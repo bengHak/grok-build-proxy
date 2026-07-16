@@ -1,21 +1,27 @@
 # Compatibility
 
-## v0.0.5 support contract
+## v0.0.6 support contract
 
 `grok-build-proxy` adapts Grok Build's public Responses API requests to the
 private ChatGPT Codex Responses Lite contract. Grok Build remains responsible
 for Plan state, Goal state, permissions, subagents, tool execution, and session
 persistence.
 
-The v0.0.5 response adapter supports:
+The v0.0.6 response adapter supports:
 
 - assistant `output_text` and refusal content;
 - `function_call` items assembled from output-item and argument events;
 - `custom_tool_call` items with completed input;
-- multiple interleaved output indexes;
+- standard Responses events and compact Responses Lite events that omit
+  `sequence_number`, `output_index`, `content_index`, or `item_id`;
+- output association by explicit index, item ID, call ID, or one unambiguous
+  open output;
+- stable synthesized item IDs that are rebound when a later event supplies the
+  upstream item ID;
+- multiple interleaved output indexes and distinct Plan or Goal calls;
 - terminal output merging without duplicate items;
 - a single completed, incomplete, failed, or error terminal;
-- fail-closed handling for incomplete executable calls;
+- fail-closed handling for incomplete or ambiguous executable calls;
 - CRLF, multiline `data:` fields, and arbitrary HTTP read boundaries.
 
 The request adapter preserves:
@@ -52,9 +58,11 @@ outside the proxy's protocol responsibilities.
 
 The repository CI runs formatting, `go vet`, race-enabled unit and integration
 tests, installer validation, and macOS arm64/amd64 release builds. Stream tests
-cover text, mixed text/tool output, `exit_plan_mode`, `update_goal`, multiple
-interleaved function calls, invalid arguments, missing terminals, incomplete and
-failed responses, custom tool calls, and fuzzed network chunk boundaries.
+cover indexed and indexless text, mixed text/tool output, `exit_plan_mode`,
+`ask_user_question`, `update_goal`, multiple distinct function calls, call-ID
+correlation, synthesized-to-upstream ID rebinding, invalid arguments, missing
+terminals, incomplete and failed responses, custom tool calls, and fuzzed network
+chunk boundaries.
 
 The protocol comparison for this release was based on Grok Build's Responses
 stream implementation on the `main` branch at commit
