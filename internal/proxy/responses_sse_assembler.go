@@ -57,10 +57,11 @@ type responsesSSEAssembler struct {
 }
 
 type responseOutputState struct {
-	index  int
-	itemID string
-	callID string
-	kind   string
+	index           int
+	itemID          string
+	itemIDSynthetic bool
+	callID          string
+	kind            string
 
 	addedItem map[string]any
 	doneItem  map[string]any
@@ -439,7 +440,7 @@ func (s *responseOutputState) acceptsEvent(itemID, callID, kind string, eventKin
 	if kind != "" && s.kind != "" && kind != s.kind {
 		return false
 	}
-	if itemID != "" && s.itemID != "" && itemID != s.itemID {
+	if itemID != "" && s.itemID != "" && itemID != s.itemID && !s.itemIDSynthetic {
 		return false
 	}
 	if callID != "" && s.callID != "" && callID != s.callID {
@@ -508,6 +509,13 @@ func (s *responsesSSEAssembler) bindOutputState(state *responseOutputState, item
 		return
 	}
 	if itemID != "" {
+		replacingItemID := state.itemID != "" && state.itemID != itemID
+		if state.itemIDSynthetic && replacingItemID {
+			delete(s.indexByItemID, state.itemID)
+		}
+		if state.itemID == "" || replacingItemID {
+			state.itemIDSynthetic = false
+		}
 		state.itemID = itemID
 		s.indexByItemID[itemID] = state.index
 	}
@@ -518,6 +526,13 @@ func (s *responsesSSEAssembler) bindOutputState(state *responseOutputState, item
 	if state.kind == "" && kind != "" {
 		state.kind = kind
 	}
+}
+
+func (s *responsesSSEAssembler) markSyntheticItemID(state *responseOutputState, itemID string) {
+	if state == nil || itemID == "" || state.itemID != itemID {
+		return
+	}
+	state.itemIDSynthetic = true
 }
 
 func (s *responsesSSEAssembler) normalizeSequence(event map[string]any, eventType string) bool {
@@ -550,11 +565,15 @@ func (s *responsesSSEAssembler) normalizeOutputItemEvent(event, item map[string]
 			itemID = s.syntheticMessageItemID(state.index)
 		}
 	}
+	syntheticItemID := stringValue(item["id"]) == "" && state.itemID == "" && itemID != ""
 	if itemID != "" && stringValue(item["id"]) == "" {
 		item["id"] = itemID
 		modified = true
 	}
 	s.bindOutputState(state, itemID, callID, kind)
+	if syntheticItemID {
+		s.markSyntheticItemID(state, itemID)
+	}
 
 	switch kind {
 	case "message":
@@ -608,11 +627,15 @@ func (s *responsesSSEAssembler) normalizeContentEvent(event map[string]any, stat
 			itemID = s.syntheticMessageItemID(state.index)
 		}
 	}
+	syntheticItemID := stringValue(event["item_id"]) == "" && state.itemID == "" && itemID != ""
 	if itemID != "" && stringValue(event["item_id"]) == "" {
 		event["item_id"] = itemID
 		modified = true
 	}
 	s.bindOutputState(state, itemID, stringValue(event["call_id"]), state.kind)
+	if syntheticItemID {
+		s.markSyntheticItemID(state, itemID)
+	}
 	if contentIndexed && setIntegerDefault(event, "content_index", 0) {
 		modified = true
 	}
