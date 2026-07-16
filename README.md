@@ -1,109 +1,137 @@
 # grok-build-proxy
 
-Grok Build의 네이티브 **OpenAI Responses API** 요청을 ChatGPT Codex 백엔드로
-전달하는 로컬 프록시입니다. Claude/Anthropic 프로토콜 변환 없이 Grok Build의
-에이전트, 도구 호출, 세션 UI를 Codex 모델과 함께 사용할 수 있게 합니다.
+A lightweight, macOS-only local proxy that lets **Grok Build** use Codex models
+available through your ChatGPT account. It accepts Grok Build's native OpenAI
+Responses API requests, adds Codex authentication, applies the small request
+shape differences required by Responses Lite models, and streams the response
+back without an Anthropic/Claude translation layer.
 
-> 비공식 커뮤니티 프로젝트입니다. OpenAI, ChatGPT, Codex, xAI 또는 Grok과
-> 제휴하거나 이들 회사가 보증하는 프로젝트가 아닙니다. ChatGPT 계정과
-> 워크스페이스에 허용된 모델만 사용할 수 있으며 내부 엔드포인트 변경으로
-> 호환성이 깨질 수 있습니다.
+> [!WARNING]
+> This is an unofficial community project. It is not affiliated with or
+> endorsed by OpenAI, ChatGPT, Codex, xAI, or Grok. Model access depends on your
+> ChatGPT plan and workspace policy. The private ChatGPT Codex backend can change
+> without notice and may require proxy updates.
 
-## 목차
+## Table of contents
 
-- [동작 방식](#동작-방식)
-- [빠른 시작](#빠른-시작)
-- [Grok Build 설정](#grok-build-설정)
-- [지원 모델과 Fast 별칭](#지원-모델과-fast-별칭)
-- [Responses Lite 변환](#responses-lite-변환)
-- [설정](#설정)
-- [보안](#보안)
-- [개발](#개발)
-- [제약 사항](#제약-사항)
+- [Requirements](#requirements)
+- [Install with curl](#install-with-curl)
+- [Authenticate Codex](#authenticate-codex)
+- [Start the proxy](#start-the-proxy)
+- [Configure Grok Build](#configure-grok-build)
+- [Supported models](#supported-models)
+- [How it works](#how-it-works)
+- [Configuration](#configuration)
+- [Security](#security)
+- [Development](#development)
+- [Release process](#release-process)
+- [Limitations](#limitations)
 
-## 동작 방식
+## Requirements
 
-```text
-Grok Build
-  POST /v1/responses (standard Responses API)
-          │
-          ▼
-grok-build-proxy
-  - Codex CLI auth.json 로드 및 OAuth 갱신
-  - ChatGPT-Account-ID 등 Codex 헤더 주입
-  - GPT-5.6 계열을 Responses Lite 형식으로 변환
-  - SSE 응답을 바이트 단위로 스트리밍
-          │
-          ▼
-ChatGPT Codex Responses backend
+- macOS on Apple Silicon (`arm64`) or Intel (`x86_64`)
+- The official Codex CLI
+- A ChatGPT account that is allowed to use the selected Codex model
+- Grok Build
+
+The installer intentionally rejects Linux and Windows. Release artifacts are
+built only for macOS.
+
+## Install with curl
+
+Install the latest release into `$HOME/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh | sh
 ```
 
-프록시는 다음 엔드포인트만 제공합니다.
+Make sure that directory is on your `PATH`. The default macOS shell is zsh:
 
-| Endpoint | 설명 |
-|---|---|
-| `POST /v1/responses` | Codex 요청 프록시 |
-| `GET /v1/models` | Grok Build용 모델 목록 |
-| `GET /healthz` | 프로세스 상태 |
-| `GET /readyz` | Codex 인증 파일을 포함한 준비 상태 |
-
-`/responses`와 `/models`도 호환 별칭으로 동작합니다.
-
-## 빠른 시작
-
-### 1. 빌드
-
-Go 1.23 이상이 필요합니다.
-
-```bash
-git clone https://github.com/bengHak/grok-build-proxy.git
-cd grok-build-proxy
-make build
+```sh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+exec zsh
 ```
 
-생성된 실행 파일은 `bin/grok-build-proxy`입니다.
+Verify the installation:
 
-### 2. 전용 Codex 로그인 디렉터리 준비
+```sh
+grok-build-proxy --version
+```
 
-동일한 refresh token을 여러 프로세스가 동시에 갱신하는 상황을 피하기 위해
-전용 `CODEX_HOME` 사용을 권장합니다.
+The installer downloads the architecture-specific release archive and verifies
+its SHA-256 checksum. Before the first tagged release exists, it downloads the
+source from `main` and builds it locally when Go 1.23 or newer is available.
 
-```bash
+Install a specific release or choose another directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh \
+  | sh -s -- --version v0.1.0 --install-dir "$HOME/bin"
+```
+
+Equivalent environment variables are also supported:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh \
+  | GROK_BUILD_PROXY_VERSION=v0.1.0 \
+    GROK_BUILD_PROXY_INSTALL_DIR="$HOME/bin" \
+    sh
+```
+
+Review [`install.sh`](install.sh) before piping it to a shell when required by
+your security policy.
+
+## Authenticate Codex
+
+Use a dedicated `CODEX_HOME` so the proxy and another Codex process do not try
+to rotate the same refresh token at the same time.
+
+```sh
 export CODEX_HOME="$HOME/.codex-grok-build-proxy"
 mkdir -p "$CODEX_HOME"
 cat > "$CODEX_HOME/config.toml" <<'EOF'
 cli_auth_credentials_store = "file"
 EOF
-codex login
+CODEX_HOME="$CODEX_HOME" codex login
 ```
 
-브라우저를 사용할 수 없는 환경에서는 공식 Codex CLI의 장치 코드 로그인을
-사용할 수 있습니다.
+For a headless Mac, use the official device-code flow:
 
-```bash
+```sh
 CODEX_HOME="$HOME/.codex-grok-build-proxy" codex login --device-auth
 ```
 
-로그인이 끝나면 `$CODEX_HOME/auth.json`이 있어야 합니다. 이 파일은 액세스 및
-리프레시 토큰을 포함하므로 비밀번호처럼 취급해야 합니다.
+After login, `$CODEX_HOME/auth.json` must exist. It contains access and refresh
+tokens and must be protected like a password.
 
-### 3. 프록시 시작
+## Start the proxy
 
-```bash
-CODEX_HOME="$HOME/.codex-grok-build-proxy" \
-  ./bin/grok-build-proxy
+```sh
+CODEX_HOME="$HOME/.codex-grok-build-proxy" grok-build-proxy
 ```
 
-기본 주소는 `http://127.0.0.1:18765`입니다.
+The default address is `http://127.0.0.1:18765`. Check readiness with:
 
-```bash
+```sh
 curl --fail http://127.0.0.1:18765/readyz
 ```
 
-## Grok Build 설정
+The proxy exposes these endpoints:
 
-[`examples/grok-config.toml`](examples/grok-config.toml)의 원하는 블록을
-`~/.grok/config.toml`에 병합합니다. 최소 예시는 다음과 같습니다.
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/responses` | Proxies a Codex Responses request |
+| `GET /v1/models` | Returns the model catalog for Grok Build |
+| `GET /healthz` | Reports process health |
+| `GET /readyz` | Verifies that Codex credentials can be loaded |
+
+`/responses` and `/models` are compatibility aliases.
+
+## Configure Grok Build
+
+Copy the model blocks you need from
+[`examples/grok-config.toml`](examples/grok-config.toml) into
+`~/.grok/config.toml`. A minimal example is:
 
 ```toml
 [model.codex-terra]
@@ -115,28 +143,28 @@ api_key = "unused"
 context_window = 372000
 ```
 
-`api_key = "unused"`는 Grok Build가 xAI 세션 토큰을 이 로컬 엔드포인트에
-사용하지 않도록 하기 위한 값입니다. 프록시는 루프백 바인딩일 때 들어오는
-Authorization 값을 사용하지 않으며, 실제 Codex 인증은 Codex CLI의
-`auth.json`에서 읽습니다.
+`api_key = "unused"` prevents Grok Build from reusing an xAI session token for
+this local endpoint. The proxy ignores the incoming Authorization value while
+bound to loopback and loads the real Codex credentials from the Codex CLI auth
+file.
 
-실행:
+Start Grok Build with the custom model:
 
-```bash
+```sh
 grok -m codex-terra
 ```
 
-설정 초안을 자동으로 출력할 수도 있습니다.
+You can also generate configuration blocks from the proxy's current catalog:
 
-```bash
-./bin/grok-build-proxy --print-grok-config
+```sh
+grok-build-proxy --print-grok-config
 ```
 
-## 지원 모델과 Fast 별칭
+## Supported models
 
-기본 모델 카탈로그는 다음 모델을 노출합니다.
+The built-in catalog currently exposes:
 
-| 모델 | 컨텍스트 창 | 전송 형식 |
+| Model | Context window | Upstream request shape |
 |---|---:|---|
 | `gpt-5.6-sol` | 372,000 | Responses Lite |
 | `gpt-5.6-terra` | 372,000 | Responses Lite |
@@ -144,12 +172,11 @@ grok -m codex-terra
 | `gpt-5.5` | 272,000 | Responses |
 | `gpt-5.2` | 272,000 | Responses |
 
-실제 모델 접근 가능 여부는 ChatGPT 플랜, 워크스페이스 정책, 지역 및 서버 측
-롤아웃에 따라 달라집니다. 프록시 목록에 존재한다고 계정 접근 권한이 생기는
-것은 아닙니다.
+A catalog entry does not grant model access. Availability can differ by plan,
+workspace, region, and server-side rollout.
 
-모델 ID 뒤에 `-fast`를 붙이면 프록시가 접미사를 제거하고
-`service_tier = "priority"`를 추가합니다.
+Append `-fast` to a model ID to have the proxy remove the suffix and set
+`service_tier = "priority"`:
 
 ```toml
 [model.codex-sol-fast]
@@ -161,113 +188,141 @@ api_key = "unused"
 context_window = 372000
 ```
 
-Fast 티어 지원 여부와 사용량 영향은 계정 및 모델에 따라 달라질 수 있습니다.
+Fast-tier availability and usage effects are account-dependent.
 
-내장 목록을 바꾸려면 쉼표로 구분해 전달합니다. 목록에 없는 모델 ID도 요청
-자체는 차단하지 않으므로 새 모델을 먼저 시험할 수 있습니다.
+Override the advertised catalog with a comma-separated list:
 
-```bash
+```sh
 GROK_BUILD_PROXY_MODELS="gpt-5.6-sol,gpt-5.6-terra" \
-  ./bin/grok-build-proxy
+  grok-build-proxy
 ```
 
-## Responses Lite 변환
+Unknown model IDs are passed through so newly enabled account-specific models
+can be tested before the catalog is updated.
 
-현재 Codex 카탈로그의 GPT-5.6 Sol/Terra/Luna는 Responses Lite 전송 형식을
-사용합니다. Grok Build는 표준 Responses API를 생성하므로 프록시가 다음을
-자동 변환합니다.
+## How it works
 
-- 최상위 `tools`를 `additional_tools` 개발자 입력 항목으로 이동
-- `instructions`를 개발자 메시지로 이동
-- `reasoning.context = "all_turns"` 설정
-- `parallel_tool_calls = false` 설정
-- Responses Lite 헤더와 client metadata 추가
-- 반환되는 Responses SSE 이벤트는 변환 없이 Grok Build로 스트리밍
+```text
+Grok Build
+  POST /v1/responses
+          |
+          v
+  grok-build-proxy
+  - loads Codex CLI auth.json
+  - refreshes OAuth tokens before expiry
+  - adds ChatGPT-Account-ID and Codex headers
+  - adapts GPT-5.6 requests to Responses Lite
+  - forwards SSE bytes as they arrive
+          |
+          v
+  ChatGPT Codex Responses backend
+```
 
-GPT-5.5와 GPT-5.2 같은 일반 Responses 모델은 요청 구조를 유지한 채 인증
-헤더만 추가합니다.
+For Responses Lite models, the proxy performs these request transformations:
 
-## 설정
+- moves top-level `tools` into an `additional_tools` developer input item;
+- moves `instructions` into a developer message;
+- sets `reasoning.context = "all_turns"`;
+- sets `parallel_tool_calls = false`;
+- adds the Responses Lite header and client metadata;
+- streams returned Responses SSE events to Grok Build unchanged.
 
-| Flag | Environment | Default |
+Normal Responses models retain their request structure and receive only the
+required authentication and routing headers.
+
+## Configuration
+
+| Flag | Environment variable | Default |
 |---|---|---|
 | `--listen` | `GROK_BUILD_PROXY_LISTEN` | `127.0.0.1:18765` |
-| `--auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | `$CODEX_HOME/auth.json` 또는 `~/.codex/auth.json` |
+| `--auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | `$CODEX_HOME/auth.json` or `~/.codex/auth.json` |
 | `--upstream` | `GROK_BUILD_PROXY_UPSTREAM` | ChatGPT Codex Responses endpoint |
 | `--refresh-url` | `GROK_BUILD_PROXY_REFRESH_URL` | OpenAI OAuth token endpoint |
-| `--models` | `GROK_BUILD_PROXY_MODELS` | 내장 모델 카탈로그 |
-| `--client-token` | `GROK_BUILD_PROXY_TOKEN` | 없음 |
+| `--models` | `GROK_BUILD_PROXY_MODELS` | Built-in catalog |
+| `--client-token` | `GROK_BUILD_PROXY_TOKEN` | Empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
 
-### 비루프백 바인딩
+### Non-loopback binding
 
-`0.0.0.0`이나 LAN 주소에 바인딩하려면 반드시 들어오는 요청용 bearer token을
-설정해야 합니다.
+A bearer token is mandatory when binding to a LAN or all-interface address:
 
-```bash
+```sh
 export GROK_BUILD_PROXY_TOKEN="replace-with-a-long-random-value"
-./bin/grok-build-proxy --listen 0.0.0.0:18765
+grok-build-proxy --listen 0.0.0.0:18765
 ```
 
-이 경우 Grok Build 설정의 `api_key`를 같은 값으로 지정합니다.
+Set the same value as `api_key` in the Grok Build model configuration. Do not
+expose this proxy directly to the public internet.
 
-## Docker
+## Security
 
-```bash
-docker build -t grok-build-proxy .
-docker run --rm \
-  --user "$(id -u):$(id -g)" \
-  -p 127.0.0.1:18765:18765 \
-  -v "$HOME/.codex-grok-build-proxy:/home/proxy/.codex:rw" \
-  grok-build-proxy --listen 0.0.0.0:18765 \
-    --auth-file /home/proxy/.codex/auth.json \
-    --client-token local-container-token
-```
+- Keep the default loopback binding whenever possible.
+- Never commit `auth.json` or copy it into logs, issues, chat messages, or build
+  artifacts.
+- The proxy does not log request bodies, response bodies, or Authorization
+  headers.
+- Use a dedicated `CODEX_HOME` to reduce refresh-token races.
+- Prefer an official OpenAI API key for unattended production automation where
+  the ChatGPT subscription path is not appropriate.
+- See [`SECURITY.md`](SECURITY.md) for vulnerability reporting guidance.
 
-컨테이너 내부에서는 비루프백 주소로 수신하므로 `--client-token`이 필요합니다.
-Grok Build 설정에도 같은 토큰을 `api_key`로 넣습니다.
+## Development
 
-## 보안
+Development and CI target macOS only. Go 1.23 or newer is required.
 
-- 기본값처럼 루프백 주소에서만 실행하는 것을 권장합니다.
-- `auth.json`을 Git, Docker 이미지, 로그, 이슈 또는 채팅에 올리지 마세요.
-- 프록시는 요청/응답 본문과 Authorization 헤더를 로그로 남기지 않습니다.
-- 공용 인터넷에 직접 노출하지 마세요.
-- 자동화 환경에서는 OpenAI가 제공하는 공식 API 키 또는 허가된 Codex access
-  token 방식이 더 적합할 수 있습니다.
-- 자세한 내용은 [`SECURITY.md`](SECURITY.md)를 참고하세요.
-
-## 개발
-
-외부 Go 모듈 없이 표준 라이브러리만 사용합니다.
-
-```bash
+```sh
+git clone https://github.com/bengHak/grok-build-proxy.git
+cd grok-build-proxy
 make check
 ```
 
-개별 명령:
+Individual commands:
 
-```bash
-go test -race ./...
+```sh
+test -z "$(gofmt -l .)"
 go vet ./...
+go test -race ./...
 go build ./cmd/grok-build-proxy
+sh -n install.sh
 ```
 
-## 제약 사항
+Build both supported macOS archives locally:
 
-- Codex CLI가 자격 증명을 OS keyring에만 저장한 경우 읽을 수 없습니다.
-  `cli_auth_credentials_store = "file"`로 전용 `CODEX_HOME`을 준비하세요.
-- ChatGPT Codex 백엔드는 공개 OpenAI Platform API와 별개의 제품 경로이며,
-  서버 측 변경에 따라 프록시 업데이트가 필요할 수 있습니다.
-- 현재 구현은 HTTP Responses/SSE 경로를 사용하며 Codex의 WebSocket 전송은
-  구현하지 않습니다.
-- xAI의 서버 측 검색 도구가 아니라 Grok Build가 로컬에서 실행하는 함수
-  도구를 대상으로 합니다. Codex의 hosted search 도구 호환성은 보장하지
-  않습니다.
+```sh
+make dist
+```
 
-## 참고 자료
+## Release process
 
-- [OpenAI Codex authentication documentation](https://learn.chatgpt.com/docs/auth)
-- [OpenAI Codex open-source repository](https://github.com/openai/codex)
+Pushing a semantic-version tag such as `v0.1.0` runs the release workflow. It
+builds and publishes these assets:
+
+```text
+grok-build-proxy_Darwin_arm64.tar.gz
+grok-build-proxy_Darwin_amd64.tar.gz
+checksums.txt
+```
+
+The curl installer selects the correct archive using `uname -m`.
+
+## Limitations
+
+- macOS is the only supported operating system.
+- The proxy cannot read credentials stored only in the macOS Keychain. Configure
+  the dedicated Codex home with `cli_auth_credentials_store = "file"`.
+- The ChatGPT Codex backend is separate from the public OpenAI Platform API and
+  can change server-side.
+- The current transport uses HTTP Responses/SSE, not Codex WebSocket transport.
+- The proxy targets function tools executed locally by Grok Build. Compatibility
+  with Codex-hosted search tools is not guaranteed.
+
+## References
+
+- [OpenAI Codex authentication](https://developers.openai.com/codex/auth)
+- [OpenAI Codex repository](https://github.com/openai/codex)
 - [xAI Grok Build repository](https://github.com/xai-org/grok-build)
 - [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy)
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
