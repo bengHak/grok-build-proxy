@@ -136,18 +136,41 @@ func (s *responseOutputState) buildFunctionCall(base map[string]any) (map[string
 	item["id"] = firstNonEmptyString(stringValue(item["id"]), s.itemID, syntheticToolItemID("fc_", callID))
 	item["name"] = firstNonEmptyString(stringValue(item["name"]), itemString(s.doneItem, "name"), itemString(s.addedItem, "name"))
 
-	arguments := stringValue(item["arguments"])
-	argumentsDone := arguments != "" && s.doneItem != nil
-	if !argumentsDone && s.argumentsDoneSeen {
-		arguments = s.argumentsDone
-		argumentsDone = true
-	}
-	if !argumentsDone {
+	arguments, complete := s.completedFunctionArguments(item)
+	if !complete {
 		return item, false
 	}
 	item["arguments"] = arguments
 	item["status"] = "completed"
 	return item, true
+}
+
+func (s *responseOutputState) completedFunctionArguments(base map[string]any) (string, bool) {
+	if s.doneItem == nil && !s.argumentsDoneSeen {
+		return "", false
+	}
+
+	candidates := []string{
+		stringValue(base["arguments"]),
+		s.argumentsDone,
+		s.argumentsDelta.String(),
+	}
+	firstInvalid := ""
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if json.Valid([]byte(candidate)) {
+			return candidate, true
+		}
+		if firstInvalid == "" {
+			firstInvalid = candidate
+		}
+	}
+	if firstInvalid != "" {
+		return firstInvalid, true
+	}
+	return "", false
 }
 
 func (s *responseOutputState) buildCustomToolCall(base map[string]any) (map[string]any, bool) {
@@ -161,18 +184,39 @@ func (s *responseOutputState) buildCustomToolCall(base map[string]any) (map[stri
 	item["id"] = firstNonEmptyString(stringValue(item["id"]), s.itemID, syntheticToolItemID("ct_", callID))
 	item["name"] = firstNonEmptyString(stringValue(item["name"]), itemString(s.doneItem, "name"), itemString(s.addedItem, "name"))
 
-	input := stringValue(item["input"])
-	inputDone := s.doneItem != nil && item["input"] != nil
-	if !inputDone && s.customInputDoneSeen {
-		input = s.customInputDone
-		inputDone = true
-	}
-	if !inputDone {
+	input, complete := s.completedCustomInput(item)
+	if !complete {
 		return item, false
 	}
 	item["input"] = input
 	item["status"] = "completed"
 	return item, true
+}
+
+func (s *responseOutputState) completedCustomInput(base map[string]any) (string, bool) {
+	if s.doneItem == nil && !s.customInputDoneSeen {
+		return "", false
+	}
+
+	delta := s.customInputDelta.String()
+	if s.customDoneItemInputPresent {
+		value := stringValue(s.doneItem["input"])
+		if value != "" || delta == "" {
+			return value, true
+		}
+	}
+	if s.customInputDonePresent {
+		if s.customInputDone != "" || delta == "" {
+			return s.customInputDone, true
+		}
+	}
+	if delta != "" {
+		return delta, true
+	}
+	if value := stringValue(base["input"]); value != "" {
+		return value, true
+	}
+	return "", false
 }
 
 func syntheticToolItemID(prefix, callID string) string {
@@ -183,14 +227,14 @@ func syntheticToolItemID(prefix, callID string) string {
 }
 
 func (s *responseOutputState) text() string {
-	if s.textDoneSeen {
+	if s.textDoneSeen && s.textDone != "" {
 		return s.textDone
 	}
 	return s.textDelta.String()
 }
 
 func (s *responseOutputState) refusal() string {
-	if s.refusalDoneSeen {
+	if s.refusalDoneSeen && s.refusalDone != "" {
 		return s.refusalDone
 	}
 	return s.refusalDelta.String()

@@ -1,13 +1,13 @@
 # Compatibility
 
-## v0.0.6 support contract
+## v0.0.7 support contract
 
 `grok-build-proxy` adapts Grok Build's public Responses API requests to the
 private ChatGPT Codex Responses Lite contract. Grok Build remains responsible
 for Plan state, Goal state, permissions, subagents, tool execution, and session
 persistence.
 
-The v0.0.6 response adapter supports:
+The v0.0.7 response adapter supports:
 
 - assistant `output_text` and refusal content;
 - `function_call` items assembled from output-item and argument events;
@@ -18,10 +18,15 @@ The v0.0.6 response adapter supports:
   open output;
 - stable synthesized item IDs that are rebound when a later event supplies the
   upstream item ID;
+- preservation of non-empty streamed deltas when a terminal `done` event omits,
+  empties, or corrupts its repeated text, function arguments, or custom input;
+- validation of recovered function arguments before a call is exposed;
+- distinction between an explicitly empty custom-tool input and a missing input;
 - multiple interleaved output indexes and distinct Plan or Goal calls;
 - terminal output merging without duplicate items;
 - a single completed, incomplete, failed, or error terminal;
 - fail-closed handling for incomplete or ambiguous executable calls;
+- bounded, content-free proxy logs for normalization failures;
 - CRLF, multiline `data:` fields, and arbitrary HTTP read boundaries.
 
 The request adapter preserves:
@@ -58,11 +63,13 @@ outside the proxy's protocol responsibilities.
 
 The repository CI runs formatting, `go vet`, race-enabled unit and integration
 tests, installer validation, and macOS arm64/amd64 release builds. Stream tests
-cover indexed and indexless text, mixed text/tool output, `exit_plan_mode`,
-`ask_user_question`, `update_goal`, multiple distinct function calls, call-ID
-correlation, synthesized-to-upstream ID rebinding, invalid arguments, missing
-terminals, incomplete and failed responses, custom tool calls, and fuzzed network
-chunk boundaries.
+cover indexed and indexless text, empty text/refusal done payloads, mixed
+text/tool output, `exit_plan_mode`, `ask_user_question`, `update_goal`, valid
+argument-delta recovery from empty or invalid done payloads, explicit empty and
+missing custom-tool input, missing completion boundaries, multiple distinct
+function calls, call-ID correlation, synthesized-to-upstream ID rebinding,
+invalid arguments, missing terminals, incomplete and failed responses, and
+fuzzed network chunk boundaries.
 
 The protocol comparison for this release was based on Grok Build's Responses
 stream implementation on the `main` branch at commit
