@@ -11,15 +11,24 @@ Treat the Codex authentication file as a password.
 - Request bodies, response bodies, and authorization values are not logged.
 - The installer writes only the executable into the selected installation
   directory and does not read or copy Codex credentials.
+- `grok-build-proxy auth` delegates login, device authorization, status, and
+  logout to the official Codex CLI. It does not collect ChatGPT passwords or
+  implement its own OAuth callback flow.
+- `grok-build-proxy doctor` reports only redacted account metadata and never
+  prints access or refresh token values.
 
 ## Credential handling
 
 - Do not commit, upload, back up to a public location, or share `auth.json`.
-- Use a dedicated `CODEX_HOME` configured with
-  `cli_auth_credentials_store = "file"`.
-- Keep the authentication file readable only by your macOS user.
-- Do not run multiple processes that refresh the same Codex credential file.
-- Log out with the Codex CLI before deleting a dedicated credential directory.
+- The default proxy credential directory is `~/.codex-grok-build-proxy`.
+- The auth wrapper configures `cli_auth_credentials_store = "file"` and
+  `forced_login_method = "chatgpt"` in that dedicated Codex home.
+- Keep the authentication file readable only by your macOS user. The doctor
+  reports group or world-readable credentials as a blocking problem.
+- Do not point multiple long-running proxy processes at the same credential
+  file. A dedicated home reduces refresh-token races with normal Codex sessions.
+- Log out with `grok-build-proxy auth logout` before deleting a dedicated
+  credential directory.
 
 ## Network exposure
 
