@@ -1,0 +1,7 @@
+.git
+.github
+bin
+dist
+*.log
+auth.json
+auth.json.*
