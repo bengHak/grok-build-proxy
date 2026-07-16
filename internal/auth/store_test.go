@@ -74,7 +74,11 @@ func TestStoreRefreshesAndPersistsRotatedTokens(t *testing.T) {
 	}))
 	defer server.Close()
 
-	store, err := NewStore(Config{Path: authPath, RefreshURL: server.URL, Now: func() time.Time { return now }})
+	store, err := NewStore(Config{
+		Path:       authPath,
+		RefreshURL: server.URL,
+		Now:        func() time.Time { return now },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,4 +147,71 @@ func testJWT(claims map[string]any) string {
 	header, _ := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
 	payload, _ := json.Marshal(claims)
 	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+func TestStoreInspectReturnsRedactedStatusWithoutRefreshing(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	authPath := filepath.Join(t.TempDir(), "auth.json")
+	writeAuthFile(t, authPath, map[string]any{
+		"auth_mode":    "chatgpt",
+		"last_refresh": now.Add(-time.Minute).Format(time.RFC3339Nano),
+		"tokens": map[string]any{
+			"id_token": testJWT(map[string]any{
+				"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-inspect"},
+			}),
+			"access_token":  testJWT(map[string]any{"exp": now.Add(time.Hour).Unix()}),
+			"refresh_token": "refresh-secret",
+		},
+	})
+	store, err := NewStore(Config{Path: authPath, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := store.Inspect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.AuthMode != "chatgpt" || status.AccountID != "acct-inspect" {
+		t.Fatalf("status = %#v", status)
+	}
+	if !status.HasRefreshToken {
+		t.Fatal("refresh token was not detected")
+	}
+	if !status.ExpiresAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("ExpiresAt = %v", status.ExpiresAt)
+	}
+	if status.FileMode.Perm()&0o077 != 0 {
+		t.Fatalf("mode = %o", status.FileMode.Perm())
+	}
+}
+
+func TestStoreInspectReturnsSecretFreeStatus(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0).UTC()
+	authPath := filepath.Join(t.TempDir(), "auth.json")
+	writeAuthFile(t, authPath, map[string]any{
+		"auth_mode":    "chatgpt",
+		"last_refresh": now.Add(-time.Minute).Format(time.RFC3339Nano),
+		"tokens": map[string]any{
+			"id_token":      testJWT(map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "account-12345678"}}),
+			"access_token":  testJWT(map[string]any{"exp": now.Add(time.Hour).Unix()}),
+			"refresh_token": "refresh-secret",
+		},
+	})
+	store, err := NewStore(Config{Path: authPath, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := store.Inspect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.AuthMode != "chatgpt" || status.AccountID != "account-12345678" {
+		t.Fatalf("unexpected status: %#v", status)
+	}
+	if !status.HasRefreshToken || !status.ExpiresAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("unexpected token metadata: %#v", status)
+	}
+	if !status.LastRefresh.Equal(now.Add(-time.Minute)) {
+		t.Fatalf("LastRefresh = %v", status.LastRefresh)
+	}
 }
