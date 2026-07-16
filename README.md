@@ -70,11 +70,14 @@ that can use the selected Codex model.
    grok -m codex-sol
    ```
 
-## Why v0.0.2 is required for GPT-5.6
+## Why v0.0.3 is required for Grok Build
 
-Version `0.0.1` used an outdated Responses Lite HTTP shape and could receive a
-400 response after a prompt was submitted. Version `0.0.2` aligns requests with
-the current official Codex HTTP contract:
+Version `0.0.3` converts public Responses API `system` input messages to the
+`developer` role before forwarding them to the ChatGPT Codex backend. This
+preserves the message content and ordering while preventing the upstream
+`400 Bad Request: System messages are not allowed` response.
+
+It also includes the Responses Lite HTTP compatibility introduced in `0.0.2`:
 
 - sends `session-id`, `thread-id`, `x-session-affinity`, and the Codex
   compatibility `version` header;
@@ -158,8 +161,9 @@ default loopback binding whenever possible.
 
 - `command not found`: ensure `$HOME/.local/bin` is in `PATH`.
 - `auth.json` missing: run `grok-build-proxy auth login`.
-- 400 with a GPT-5.6 model: confirm `grok-build-proxy --version` reports
-  `0.0.2` or newer and inspect the new `upstream_error` log field.
+- `System messages are not allowed`: upgrade to `0.0.3` or newer.
+- Other 400 responses with a GPT-5.6 model: inspect the `upstream_error` log
+  field and confirm `grok-build-proxy --version` reports `0.0.3` or newer.
 - 401: run `grok-build-proxy auth status`, then log in again if required.
 - Mapping has no effect: confirm the selected Grok entry points to this local
   endpoint and its `model` value exactly matches the map source.
@@ -174,7 +178,7 @@ cd grok-build-proxy
 gofmt -w $(find . -name '*.go' -type f)
 go vet ./...
 go test -race ./...
-make dist VERSION=0.0.2
+make dist VERSION=0.0.3
 ```
 
 Release assets are built for macOS arm64 and amd64 and published with a SHA-256
