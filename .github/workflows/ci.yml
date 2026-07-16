@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -23,5 +23,9 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race ./...
-      - name: Build
-        run: go build ./cmd/grok-build-proxy
+      - name: Validate installer
+        run: sh -n install.sh
+      - name: Build current Mac architecture
+        run: make build VERSION=ci
+      - name: Build Apple Silicon and Intel archives
+        run: make dist VERSION=ci
