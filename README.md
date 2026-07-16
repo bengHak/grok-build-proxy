@@ -70,30 +70,31 @@ that can use the selected Codex model.
    grok -m codex-sol
    ```
 
-## Why v0.0.5 is required for Plan and Goal
+## Why v0.0.6 is required for Responses Lite, Plan, and Goal
 
-Grok Build streams tool-call arguments before deciding whether a turn completed
-successfully from `response.completed.response.output`. Some Responses Lite
-streams contain complete tool-call events while leaving that final output empty,
-or finish with `[DONE]` without a terminal event. That can make Grok Build retry
-a Plan or Goal turn and repeat `read_file`, `write`, `exit_plan_mode`, or
-`update_goal` calls.
+Grok Build displays streamed text immediately, but accepts a turn from the final
+`response.completed.response.output`. Some private Responses Lite streams omit
+standard event-envelope fields such as `sequence_number`, `output_index`,
+`content_index`, or `item_id`, and some leave the final output empty. A visible
+answer can therefore be followed by a stream failure and retry unless the proxy
+normalizes both the live events and the terminal response.
 
-Version `0.0.5` adds a canonical Responses Lite output assembler:
+Version `0.0.6` extends the canonical Responses Lite assembler to:
 
-- reconstructs `function_call` items from `response.output_item.*` and
-  `response.function_call_arguments.*` events;
-- reconstructs `custom_tool_call` input when its done event is present;
-- merges text and tool calls by `output_index` without duplicating an existing
-  terminal item;
-- validates function IDs, call IDs, names, and JSON arguments before exposing a
-  completed call to Grok Build;
-- fails closed with a stream error when an executable call is incomplete;
-- preserves `response.incomplete`, `response.failed`, and upstream error
+- fill missing event-envelope fields before forwarding events to Grok Build;
+- associate output by explicit index, item ID, call ID, or one unambiguous open
+  output;
+- synthesize stable message and tool item IDs, then rebind them when an upstream
+  item ID arrives later;
+- reconstruct `function_call` and `custom_tool_call` items from compact or
+  standard stream shapes;
+- keep multiple Plan and Goal calls distinct, including `ask_user_question`,
+  `exit_plan_mode`, and `update_goal`;
+- merge streamed text and tools into the terminal output without duplication;
+- fail closed instead of executing an incomplete or ambiguous tool call;
+- preserve `response.incomplete`, `response.failed`, and upstream error
   terminals instead of upgrading them to completed;
-- supports multiple interleaved tool calls and arbitrary network chunk
-  boundaries;
-- preserves explicit `tool_choice` values and `function_call_output.call_id`
+- preserve explicit `tool_choice` values and `function_call_output.call_id`
   across multi-turn Plan and Goal requests.
 
 It also includes the request and text-stream compatibility introduced in earlier
@@ -200,14 +201,15 @@ default loopback binding whenever possible.
 
 - `command not found`: ensure `$HOME/.local/bin` is in `PATH`.
 - `auth.json` missing: run `grok-build-proxy auth login`.
-- Plan or Goal repeats a tool call: upgrade to `0.0.5` or newer and inspect the
-  stream error before lowering `GROK_MAX_RETRIES` for diagnosis.
+- The same text answer or a Plan/Goal tool call is repeated: upgrade to `0.0.6`
+  or newer and inspect the stream error before lowering `GROK_MAX_RETRIES`.
 - `proxy_incomplete_output`: the upstream stream ended before a safe executable
   tool call could be reconstructed; the proxy intentionally did not complete it.
-- The same text answer is displayed repeatedly: upgrade to `0.0.4` or newer.
+- `proxy_missing_terminal_output`: no unambiguous text or tool output could be
+  assembled; capture the upstream SSE because its private shape may have changed.
 - `System messages are not allowed`: upgrade to `0.0.3` or newer.
 - Other 400 responses with a GPT-5.6 model: inspect the `upstream_error` log
-  field and confirm `grok-build-proxy --version` reports `0.0.5` or newer.
+  field and confirm `grok-build-proxy --version` reports `0.0.6` or newer.
 - 401: run `grok-build-proxy auth status`, then log in again if required.
 - Mapping has no effect: confirm the selected Grok entry points to this local
   endpoint and its `model` value exactly matches the map source.
@@ -222,7 +224,7 @@ cd grok-build-proxy
 gofmt -w $(find . -name '*.go' -type f)
 go vet ./...
 go test -race ./...
-make dist VERSION=0.0.5
+make dist VERSION=0.0.6
 ```
 
 Release assets are built for macOS arm64 and amd64 and published with a SHA-256

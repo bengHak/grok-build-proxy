@@ -131,8 +131,9 @@ func (s *responseOutputState) buildFunctionCall(base map[string]any) (map[string
 		item = map[string]any{}
 	}
 	item["type"] = "function_call"
-	item["id"] = firstNonEmptyString(stringValue(item["id"]), s.itemID)
-	item["call_id"] = firstNonEmptyString(stringValue(item["call_id"]), itemString(s.doneItem, "call_id"), itemString(s.addedItem, "call_id"))
+	callID := firstNonEmptyString(stringValue(item["call_id"]), s.callID, itemString(s.doneItem, "call_id"), itemString(s.addedItem, "call_id"))
+	item["call_id"] = callID
+	item["id"] = firstNonEmptyString(stringValue(item["id"]), s.itemID, syntheticToolItemID("fc_", callID))
 	item["name"] = firstNonEmptyString(stringValue(item["name"]), itemString(s.doneItem, "name"), itemString(s.addedItem, "name"))
 
 	arguments := stringValue(item["arguments"])
@@ -155,8 +156,9 @@ func (s *responseOutputState) buildCustomToolCall(base map[string]any) (map[stri
 		item = map[string]any{}
 	}
 	item["type"] = "custom_tool_call"
-	item["id"] = firstNonEmptyString(stringValue(item["id"]), s.itemID)
-	item["call_id"] = firstNonEmptyString(stringValue(item["call_id"]), itemString(s.doneItem, "call_id"), itemString(s.addedItem, "call_id"))
+	callID := firstNonEmptyString(stringValue(item["call_id"]), s.callID, itemString(s.doneItem, "call_id"), itemString(s.addedItem, "call_id"))
+	item["call_id"] = callID
+	item["id"] = firstNonEmptyString(stringValue(item["id"]), s.itemID, syntheticToolItemID("ct_", callID))
 	item["name"] = firstNonEmptyString(stringValue(item["name"]), itemString(s.doneItem, "name"), itemString(s.addedItem, "name"))
 
 	input := stringValue(item["input"])
@@ -173,15 +175,22 @@ func (s *responseOutputState) buildCustomToolCall(base map[string]any) (map[stri
 	return item, true
 }
 
+func syntheticToolItemID(prefix, callID string) string {
+	if callID == "" {
+		return ""
+	}
+	return prefix + callID
+}
+
 func (s *responseOutputState) text() string {
-	if s.textDone != "" {
+	if s.textDoneSeen {
 		return s.textDone
 	}
 	return s.textDelta.String()
 }
 
 func (s *responseOutputState) refusal() string {
-	if s.refusalDone != "" {
+	if s.refusalDoneSeen {
 		return s.refusalDone
 	}
 	return s.refusalDelta.String()
@@ -242,6 +251,14 @@ func findExistingOutputItem(output []any, state *responseOutputState) int {
 	if state.itemID != "" {
 		for index, raw := range output {
 			if stringValue(jsonObject(raw)["id"]) == state.itemID {
+				return index
+			}
+		}
+	}
+	if state.callID != "" {
+		for index, raw := range output {
+			item := jsonObject(raw)
+			if stringValue(item["call_id"]) == state.callID {
 				return index
 			}
 		}

@@ -27,31 +27,52 @@ func parseResponsesCompatMode(value string) responsesCompatMode {
 	}
 }
 
+type responseStreamOutputEvent uint8
+
+const (
+	outputEventItemAdded responseStreamOutputEvent = iota
+	outputEventItemDone
+	outputEventTextDelta
+	outputEventTextDone
+	outputEventRefusalDelta
+	outputEventRefusalDone
+	outputEventFunctionArgumentsDelta
+	outputEventFunctionArgumentsDone
+	outputEventCustomInputDelta
+	outputEventCustomInputDone
+)
+
 type responsesSSEAssembler struct {
-	mode             responsesCompatMode
-	outputs          map[int]*responseOutputState
-	indexByItemID    map[string]int
-	responseSnapshot map[string]any
-	terminalSeen     bool
-	doneSeen         bool
-	maxSequence      int64
-	stateBytes       int
-	stateErr         error
+	mode              responsesCompatMode
+	outputs           map[int]*responseOutputState
+	indexByItemID     map[string]int
+	indexByCallID     map[string]int
+	nextImplicitIndex int
+	responseSnapshot  map[string]any
+	terminalSeen      bool
+	doneSeen          bool
+	maxSequence       int64
+	stateBytes        int
+	stateErr          error
 }
 
 type responseOutputState struct {
-	index  int
-	itemID string
-	kind   string
+	index           int
+	itemID          string
+	itemIDSynthetic bool
+	callID          string
+	kind            string
 
 	addedItem map[string]any
 	doneItem  map[string]any
 
-	textDelta strings.Builder
-	textDone  string
+	textDelta    strings.Builder
+	textDone     string
+	textDoneSeen bool
 
-	refusalDelta strings.Builder
-	refusalDone  string
+	refusalDelta    strings.Builder
+	refusalDone     string
+	refusalDoneSeen bool
 
 	argumentsDelta    strings.Builder
 	argumentsDone     string
@@ -67,6 +88,7 @@ func newResponsesSSEAssembler(mode responsesCompatMode) *responsesSSEAssembler {
 		mode:          mode,
 		outputs:       make(map[int]*responseOutputState),
 		indexByItemID: make(map[string]int),
+		indexByCallID: make(map[string]int),
 	}
 }
 
@@ -99,8 +121,8 @@ func (s *responsesSSEAssembler) transformFrame(frame []byte) []byte {
 			modified = true
 		}
 	}
-	if sequence, ok := integerValue(event["sequence_number"]); ok && sequence > s.maxSequence {
-		s.maxSequence = sequence
+	if s.normalizeSequence(event, eventType) {
+		modified = true
 	}
 
 	switch eventType {
@@ -109,32 +131,32 @@ func (s *responsesSSEAssembler) transformFrame(frame []byte) []byte {
 			s.responseSnapshot = cloneJSONObject(response)
 		}
 	case "response.output_item.added":
-		s.captureOutputItem(event, false)
+		modified = s.captureOutputItem(event, false) || modified
 	case "response.output_item.done":
-		s.captureOutputItem(event, true)
+		modified = s.captureOutputItem(event, true) || modified
 	case "response.output_text.delta":
-		s.captureText(event, false)
+		modified = s.captureText(event, false) || modified
 	case "response.output_text.done":
-		s.captureText(event, true)
+		modified = s.captureText(event, true) || modified
 	case "response.refusal.delta":
-		s.captureRefusal(event, false)
+		modified = s.captureRefusal(event, false) || modified
 	case "response.refusal.done":
-		s.captureRefusal(event, true)
+		modified = s.captureRefusal(event, true) || modified
 	case "response.function_call_arguments.delta":
 		if s.mode == responsesCompatFull {
-			s.captureFunctionArguments(event, false)
+			modified = s.captureFunctionArguments(event, false) || modified
 		}
 	case "response.function_call_arguments.done":
 		if s.mode == responsesCompatFull {
-			s.captureFunctionArguments(event, true)
+			modified = s.captureFunctionArguments(event, true) || modified
 		}
 	case "response.custom_tool_call_input.delta":
 		if s.mode == responsesCompatFull {
-			s.captureCustomToolInput(event, false)
+			modified = s.captureCustomToolInput(event, false) || modified
 		}
 	case "response.custom_tool_call_input.done":
 		if s.mode == responsesCompatFull {
-			s.captureCustomToolInput(event, true)
+			modified = s.captureCustomToolInput(event, true) || modified
 		}
 	case "response.completed":
 		return s.transformTerminal(eventName, event, "completed", modified, true)
@@ -226,135 +248,430 @@ func (s *responsesSSEAssembler) synthesizeTerminal() []byte {
 	})
 }
 
-func (s *responsesSSEAssembler) captureOutputItem(event map[string]any, done bool) {
+func (s *responsesSSEAssembler) captureOutputItem(event map[string]any, done bool) bool {
 	item := jsonObject(event["item"])
 	if item == nil {
-		return
+		return false
 	}
-	state := s.outputForEvent(event)
+	eventKind := outputEventItemAdded
+	if done {
+		eventKind = outputEventItemDone
+	}
+	state := s.outputForEvent(event, item, stringValue(item["type"]), eventKind)
 	if state == nil {
-		return
+		return false
 	}
-	if id := stringValue(item["id"]); id != "" {
-		state.itemID = id
-		s.indexByItemID[id] = state.index
-	}
-	if kind := stringValue(item["type"]); kind != "" {
-		state.kind = kind
-	}
+	modified := s.normalizeOutputItemEvent(event, item, state, done)
 	if done {
 		state.doneItem = cloneJSONObject(item)
 	} else {
 		state.addedItem = cloneJSONObject(item)
 	}
+	return modified
 }
 
-func (s *responsesSSEAssembler) captureText(event map[string]any, done bool) {
-	state := s.outputForEvent(event)
+func (s *responsesSSEAssembler) captureText(event map[string]any, done bool) bool {
+	eventKind := outputEventTextDelta
+	if done {
+		eventKind = outputEventTextDone
+	}
+	state := s.outputForEvent(event, nil, "message", eventKind)
 	if state == nil {
-		return
+		return false
 	}
-	if state.kind == "" {
-		state.kind = "message"
-	}
+	modified := s.normalizeContentEvent(event, state, true)
 	if done {
 		state.textDone = stringValue(event["text"])
+		state.textDoneSeen = true
 		s.addStateBytes(len(state.textDone))
-		return
+		return modified
 	}
 	delta := stringValue(event["delta"])
 	if delta != "" {
 		state.textDelta.WriteString(delta)
 		s.addStateBytes(len(delta))
 	}
+	return modified
 }
 
-func (s *responsesSSEAssembler) captureRefusal(event map[string]any, done bool) {
-	state := s.outputForEvent(event)
+func (s *responsesSSEAssembler) captureRefusal(event map[string]any, done bool) bool {
+	eventKind := outputEventRefusalDelta
+	if done {
+		eventKind = outputEventRefusalDone
+	}
+	state := s.outputForEvent(event, nil, "message", eventKind)
 	if state == nil {
-		return
+		return false
 	}
-	if state.kind == "" {
-		state.kind = "message"
-	}
+	modified := s.normalizeContentEvent(event, state, true)
 	if done {
 		state.refusalDone = stringValue(event["refusal"])
+		state.refusalDoneSeen = true
 		s.addStateBytes(len(state.refusalDone))
-		return
+		return modified
 	}
 	delta := stringValue(event["delta"])
 	if delta != "" {
 		state.refusalDelta.WriteString(delta)
 		s.addStateBytes(len(delta))
 	}
+	return modified
 }
 
-func (s *responsesSSEAssembler) captureFunctionArguments(event map[string]any, done bool) {
-	state := s.outputForEvent(event)
+func (s *responsesSSEAssembler) captureFunctionArguments(event map[string]any, done bool) bool {
+	eventKind := outputEventFunctionArgumentsDelta
+	if done {
+		eventKind = outputEventFunctionArgumentsDone
+	}
+	state := s.outputForEvent(event, nil, "function_call", eventKind)
 	if state == nil {
-		return
+		return false
 	}
-	if state.kind == "" {
-		state.kind = "function_call"
-	}
+	modified := s.normalizeContentEvent(event, state, false)
 	if done {
 		state.argumentsDone = stringValue(event["arguments"])
 		state.argumentsDoneSeen = true
 		s.addStateBytes(len(state.argumentsDone))
-		return
+		return modified
 	}
 	delta := stringValue(event["delta"])
 	if delta != "" {
 		state.argumentsDelta.WriteString(delta)
 		s.addStateBytes(len(delta))
 	}
+	return modified
 }
 
-func (s *responsesSSEAssembler) captureCustomToolInput(event map[string]any, done bool) {
-	state := s.outputForEvent(event)
+func (s *responsesSSEAssembler) captureCustomToolInput(event map[string]any, done bool) bool {
+	eventKind := outputEventCustomInputDelta
+	if done {
+		eventKind = outputEventCustomInputDone
+	}
+	state := s.outputForEvent(event, nil, "custom_tool_call", eventKind)
 	if state == nil {
-		return
+		return false
 	}
-	if state.kind == "" {
-		state.kind = "custom_tool_call"
-	}
+	modified := s.normalizeContentEvent(event, state, false)
 	if done {
 		state.customInputDone = stringValue(event["input"])
 		state.customInputDoneSeen = true
 		s.addStateBytes(len(state.customInputDone))
-		return
+		return modified
 	}
 	delta := stringValue(event["delta"])
 	if delta != "" {
 		state.customInputDelta.WriteString(delta)
 		s.addStateBytes(len(delta))
 	}
+	return modified
 }
 
-func (s *responsesSSEAssembler) outputForEvent(event map[string]any) *responseOutputState {
-	itemID := stringValue(event["item_id"])
-	index, hasIndex := integerValue(event["output_index"])
-	if !hasIndex && itemID != "" {
-		mapped, exists := s.indexByItemID[itemID]
-		if exists {
-			index = int64(mapped)
-			hasIndex = true
+func (s *responsesSSEAssembler) outputForEvent(event, item map[string]any, kind string, eventKind responseStreamOutputEvent) *responseOutputState {
+	itemID := firstNonEmptyString(stringValue(event["item_id"]), itemString(item, "id"))
+	callID := firstNonEmptyString(stringValue(event["call_id"]), itemString(item, "call_id"))
+	kind = firstNonEmptyString(kind, itemString(item, "type"))
+	explicitIndex, hasExplicitIndex := integerValue(event["output_index"])
+
+	if state := s.mappedOutput(itemID, callID); state != nil {
+		if hasExplicitIndex && state.index != int(explicitIndex) && s.outputs[int(explicitIndex)] == nil {
+			state = s.reindexOutput(state, int(explicitIndex))
+		}
+		s.bindOutputState(state, itemID, callID, kind)
+		return state
+	}
+
+	if hasExplicitIndex {
+		index := int(explicitIndex)
+		if state := s.outputs[index]; state != nil && state.acceptsEvent(itemID, callID, kind, eventKind) {
+			s.bindOutputState(state, itemID, callID, kind)
+			return state
+		}
+		if s.outputs[index] == nil {
+			if state := s.uniqueOutputCandidate(itemID, callID, kind, eventKind); state != nil {
+				state = s.reindexOutput(state, index)
+				s.bindOutputState(state, itemID, callID, kind)
+				return state
+			}
+			state := s.newOutputState(index)
+			s.bindOutputState(state, itemID, callID, kind)
+			return state
 		}
 	}
-	if !hasIndex {
-		return nil
+
+	if state := s.uniqueOutputCandidate(itemID, callID, kind, eventKind); state != nil {
+		s.bindOutputState(state, itemID, callID, kind)
+		return state
 	}
-	key := int(index)
-	state := s.outputs[key]
-	if state == nil {
-		state = &responseOutputState{index: key}
-		s.outputs[key] = state
-	}
+
+	state := s.allocateOutputState()
+	s.bindOutputState(state, itemID, callID, kind)
+	return state
+}
+
+func (s *responsesSSEAssembler) mappedOutput(itemID, callID string) *responseOutputState {
 	if itemID != "" {
-		state.itemID = itemID
-		s.indexByItemID[itemID] = key
+		if index, exists := s.indexByItemID[itemID]; exists {
+			return s.outputs[index]
+		}
+	}
+	if callID != "" {
+		if index, exists := s.indexByCallID[callID]; exists {
+			return s.outputs[index]
+		}
+	}
+	return nil
+}
+
+func (s *responsesSSEAssembler) uniqueOutputCandidate(itemID, callID, kind string, eventKind responseStreamOutputEvent) *responseOutputState {
+	var candidate *responseOutputState
+	for _, state := range s.outputs {
+		if !state.acceptsEvent(itemID, callID, kind, eventKind) {
+			continue
+		}
+		if candidate != nil {
+			return nil
+		}
+		candidate = state
+	}
+	return candidate
+}
+
+func (s *responseOutputState) acceptsEvent(itemID, callID, kind string, eventKind responseStreamOutputEvent) bool {
+	if kind != "" && s.kind != "" && kind != s.kind {
+		return false
+	}
+	if itemID != "" && s.itemID != "" && itemID != s.itemID && !s.itemIDSynthetic {
+		return false
+	}
+	if callID != "" && s.callID != "" && callID != s.callID {
+		return false
+	}
+	switch eventKind {
+	case outputEventItemAdded:
+		return s.addedItem == nil && s.doneItem == nil
+	case outputEventItemDone:
+		return s.doneItem == nil
+	case outputEventTextDelta:
+		return s.doneItem == nil && !s.textDoneSeen
+	case outputEventTextDone:
+		return s.doneItem == nil && !s.textDoneSeen
+	case outputEventRefusalDelta:
+		return s.doneItem == nil && !s.refusalDoneSeen
+	case outputEventRefusalDone:
+		return s.doneItem == nil && !s.refusalDoneSeen
+	case outputEventFunctionArgumentsDelta:
+		return s.doneItem == nil && !s.argumentsDoneSeen
+	case outputEventFunctionArgumentsDone:
+		return s.doneItem == nil && !s.argumentsDoneSeen
+	case outputEventCustomInputDelta:
+		return s.doneItem == nil && !s.customInputDoneSeen
+	case outputEventCustomInputDone:
+		return s.doneItem == nil && !s.customInputDoneSeen
+	default:
+		return true
+	}
+}
+
+func (s *responsesSSEAssembler) newOutputState(index int) *responseOutputState {
+	state := &responseOutputState{index: index}
+	s.outputs[index] = state
+	return state
+}
+
+func (s *responsesSSEAssembler) allocateOutputState() *responseOutputState {
+	for {
+		index := s.nextImplicitIndex
+		s.nextImplicitIndex++
+		if s.outputs[index] == nil {
+			return s.newOutputState(index)
+		}
+	}
+}
+
+func (s *responsesSSEAssembler) reindexOutput(state *responseOutputState, index int) *responseOutputState {
+	if state == nil || state.index == index || s.outputs[index] != nil {
+		return state
+	}
+	delete(s.outputs, state.index)
+	state.index = index
+	s.outputs[index] = state
+	if state.itemID != "" {
+		s.indexByItemID[state.itemID] = index
+	}
+	if state.callID != "" {
+		s.indexByCallID[state.callID] = index
 	}
 	return state
+}
+
+func (s *responsesSSEAssembler) bindOutputState(state *responseOutputState, itemID, callID, kind string) {
+	if state == nil {
+		return
+	}
+	if itemID != "" {
+		replacingItemID := state.itemID != "" && state.itemID != itemID
+		if state.itemIDSynthetic && replacingItemID {
+			delete(s.indexByItemID, state.itemID)
+		}
+		if state.itemID == "" || replacingItemID {
+			state.itemIDSynthetic = false
+		}
+		state.itemID = itemID
+		s.indexByItemID[itemID] = state.index
+	}
+	if callID != "" {
+		state.callID = callID
+		s.indexByCallID[callID] = state.index
+	}
+	if state.kind == "" && kind != "" {
+		state.kind = kind
+	}
+}
+
+func (s *responsesSSEAssembler) markSyntheticItemID(state *responseOutputState, itemID string) {
+	if state == nil || itemID == "" || state.itemID != itemID {
+		return
+	}
+	state.itemIDSynthetic = true
+}
+
+func (s *responsesSSEAssembler) normalizeSequence(event map[string]any, eventType string) bool {
+	if !strings.HasPrefix(eventType, "response.") {
+		return false
+	}
+	if sequence, ok := integerValue(event["sequence_number"]); ok {
+		if sequence > s.maxSequence {
+			s.maxSequence = sequence
+		}
+		return false
+	}
+	s.maxSequence++
+	event["sequence_number"] = s.maxSequence
+	return true
+}
+
+func (s *responsesSSEAssembler) normalizeOutputItemEvent(event, item map[string]any, state *responseOutputState, done bool) bool {
+	modified := setIntegerDefault(event, "output_index", int64(state.index))
+	kind := stringValue(item["type"])
+	itemID := firstNonEmptyString(stringValue(item["id"]), state.itemID)
+	callID := firstNonEmptyString(stringValue(item["call_id"]), state.callID)
+	if itemID == "" {
+		switch kind {
+		case "function_call":
+			itemID = syntheticToolItemID("fc_", callID)
+		case "custom_tool_call":
+			itemID = syntheticToolItemID("ct_", callID)
+		case "message":
+			itemID = s.syntheticMessageItemID(state.index)
+		}
+	}
+	syntheticItemID := stringValue(item["id"]) == "" && state.itemID == "" && itemID != ""
+	if itemID != "" && stringValue(item["id"]) == "" {
+		item["id"] = itemID
+		modified = true
+	}
+	s.bindOutputState(state, itemID, callID, kind)
+	if syntheticItemID {
+		s.markSyntheticItemID(state, itemID)
+	}
+
+	switch kind {
+	case "message":
+		if stringValue(item["role"]) == "" {
+			item["role"] = "assistant"
+			modified = true
+		}
+		if stringValue(item["status"]) == "" {
+			if done {
+				item["status"] = "completed"
+			} else {
+				item["status"] = "in_progress"
+			}
+			modified = true
+		}
+		if _, exists := item["content"]; !exists || item["content"] == nil {
+			item["content"] = []any{}
+			modified = true
+		}
+		if normalizeMessageContent(jsonArray(item["content"])) {
+			modified = true
+		}
+	case "function_call":
+		if callID != "" && stringValue(item["call_id"]) == "" {
+			item["call_id"] = callID
+			modified = true
+		}
+	case "custom_tool_call":
+		if callID != "" && stringValue(item["call_id"]) == "" {
+			item["call_id"] = callID
+			modified = true
+		}
+		if _, exists := item["input"]; !exists {
+			item["input"] = ""
+			modified = true
+		}
+	}
+	return modified
+}
+
+func (s *responsesSSEAssembler) normalizeContentEvent(event map[string]any, state *responseOutputState, contentIndexed bool) bool {
+	modified := setIntegerDefault(event, "output_index", int64(state.index))
+	itemID := firstNonEmptyString(stringValue(event["item_id"]), state.itemID)
+	if itemID == "" {
+		switch state.kind {
+		case "function_call":
+			itemID = syntheticToolItemID("fc_", state.callID)
+		case "custom_tool_call":
+			itemID = syntheticToolItemID("ct_", state.callID)
+		default:
+			itemID = s.syntheticMessageItemID(state.index)
+		}
+	}
+	syntheticItemID := stringValue(event["item_id"]) == "" && state.itemID == "" && itemID != ""
+	if itemID != "" && stringValue(event["item_id"]) == "" {
+		event["item_id"] = itemID
+		modified = true
+	}
+	s.bindOutputState(state, itemID, stringValue(event["call_id"]), state.kind)
+	if syntheticItemID {
+		s.markSyntheticItemID(state, itemID)
+	}
+	if contentIndexed && setIntegerDefault(event, "content_index", 0) {
+		modified = true
+	}
+	return modified
+}
+
+func (s *responsesSSEAssembler) syntheticMessageItemID(index int) string {
+	responseID := stringValue(s.responseSnapshot["id"])
+	base := strings.TrimPrefix(responseID, "resp_")
+	if base == "" {
+		base = "grok_build_proxy"
+	}
+	return fmt.Sprintf("msg_%s_%d", base, index)
+}
+
+func setIntegerDefault(object map[string]any, key string, value int64) bool {
+	if _, ok := integerValue(object[key]); ok {
+		return false
+	}
+	object[key] = value
+	return true
+}
+
+func normalizeMessageContent(content []any) bool {
+	modified := false
+	for _, raw := range content {
+		part := jsonObject(raw)
+		if stringValue(part["type"]) != "output_text" {
+			continue
+		}
+		if _, exists := part["annotations"]; !exists || part["annotations"] == nil {
+			part["annotations"] = []any{}
+			modified = true
+		}
+	}
+	return modified
 }
 
 func (s *responsesSSEAssembler) addStateBytes(size int) {
