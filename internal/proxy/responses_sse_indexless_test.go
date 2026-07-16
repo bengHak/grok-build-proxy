@@ -173,3 +173,106 @@ func TestResponsesLiteSSECapturesIndexlessCustomToolCall(t *testing.T) {
 		t.Fatalf("item = %#v", item)
 	}
 }
+
+func TestResponsesLiteSSENormalizesIndexlessTextEnvelope(t *testing.T) {
+	stream := sseStream(
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_wire","object":"response","status":"in_progress","model":"gpt-5.6-sol","output":[]}}`,
+		``,
+		`event: response.output_text.delta`,
+		`data: {"type":"response.output_text.delta","delta":"hello"}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_wire","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}}`,
+		``,
+	)
+
+	raw := normalizeSSE(t, stream)
+	delta := findSSEEvent(t, raw, "response.output_text.delta")
+	if _, ok := integerValue(delta["sequence_number"]); !ok {
+		t.Fatalf("missing sequence number: %#v", delta)
+	}
+	if delta["item_id"] != "msg_wire_0" {
+		t.Fatalf("item_id = %#v", delta["item_id"])
+	}
+	if index, ok := integerValue(delta["output_index"]); !ok || index != 0 {
+		t.Fatalf("output_index = %#v", delta["output_index"])
+	}
+	if index, ok := integerValue(delta["content_index"]); !ok || index != 0 {
+		t.Fatalf("content_index = %#v", delta["content_index"])
+	}
+}
+
+func TestResponsesLiteSSENormalizesIndexlessToolEnvelope(t *testing.T) {
+	stream := sseStream(
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_tool_wire","object":"response","status":"in_progress","model":"gpt-5.6-sol","output":[]}}`,
+		``,
+		`event: response.output_item.added`,
+		`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_wire","name":"update_goal","arguments":""}}`,
+		``,
+		`event: response.function_call_arguments.delta`,
+		`data: {"type":"response.function_call_arguments.delta","delta":"{\"completed\":"}`,
+		``,
+		`event: response.function_call_arguments.done`,
+		`data: {"type":"response.function_call_arguments.done","arguments":"{\"completed\":true}"}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_tool_wire","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}}`,
+		``,
+	)
+
+	raw := normalizeSSE(t, stream)
+	added := findSSEEvent(t, raw, "response.output_item.added")
+	item := jsonObject(added["item"])
+	if item["id"] != "fc_call_wire" {
+		t.Fatalf("item = %#v", item)
+	}
+	if index, ok := integerValue(added["output_index"]); !ok || index != 0 {
+		t.Fatalf("added output_index = %#v", added["output_index"])
+	}
+
+	for _, eventType := range []string{
+		"response.function_call_arguments.delta",
+		"response.function_call_arguments.done",
+	} {
+		event := findSSEEvent(t, raw, eventType)
+		if event["item_id"] != "fc_call_wire" {
+			t.Fatalf("%s item_id = %#v", eventType, event["item_id"])
+		}
+		if index, ok := integerValue(event["output_index"]); !ok || index != 0 {
+			t.Fatalf("%s output_index = %#v", eventType, event["output_index"])
+		}
+		if _, ok := integerValue(event["sequence_number"]); !ok {
+			t.Fatalf("%s missing sequence number: %#v", eventType, event)
+		}
+	}
+}
+
+func TestResponsesLiteSSENormalizesMessageDoneContent(t *testing.T) {
+	stream := sseStream(
+		`event: response.created`,
+		`data: {"type":"response.created","response":{"id":"resp_message_wire","object":"response","status":"in_progress","model":"gpt-5.6-sol","output":[]}}`,
+		``,
+		`event: response.output_item.done`,
+		`data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}`,
+		``,
+		`event: response.completed`,
+		`data: {"type":"response.completed","response":{"id":"resp_message_wire","object":"response","status":"completed","model":"gpt-5.6-sol","output":[]}}`,
+		``,
+	)
+
+	raw := normalizeSSE(t, stream)
+	done := findSSEEvent(t, raw, "response.output_item.done")
+	item := jsonObject(done["item"])
+	if item["id"] != "msg_message_wire_0" || item["status"] != "completed" {
+		t.Fatalf("item = %#v", item)
+	}
+	content := jsonArray(item["content"])
+	if len(content) != 1 {
+		t.Fatalf("content = %#v", content)
+	}
+	if _, ok := jsonObject(content[0])["annotations"].([]any); !ok {
+		t.Fatalf("annotations = %#v", jsonObject(content[0])["annotations"])
+	}
+}
