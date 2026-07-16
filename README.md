@@ -70,43 +70,53 @@ that can use the selected Codex model.
    grok -m codex-sol
    ```
 
-## Why v0.0.4 is required for Grok Build
+## Why v0.0.5 is required for Plan and Goal
 
-Grok Build displays `response.output_text.delta` chunks immediately, but decides
-whether a turn succeeded from the final `response.completed.response.output`.
-Some Responses Lite streams contain valid text deltas while leaving that final
-output empty, or finish with `[DONE]` without a terminal event. Grok Build then
-retries the turn and the already-displayed answer appears again.
+Grok Build streams tool-call arguments before deciding whether a turn completed
+successfully from `response.completed.response.output`. Some Responses Lite
+streams contain complete tool-call events while leaving that final output empty,
+or finish with `[DONE]` without a terminal event. That can make Grok Build retry
+a Plan or Goal turn and repeat `read_file`, `write`, `exit_plan_mode`, or
+`update_goal` calls.
 
-Version `0.0.4` normalizes those streams before forwarding them to Grok Build:
+Version `0.0.5` adds a canonical Responses Lite output assembler:
 
-- backfills an empty final assistant output from the text deltas already sent;
-- preserves an existing final output instead of duplicating it;
-- synthesizes one `response.completed` event before `[DONE]` only when a valid
-  response snapshot and streamed text are available;
-- applies the response adapter only to successful Responses Lite SSE requests.
+- reconstructs `function_call` items from `response.output_item.*` and
+  `response.function_call_arguments.*` events;
+- reconstructs `custom_tool_call` input when its done event is present;
+- merges text and tool calls by `output_index` without duplicating an existing
+  terminal item;
+- validates function IDs, call IDs, names, and JSON arguments before exposing a
+  completed call to Grok Build;
+- fails closed with a stream error when an executable call is incomplete;
+- preserves `response.incomplete`, `response.failed`, and upstream error
+  terminals instead of upgrading them to completed;
+- supports multiple interleaved tool calls and arbitrary network chunk
+  boundaries;
+- preserves explicit `tool_choice` values and `function_call_output.call_id`
+  across multi-turn Plan and Goal requests.
 
-It also includes the request compatibility introduced in earlier releases:
-
-- converts public Responses API `system` messages to the `developer` role;
-- sends `session-id`, `thread-id`, `x-session-affinity`, and the Codex
-  compatibility `version` header;
-- removes the obsolete fixed `OpenAI-Beta: responses=experimental` header;
-- removes WebSocket-only metadata from HTTP requests;
-- creates the canonical `additional_tools` input item, even when the tool list
-  is empty;
-- sets `tool_choice = "auto"`, `parallel_tool_calls = false`,
-  `reasoning.context = "all_turns"`, and a stable `prompt_cache_key`;
-- requests `reasoning.encrypted_content`, removes unsupported provider fields,
-  image detail, and nonpersistent input IDs;
-- logs a bounded, redacted upstream error summary while returning the original
-  error body to Grok Build.
+It also includes the request and text-stream compatibility introduced in earlier
+releases, including `system` to `developer` role normalization and final text
+backfilling. See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the support contract
+and validation matrix.
 
 The compatibility version defaults to `0.144.0`. Override it only when testing a
 newer official Codex contract:
 
 ```sh
 GROK_BUILD_PROXY_CODEX_COMPAT_VERSION=0.144.0 grok-build-proxy
+```
+
+The full tool-call assembler is enabled by default. Temporary rollback modes are
+available when diagnosing an upstream protocol change:
+
+```sh
+# Disable all Responses Lite response normalization.
+GROK_BUILD_PROXY_RESPONSES_COMPAT=off grok-build-proxy
+
+# Keep only the earlier text compatibility behavior. Missing tool terminals fail.
+GROK_BUILD_PROXY_RESPONSES_COMPAT=text grok-build-proxy
 ```
 
 ## Authentication and diagnostics
@@ -130,6 +140,24 @@ curl --fail http://127.0.0.1:18765/healthz
 curl --fail http://127.0.0.1:18765/readyz
 curl -fsS http://127.0.0.1:18765/v1/models | python3 -m json.tool
 ```
+
+## Plan and Goal
+
+Run the parent session with a proxy-backed Responses model:
+
+```sh
+grok -m codex-sol
+```
+
+`/plan` and `/goal` are implemented by Grok Build, not by this proxy. The proxy
+supplies protocol compatibility for their text and tool-call turns. Subagents
+inherit the parent model unless Grok configuration assigns a different model to
+that role. A subagent configured to use another provider will not pass through
+this proxy.
+
+For the first Goal test, use a small disposable Git repository and independently
+verify the resulting diff and tests. Goal orchestration may run several planner,
+verifier, strategist, and summarizer requests concurrently.
 
 ## Model substitutions
 
@@ -161,6 +189,7 @@ are rejected before the server starts.
 | `--models` | `GROK_BUILD_PROXY_MODELS` | built-in catalog |
 | `--model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | empty |
 | `--codex-compat-version` | `GROK_BUILD_PROXY_CODEX_COMPAT_VERSION` | `0.144.0` |
+| — | `GROK_BUILD_PROXY_RESPONSES_COMPAT` | `full` (`full`, `text`, or `off`) |
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
 
@@ -171,10 +200,14 @@ default loopback binding whenever possible.
 
 - `command not found`: ensure `$HOME/.local/bin` is in `PATH`.
 - `auth.json` missing: run `grok-build-proxy auth login`.
-- The same answer is displayed repeatedly: upgrade to `0.0.4` or newer.
+- Plan or Goal repeats a tool call: upgrade to `0.0.5` or newer and inspect the
+  stream error before lowering `GROK_MAX_RETRIES` for diagnosis.
+- `proxy_incomplete_output`: the upstream stream ended before a safe executable
+  tool call could be reconstructed; the proxy intentionally did not complete it.
+- The same text answer is displayed repeatedly: upgrade to `0.0.4` or newer.
 - `System messages are not allowed`: upgrade to `0.0.3` or newer.
 - Other 400 responses with a GPT-5.6 model: inspect the `upstream_error` log
-  field and confirm `grok-build-proxy --version` reports `0.0.4` or newer.
+  field and confirm `grok-build-proxy --version` reports `0.0.5` or newer.
 - 401: run `grok-build-proxy auth status`, then log in again if required.
 - Mapping has no effect: confirm the selected Grok entry points to this local
   endpoint and its `model` value exactly matches the map source.
@@ -189,7 +222,7 @@ cd grok-build-proxy
 gofmt -w $(find . -name '*.go' -type f)
 go vet ./...
 go test -race ./...
-make dist VERSION=0.0.4
+make dist VERSION=0.0.5
 ```
 
 Release assets are built for macOS arm64 and amd64 and published with a SHA-256
