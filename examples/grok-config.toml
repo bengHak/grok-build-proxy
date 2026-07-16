@@ -1,0 +1,39 @@
+# Merge the model blocks you want into ~/.grok/config.toml.
+# Start grok-build-proxy first; it listens on 127.0.0.1:18765 by default.
+
+[model.codex-sol]
+model = "gpt-5.6-sol"
+name = "Codex GPT-5.6 Sol"
+description = "Latest frontier agentic coding model via ChatGPT Codex"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+context_window = 372000
+
+[model.codex-terra]
+model = "gpt-5.6-terra"
+name = "Codex GPT-5.6 Terra"
+description = "Balanced agentic coding model via ChatGPT Codex"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+context_window = 372000
+
+[model.codex-luna]
+model = "gpt-5.6-luna"
+name = "Codex GPT-5.6 Luna"
+description = "Fast agentic coding model via ChatGPT Codex"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+context_window = 372000
+
+# The -fast suffix is a local proxy alias. It sends the base model with
+# service_tier="priority". Availability and usage impact depend on the account.
+[model.codex-sol-fast]
+model = "gpt-5.6-sol-fast"
+name = "Codex GPT-5.6 Sol (Fast)"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+context_window = 372000
