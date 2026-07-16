@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -31,6 +32,10 @@ func main() {
 }
 
 func run() error {
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("grok-build-proxy supports macOS only (detected %s)", runtime.GOOS)
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("resolve home directory: %w", err)
@@ -62,7 +67,10 @@ func run() error {
 	}
 
 	logger := newLogger(*logFormat)
-	store, err := auth.NewStore(auth.Config{Path: *authFile, RefreshURL: *refreshURL})
+	store, err := auth.NewStore(auth.Config{
+		Path:       *authFile,
+		RefreshURL: *refreshURL,
+	})
 	if err != nil {
 		return err
 	}
@@ -90,7 +98,12 @@ func run() error {
 	defer stop()
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("proxy listening", "address", *listen, "auth_file", *authFile, "models", strings.Join(models.IDs(), ","), "version", version)
+		logger.Info("proxy listening",
+			"address", *listen,
+			"auth_file", *authFile,
+			"models", strings.Join(models.IDs(), ","),
+			"version", version,
+		)
 		serveErr <- server.ListenAndServe()
 	}()
 
