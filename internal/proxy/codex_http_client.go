@@ -52,6 +52,11 @@ func (t *codexCompatTransport) RoundTrip(req *http.Request) (*http.Response, err
 	if err != nil {
 		return nil, err
 	}
+	if shouldNormalizeCodexSSEResponse(req, resp) {
+		resp.Body = newResponsesLiteSSEBody(resp.Body)
+		resp.ContentLength = -1
+		resp.Header.Del("Content-Length")
+	}
 	if resp.StatusCode >= 400 {
 		logUpstreamError(t.logger, req, resp)
 	}
