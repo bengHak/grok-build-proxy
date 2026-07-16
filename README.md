@@ -70,15 +70,25 @@ that can use the selected Codex model.
    grok -m codex-sol
    ```
 
-## Why v0.0.3 is required for Grok Build
+## Why v0.0.4 is required for Grok Build
 
-Version `0.0.3` converts public Responses API `system` input messages to the
-`developer` role before forwarding them to the ChatGPT Codex backend. This
-preserves the message content and ordering while preventing the upstream
-`400 Bad Request: System messages are not allowed` response.
+Grok Build displays `response.output_text.delta` chunks immediately, but decides
+whether a turn succeeded from the final `response.completed.response.output`.
+Some Responses Lite streams contain valid text deltas while leaving that final
+output empty, or finish with `[DONE]` without a terminal event. Grok Build then
+retries the turn and the already-displayed answer appears again.
 
-It also includes the Responses Lite HTTP compatibility introduced in `0.0.2`:
+Version `0.0.4` normalizes those streams before forwarding them to Grok Build:
 
+- backfills an empty final assistant output from the text deltas already sent;
+- preserves an existing final output instead of duplicating it;
+- synthesizes one `response.completed` event before `[DONE]` only when a valid
+  response snapshot and streamed text are available;
+- applies the response adapter only to successful Responses Lite SSE requests.
+
+It also includes the request compatibility introduced in earlier releases:
+
+- converts public Responses API `system` messages to the `developer` role;
 - sends `session-id`, `thread-id`, `x-session-affinity`, and the Codex
   compatibility `version` header;
 - removes the obsolete fixed `OpenAI-Beta: responses=experimental` header;
@@ -161,9 +171,10 @@ default loopback binding whenever possible.
 
 - `command not found`: ensure `$HOME/.local/bin` is in `PATH`.
 - `auth.json` missing: run `grok-build-proxy auth login`.
+- The same answer is displayed repeatedly: upgrade to `0.0.4` or newer.
 - `System messages are not allowed`: upgrade to `0.0.3` or newer.
 - Other 400 responses with a GPT-5.6 model: inspect the `upstream_error` log
-  field and confirm `grok-build-proxy --version` reports `0.0.3` or newer.
+  field and confirm `grok-build-proxy --version` reports `0.0.4` or newer.
 - 401: run `grok-build-proxy auth status`, then log in again if required.
 - Mapping has no effect: confirm the selected Grok entry points to this local
   endpoint and its `model` value exactly matches the map source.
@@ -178,7 +189,7 @@ cd grok-build-proxy
 gofmt -w $(find . -name '*.go' -type f)
 go vet ./...
 go test -race ./...
-make dist VERSION=0.0.3
+make dist VERSION=0.0.4
 ```
 
 Release assets are built for macOS arm64 and amd64 and published with a SHA-256
