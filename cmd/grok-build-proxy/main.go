@@ -2,131 +2,124 @@ package main
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
+	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
-	"time"
-
-	"github.com/bengHak/grok-build-proxy/internal/auth"
-	"github.com/bengHak/grok-build-proxy/internal/catalog"
-	proxyhandler "github.com/bengHak/grok-build-proxy/internal/proxy"
 )
 
 var version = "dev"
 
 const defaultUpstream = "https://chatgpt.com/backend-api/codex/responses"
 
+type commandIO struct {
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+}
+
+type commandDefaults struct {
+	home       string
+	codexHome  string
+	authFile   string
+	grokConfig string
+}
+
 func main() {
-	if err := run(); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := execute(ctx, os.Args[1:], commandIO{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr}); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	if runtime.GOOS != "darwin" {
-		return fmt.Errorf("grok-build-proxy supports macOS only (detected %s)", runtime.GOOS)
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return fmt.Errorf("resolve home directory: %w", err)
-	}
-	defaultCodexHome := envOr("CODEX_HOME", filepath.Join(home, ".codex"))
-
-	listen := flag.String("listen", envOr("GROK_BUILD_PROXY_LISTEN", "127.0.0.1:18765"), "address to listen on")
-	authFile := flag.String("auth-file", envOr("GROK_BUILD_PROXY_AUTH_FILE", filepath.Join(defaultCodexHome, "auth.json")), "path to the Codex CLI auth.json file")
-	upstream := flag.String("upstream", envOr("GROK_BUILD_PROXY_UPSTREAM", defaultUpstream), "ChatGPT Codex Responses endpoint")
-	refreshURL := flag.String("refresh-url", envOr("GROK_BUILD_PROXY_REFRESH_URL", auth.DefaultRefreshURL), "OpenAI OAuth token refresh endpoint")
-	modelsCSV := flag.String("models", os.Getenv("GROK_BUILD_PROXY_MODELS"), "comma-separated model IDs exposed by /v1/models")
-	clientToken := flag.String("client-token", os.Getenv("GROK_BUILD_PROXY_TOKEN"), "optional bearer token required from local clients")
-	logFormat := flag.String("log-format", envOr("GROK_BUILD_PROXY_LOG_FORMAT", "text"), "text or json")
-	printConfig := flag.Bool("print-grok-config", false, "print example Grok Build model configuration and exit")
-	showVersion := flag.Bool("version", false, "print version and exit")
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Println(version)
-		return nil
-	}
-	models := catalog.New(*modelsCSV)
-	if *printConfig {
-		fmt.Print(renderGrokConfig(*listen, models))
-		return nil
-	}
-	if !proxyhandler.IsLoopbackListen(*listen) && strings.TrimSpace(*clientToken) == "" {
-		return errors.New("refusing to bind to a non-loopback address without --client-token or GROK_BUILD_PROXY_TOKEN")
-	}
-
-	logger := newLogger(*logFormat)
-	store, err := auth.NewStore(auth.Config{
-		Path:       *authFile,
-		RefreshURL: *refreshURL,
-	})
+func execute(ctx context.Context, args []string, streams commandIO) error {
+	defaults, err := resolveDefaults()
 	if err != nil {
 		return err
 	}
-	handler, err := proxyhandler.New(proxyhandler.Config{
-		UpstreamURL: *upstream,
-		Credentials: store,
-		Catalog:     models,
-		Logger:      logger,
-		ClientToken: *clientToken,
-		Version:     version,
-	})
-	if err != nil {
-		return err
+	if len(args) == 0 {
+		return runServe(ctx, nil, streams, defaults)
 	}
 
-	server := &http.Server{
-		Addr:              *listen,
-		Handler:           handler,
-		ReadHeaderTimeout: 15 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
-
-	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	serveErr := make(chan error, 1)
-	go func() {
-		logger.Info("proxy listening",
-			"address", *listen,
-			"auth_file", *authFile,
-			"models", strings.Join(models.IDs(), ","),
-			"version", version,
-		)
-		serveErr <- server.ListenAndServe()
-	}()
-
-	select {
-	case err := <-serveErr:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+	switch args[0] {
+	case "serve":
+		return runServe(ctx, args[1:], streams, defaults)
+	case "auth":
+		return runAuth(ctx, args[1:], streams, defaults)
+	case "doctor":
+		return runDoctor(ctx, args[1:], streams, defaults)
+	case "version", "--version":
+		fmt.Fprintln(streams.stdout, version)
+		return nil
+	case "help", "--help", "-h":
+		writeRootUsage(streams.stdout)
+		return nil
+	default:
+		if strings.HasPrefix(args[0], "-") {
+			return runServe(ctx, args, streams, defaults)
 		}
-		return err
-	case <-shutdownCtx.Done():
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		logger.Info("shutting down")
-		return server.Shutdown(ctx)
+		writeRootUsage(streams.stderr)
+		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-func newLogger(format string) *slog.Logger {
+func resolveDefaults() (commandDefaults, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return commandDefaults{}, fmt.Errorf("resolve home directory: %w", err)
+	}
+	codexHome := firstNonEmpty(
+		os.Getenv("GROK_BUILD_PROXY_CODEX_HOME"),
+		os.Getenv("CODEX_HOME"),
+		filepath.Join(home, ".codex-grok-build-proxy"),
+	)
+	return commandDefaults{
+		home:       home,
+		codexHome:  filepath.Clean(codexHome),
+		authFile:   filepath.Clean(envOr("GROK_BUILD_PROXY_AUTH_FILE", filepath.Join(codexHome, "auth.json"))),
+		grokConfig: filepath.Clean(envOr("GROK_BUILD_PROXY_GROK_CONFIG", filepath.Join(home, ".grok", "config.toml"))),
+	}, nil
+}
+
+func requireMacOS() error {
+	if runtime.GOOS != "darwin" {
+		return fmt.Errorf("grok-build-proxy supports macOS only (detected %s)", runtime.GOOS)
+	}
+	if runtime.GOARCH != "arm64" && runtime.GOARCH != "amd64" {
+		return fmt.Errorf("grok-build-proxy does not support macOS/%s", runtime.GOARCH)
+	}
+	return nil
+}
+
+func writeRootUsage(w io.Writer) {
+	fmt.Fprintln(w, `Usage:
+  grok-build-proxy [serve flags]
+  grok-build-proxy serve [flags]
+  grok-build-proxy auth <login|device|status|logout> [flags]
+  grok-build-proxy doctor [flags]
+  grok-build-proxy --version
+
+Commands:
+  serve    Start the local Grok Build to Codex proxy (default command)
+  auth     Delegate ChatGPT authentication to the official Codex CLI
+  doctor   Check Codex auth, Grok Build configuration, and proxy readiness
+
+Run "grok-build-proxy <command> --help" for command-specific options.`)
+}
+
+func newLogger(format string, w io.Writer) *slog.Logger {
 	options := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if strings.EqualFold(format, "json") {
-		return slog.New(slog.NewJSONHandler(os.Stderr, options))
+		return slog.New(slog.NewJSONHandler(w, options))
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, options))
+	return slog.New(slog.NewTextHandler(w, options))
 }
 
 func envOr(name, fallback string) string {
@@ -136,18 +129,11 @@ func envOr(name, fallback string) string {
 	return fallback
 }
 
-func renderGrokConfig(listen string, models catalog.Catalog) string {
-	var builder strings.Builder
-	builder.WriteString("# Add selected blocks to ~/.grok/config.toml\n\n")
-	for _, model := range models.Models() {
-		name := strings.NewReplacer(".", "-", "_", "-", "/", "-").Replace(model.ID)
-		fmt.Fprintf(&builder, "[model.codex-%s]\n", name)
-		fmt.Fprintf(&builder, "model = %q\n", model.ID)
-		fmt.Fprintf(&builder, "name = %q\n", "Codex "+model.DisplayName)
-		fmt.Fprintf(&builder, "base_url = %q\n", "http://"+listen+"/v1")
-		builder.WriteString("api_backend = \"responses\"\n")
-		builder.WriteString("api_key = \"unused\"\n")
-		fmt.Fprintf(&builder, "context_window = %d\n\n", model.ContextWindow)
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
 	}
-	return builder.String()
+	return ""
 }
