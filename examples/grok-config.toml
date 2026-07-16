@@ -1,5 +1,10 @@
 # Merge the model blocks you want into ~/.grok/config.toml.
 # Start grok-build-proxy first; it listens on 127.0.0.1:18765 by default.
+# If your file already has a [models] table, add this key to that table instead
+# of declaring [models] a second time.
+
+[models]
+default_reasoning_effort = "xhigh"
 
 [model.codex-sol]
 model = "gpt-5.6-sol"

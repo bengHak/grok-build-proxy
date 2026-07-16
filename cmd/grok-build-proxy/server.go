@@ -29,6 +29,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 	refreshURL := flags.String("refresh-url", envOr("GROK_BUILD_PROXY_REFRESH_URL", auth.DefaultRefreshURL), "OpenAI OAuth token refresh endpoint")
 	modelsCSV := flags.String("models", strings.TrimSpace(os.Getenv("GROK_BUILD_PROXY_MODELS")), "comma-separated model IDs exposed by /v1/models")
 	modelMapSpec := flags.String("model-map", strings.TrimSpace(os.Getenv("GROK_BUILD_PROXY_MODEL_MAP")), "comma-separated Grok-to-Codex substitutions (source=target)")
+	codexCompatVersion := flags.String("codex-compat-version", envOr("GROK_BUILD_PROXY_CODEX_COMPAT_VERSION", proxyhandler.DefaultCodexCompatibilityVersion), "Codex backend compatibility version header")
 	clientToken := flags.String("client-token", strings.TrimSpace(os.Getenv("GROK_BUILD_PROXY_TOKEN")), "optional bearer token required from local clients")
 	logFormat := flags.String("log-format", envOr("GROK_BUILD_PROXY_LOG_FORMAT", "text"), "text or json")
 	printConfig := flags.Bool("print-grok-config", false, "print example Grok Build model configuration and exit")
@@ -77,6 +78,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 		Credentials: store,
 		Catalog:     models,
 		ModelMap:    mappings,
+		HTTPClient:  proxyhandler.NewCodexHTTPClient(logger, *codexCompatVersion),
 		Logger:      logger,
 		ClientToken: *clientToken,
 		Version:     version,
@@ -100,6 +102,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 			"auth_file", *authFile,
 			"models", strings.Join(models.IDs(), ","),
 			"model_map", mappings.String(),
+			"codex_compat_version", *codexCompatVersion,
 			"version", version,
 		)
 		serveErr <- server.ListenAndServe()
@@ -122,6 +125,9 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 func renderGrokConfig(listen string, models catalog.Catalog, mappings modelmap.Map) string {
 	var builder strings.Builder
 	builder.WriteString("# Add selected blocks to ~/.grok/config.toml\n\n")
+	builder.WriteString("# Optional global default used by the Quick Start:\n")
+	builder.WriteString("# [models]\n")
+	builder.WriteString("# default_reasoning_effort = \"xhigh\"\n\n")
 	mappedSources := make(map[string]struct{}, mappings.Len())
 	for _, entry := range mappings.Entries() {
 		mappedSources[entry.Source] = struct{}{}

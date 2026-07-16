@@ -8,7 +8,10 @@ Treat the Codex authentication file as a password.
 - The server binds to `127.0.0.1` by default.
 - Binding to a non-loopback address is rejected unless an inbound bearer token
   is configured with `GROK_BUILD_PROXY_TOKEN` or `--client-token`.
-- Request bodies, response bodies, and authorization values are not logged.
+- Request bodies, successful response bodies, and authorization values are not
+  logged. For upstream 4xx/5xx responses, the proxy records only a bounded,
+  single-line error summary with common credential shapes redacted; the
+  original response body is forwarded to the local caller.
 - The installer writes only the executable into the selected installation
   directory and does not read or copy Codex credentials.
 - `grok-build-proxy auth` delegates login, device authorization, status, and

@@ -4,14 +4,10 @@ on:
   push:
     tags:
       - "v*"
-    branches:
-      - main
-    paths:
-      - VERSION
   workflow_dispatch:
     inputs:
       version:
-        description: "Semantic version to release (for example 0.0.1)"
+        description: "Semantic version to release (for example 0.0.2)"
         required: false
         type: string
 
@@ -86,6 +82,7 @@ jobs:
             dist/grok-build-proxy_Darwin_amd64.tar.gz
             dist/checksums.txt
             --generate-notes
+            --latest
             --title "${TAG}"
           )
 
