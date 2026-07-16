@@ -20,7 +20,9 @@ var allowedCodexFields = map[string]struct{}{
 
 func normalizeCodexBody(body map[string]any, identity codexIdentity, lite bool) error {
 	body["store"] = false
-	body["tool_choice"] = "auto"
+	if err := normalizeCompatToolChoice(body); err != nil {
+		return err
+	}
 	if identity.sessionID != "" {
 		body["prompt_cache_key"] = identity.sessionID
 	}
@@ -50,6 +52,30 @@ func normalizeCodexBody(body map[string]any, identity codexIdentity, lite bool) 
 		}
 	}
 	return nil
+}
+
+func normalizeCompatToolChoice(body map[string]any) error {
+	raw, exists := body["tool_choice"]
+	if !exists || raw == nil {
+		body["tool_choice"] = "auto"
+		return nil
+	}
+	switch choice := raw.(type) {
+	case string:
+		switch strings.ToLower(strings.TrimSpace(choice)) {
+		case "auto", "none", "required":
+			return nil
+		default:
+			return errors.New("tool_choice must be auto, none, required, or an object")
+		}
+	case map[string]any:
+		if strings.TrimSpace(stringValue(choice["type"])) == "" {
+			return errors.New("tool_choice object requires a type")
+		}
+		return nil
+	default:
+		return errors.New("tool_choice must be a string or object")
+	}
 }
 
 func normalizeResponsesLiteBody(body map[string]any, input []any) error {
