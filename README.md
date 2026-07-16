@@ -1,34 +1,96 @@
 # grok-build-proxy
 
+[![CI](https://github.com/bengHak/grok-build-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bengHak/grok-build-proxy/actions/workflows/ci.yml)
+
 A lightweight, macOS-only local proxy that lets **Grok Build** use Codex models
-available through your ChatGPT account. It accepts Grok Build's native OpenAI
-Responses API requests, adds Codex authentication, applies the small request
-shape differences required by Responses Lite models, and streams the response
-back without an Anthropic/Claude translation layer.
+available through your ChatGPT account.
+
+Grok Build remains the agent harness and continues to own prompts, tools,
+permissions, Plan mode, Goal mode, subagents, context, and session state. The
+proxy handles Codex authentication, optional model-ID substitution, Responses
+API adaptation, and streaming.
 
 > [!WARNING]
-> This is an unofficial community project. It is not affiliated with or
-> endorsed by OpenAI, ChatGPT, Codex, xAI, or Grok. Model access depends on your
-> ChatGPT plan and workspace policy. The private ChatGPT Codex backend can change
-> without notice and may require proxy updates.
+> This is an unofficial community project. It is not affiliated with or endorsed
+> by OpenAI, ChatGPT, Codex, xAI, or Grok. It uses the ChatGPT Codex backend,
+> which is separate from the public OpenAI Platform API and may change without
+> notice. Model availability depends on your ChatGPT plan and workspace policy.
 
 ## Table of contents
 
+- [Quick start](#quick-start)
 - [Requirements](#requirements)
-- [Install with curl](#install-with-curl)
+- [Install](#install)
 - [Authenticate with the official Codex CLI](#authenticate-with-the-official-codex-cli)
-- [Run the doctor](#run-the-doctor)
-- [Start the proxy](#start-the-proxy)
 - [Configure Grok Build](#configure-grok-build)
+- [Run and verify](#run-and-verify)
 - [Model substitutions](#model-substitutions)
-- [Supported models](#supported-models)
+- [Supported Codex models](#supported-codex-models)
 - [How it works](#how-it-works)
 - [Commands](#commands)
-- [Configuration](#configuration)
+- [Configuration reference](#configuration-reference)
+- [Troubleshooting](#troubleshooting)
 - [Security](#security)
-- [Development](#development)
-- [Release process](#release-process)
+- [Update and uninstall](#update-and-uninstall)
+- [Development and releases](#development-and-releases)
 - [Limitations](#limitations)
+
+## Quick start
+
+Start with a separate Codex model name inside Grok Build. This is the simplest
+way to verify authentication and transport before adding model substitutions.
+
+1. Install the proxy:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh | sh
+   ```
+
+2. Add the default install directory to `PATH` when necessary:
+
+   ```sh
+   echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+   exec zsh
+   ```
+
+3. Sign in through the official Codex CLI:
+
+   ```sh
+   grok-build-proxy auth login
+   ```
+
+4. Add this block to `~/.grok/config.toml`:
+
+   ```toml
+   [model.codex-terra]
+   model = "gpt-5.6-terra"
+   name = "Codex GPT-5.6 Terra"
+   base_url = "http://127.0.0.1:18765/v1"
+   api_backend = "responses"
+   api_key = "unused"
+   context_window = 372000
+   ```
+
+5. Check the setup:
+
+   ```sh
+   grok-build-proxy doctor
+   ```
+
+6. Start the proxy in one terminal and Grok Build in another:
+
+   ```sh
+   # Terminal 1
+   grok-build-proxy
+   ```
+
+   ```sh
+   # Terminal 2
+   grok -m codex-terra
+   ```
+
+A stopped proxy is a doctor warning when the port is available. Fix every
+`FAIL` result before starting Grok Build.
 
 ## Requirements
 
@@ -40,39 +102,38 @@ back without an Anthropic/Claude translation layer.
 The installer intentionally rejects Linux and Windows. Release artifacts are
 built only for macOS.
 
-## Install with curl
+## Install
 
-Install the latest release into `$HOME/.local/bin`:
+The installer prefers a matching binary from the latest GitHub release. If no
+release or matching asset is available, it builds the repository source and
+requires Go 1.23 or newer.
+
+### Latest release when available
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh | sh
 ```
 
-Make sure that directory is on your `PATH`. The default macOS shell is zsh:
+The default destination is `$HOME/.local/bin/grok-build-proxy`.
+
+### Current `main` source
+
+Use this when a required feature has not reached a tagged release:
 
 ```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
-exec zsh
+curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh \
+  | sh -s -- --from-source
 ```
 
-Verify the installation:
-
-```sh
-grok-build-proxy --version
-```
-
-The installer downloads the architecture-specific release archive and verifies
-its SHA-256 checksum. Before the first tagged release exists, it falls back to a
-local source build when Go 1.23 or newer is available.
-
-Install a specific release or choose another directory:
+### Specific release or source ref
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh \
   | sh -s -- --version v0.1.0 --install-dir "$HOME/bin"
 ```
 
-Equivalent environment variables are also supported:
+If the release asset is unavailable, `--version` is used as the source tag or
+branch fallback. Equivalent environment variables are supported:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh \
@@ -81,93 +142,152 @@ curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/insta
     sh
 ```
 
-Review [`install.sh`](install.sh) before piping it to a shell when required by
-your security policy.
+Release archives are verified against the published SHA-256 manifest. To review
+the installer before running it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh \
+  -o /tmp/grok-build-proxy-install.sh
+less /tmp/grok-build-proxy-install.sh
+sh /tmp/grok-build-proxy-install.sh
+```
+
+Verify the result:
+
+```sh
+grok-build-proxy --version
+```
 
 ## Authenticate with the official Codex CLI
 
-The proxy does **not** implement or imitate OpenAI's OAuth login flow. Its auth
-commands prepare a dedicated, file-backed `CODEX_HOME` and then execute the
-official Codex CLI.
-
-Browser login:
+The proxy does **not** implement or imitate OpenAI's OAuth login UI. Its auth
+commands prepare a dedicated, file-backed `CODEX_HOME` and execute the official
+Codex CLI.
 
 ```sh
+# Browser login
 grok-build-proxy auth login
-```
 
-Device-code login for a headless Mac:
-
-```sh
+# Device-code login for a headless Mac
 grok-build-proxy auth device
-```
 
-Check or clear the current login:
-
-```sh
+# Inspect or clear the login
 grok-build-proxy auth status
 grok-build-proxy auth logout
 ```
 
-By default these commands use:
+Device-code authentication is currently marked beta by OpenAI and may need to
+be enabled in personal security settings or workspace permissions.
+
+The default credential directory is:
 
 ```text
 ~/.codex-grok-build-proxy
 ```
 
-They preserve unrelated Codex settings while ensuring these top-level values in
-`config.toml`:
+The wrapper preserves unrelated Codex settings while ensuring:
 
 ```toml
 cli_auth_credentials_store = "file"
 forced_login_method = "chatgpt"
 ```
 
-The resulting `auth.json` contains access and refresh tokens and must be
-protected like a password. To use another dedicated directory:
+The resulting `auth.json` contains access and refresh tokens. Treat it like a
+password. Credential-directory precedence is:
+
+1. `GROK_BUILD_PROXY_CODEX_HOME`
+2. `CODEX_HOME`
+3. `~/.codex-grok-build-proxy`
+
+Use a custom dedicated directory with:
 
 ```sh
 grok-build-proxy auth login --codex-home "$HOME/.my-codex-proxy"
 ```
 
-`GROK_BUILD_PROXY_CODEX_HOME` and `CODEX_HOME` are also supported. The proxy
-prefers them in that order.
+A dedicated directory reduces refresh-token races with ordinary Codex CLI
+sessions.
 
-## Run the doctor
+## Configure Grok Build
 
-Run the built-in diagnostic before starting Grok Build:
+There are two routing modes. They can coexist, but test the direct mode first.
 
-```sh
-grok-build-proxy doctor
+### Direct Codex model names
+
+Create a new Grok model entry whose `model` value is already a Codex model ID:
+
+```toml
+[model.codex-sol]
+model = "gpt-5.6-sol"
+name = "Codex GPT-5.6 Sol"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+context_window = 372000
 ```
 
-The doctor does not print token values. It checks:
-
-- macOS and CPU architecture;
-- the official `codex` executable and `codex login status`;
-- file-backed Codex credential settings;
-- ChatGPT auth mode, token expiry, refresh-token presence, and file permissions;
-- the `grok` executable and `~/.grok/config.toml`;
-- proxy-side model substitution syntax and cycles;
-- whether the proxy is already running or its port is available;
-- `/healthz` and `/readyz` when a proxy instance is running.
-
-Warnings do not make the command fail. Missing required CLIs or configuration,
-authentication failures, unsafe permissions, and port conflicts return a
-non-zero exit status.
-
-Useful overrides:
+Run it with:
 
 ```sh
-grok-build-proxy doctor \
-  --codex-home "$HOME/.codex-grok-build-proxy" \
-  --grok-config "$HOME/.grok/config.toml" \
-  --listen 127.0.0.1:18765
+grok -m codex-sol
 ```
 
-## Start the proxy
+No model map is needed in this mode. Additional examples are available in
+[`examples/grok-config.toml`](examples/grok-config.toml).
 
-After authentication succeeds:
+### Preserve built-in Grok model IDs
+
+Model substitution preserves source IDs such as `grok-build`,
+`grok-composer-2.5`, or `grok-4.5` while sending a selected Codex target
+upstream.
+
+This mode requires both:
+
+1. a model map when the proxy starts; and
+2. Grok model blocks that point the source IDs to the local proxy.
+
+Generate matching blocks with the same map used by the proxy:
+
+```sh
+GROK_BUILD_PROXY_MODEL_MAP='grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol' \
+  grok-build-proxy --print-grok-config \
+  > /tmp/grok-build-proxy-models.toml
+
+cat /tmp/grok-build-proxy-models.toml
+```
+
+Review and merge the relevant blocks into `~/.grok/config.toml`. Do not blindly
+append the output if the file already defines the same table names.
+
+A generated override looks like this:
+
+```toml
+# Proxy mapping: grok-4.5 -> gpt-5.6-sol
+[model."grok-4.5"]
+model = "grok-4.5"
+name = "Grok 4.5 via Codex GPT-5.6 Sol"
+description = "Routes grok-4.5 to gpt-5.6-sol through grok-build-proxy"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+context_window = 372000
+```
+
+> [!IMPORTANT]
+> Keep the source ID in the `model` field. For example, a `grok-4.5` mapping
+> requires `model = "grok-4.5"`. Setting it directly to `gpt-5.6-sol` switches
+> to direct-model routing and bypasses that source mapping.
+
+The generated config does not persist the proxy's model map. Start the proxy
+with the same `GROK_BUILD_PROXY_MODEL_MAP` or `--model-map` value every time.
+
+`api_key = "unused"` prevents Grok Build from attaching an xAI session token to
+the loopback endpoint. When using a protected non-loopback endpoint, replace it
+with the configured proxy bearer token.
+
+## Run and verify
+
+Start the proxy in the foreground while configuring it:
 
 ```sh
 grok-build-proxy
@@ -179,64 +299,42 @@ The explicit form is equivalent:
 grok-build-proxy serve
 ```
 
-The default address is `http://127.0.0.1:18765`. Check readiness with:
+The default address is `http://127.0.0.1:18765`.
+
+### Health, readiness, and routes
 
 ```sh
-curl --fail http://127.0.0.1:18765/readyz
+curl -fsS http://127.0.0.1:18765/healthz | python3 -m json.tool
+curl -fsS http://127.0.0.1:18765/readyz | python3 -m json.tool
+curl -fsS http://127.0.0.1:18765/v1/models | python3 -m json.tool
 ```
 
-The proxy exposes these endpoints:
+- `healthz` confirms the process is running and reports the map count.
+- `readyz` verifies that Codex credentials can be loaded or refreshed.
+- `v1/models` lists canonical and mapped routes. Mapped entries include
+  `target_model`; fast routes include `service_tier: "priority"`.
 
-| Endpoint | Purpose |
-|---|---|
-| `POST /v1/responses` | Proxies a Codex Responses request |
-| `GET /v1/models` | Returns the model catalog for Grok Build |
-| `GET /healthz` | Reports process health |
-| `GET /readyz` | Verifies that Codex credentials can be loaded |
+Run `grok-build-proxy doctor` before startup to validate files and port
+availability, or from another terminal after startup to validate the live
+endpoints too. It checks the platform, CLIs, authentication, file permissions,
+Grok config, model-map syntax, port state, health, and readiness without printing
+token values.
+
+### HTTP endpoints
+
+| Endpoint | Authentication | Purpose |
+|---|---|---|
+| `POST /v1/responses` | Proxy token when configured | Proxy a Codex Responses request |
+| `GET /v1/models` | Proxy token when configured | Return canonical and mapped routes |
+| `GET /healthz` | None | Report process health and map count |
+| `GET /readyz` | Proxy token when configured | Verify Codex credentials |
 
 `/responses` and `/models` are compatibility aliases.
 
-## Configure Grok Build
-
-Copy the model blocks you need from
-[`examples/grok-config.toml`](examples/grok-config.toml) into
-`~/.grok/config.toml`. A minimal example is:
-
-```toml
-[model.codex-terra]
-model = "gpt-5.6-terra"
-name = "Codex GPT-5.6 Terra"
-base_url = "http://127.0.0.1:18765/v1"
-api_backend = "responses"
-api_key = "unused"
-context_window = 372000
-```
-
-`api_key = "unused"` prevents Grok Build from reusing an xAI session token for
-this local endpoint. The proxy ignores the incoming Authorization value while
-bound to loopback and loads the real Codex credentials from the Codex CLI auth
-file.
-
-Start Grok Build with the custom model:
-
-```sh
-grok -m codex-terra
-```
-
-Generate model blocks from the proxy's current catalog:
-
-```sh
-grok-build-proxy --print-grok-config
-```
-
 ## Model substitutions
 
-The proxy can replace any Grok-facing model ID with a user-selected Codex model
-ID. This lets Grok Build keep its existing agent definitions—including Plan and
-Goal subagents—while only the model ID sent to the Codex backend changes.
-Substitution is disabled by default.
-
-Configure comma-separated `source=target` pairs:
+Substitution is disabled by default. Configure comma-separated `source=target`
+pairs:
 
 ```sh
 export GROK_BUILD_PROXY_MODEL_MAP='grok-build=gpt-5.6-terra,grok-composer-2.5=gpt-5.6-terra,grok-4.5=gpt-5.6-sol'
@@ -251,57 +349,22 @@ grok-build-proxy \
 ```
 
 The source is the exact `model` value Grok Build sends, not merely the display
-name. Use `grok models` to inspect the IDs available in your installation. It is
-valid to map several source IDs to the same Codex target.
+name. Use `grok models` and inspect `~/.grok/config.toml` to confirm IDs.
 
-A substitution is applied to every `POST /v1/responses` request that reaches the
-proxy. Consequently:
+### Plan mode, Goal mode, and subagents
 
-- a parent session using a mapped model uses the configured Codex target;
+The map applies to every `POST /v1/responses` request that reaches this proxy:
+
+- a mapped parent session uses the selected Codex target;
 - `/plan` continues to use that mapped parent model;
-- ordinary subagents that inherit or explicitly select a mapped source use its
-  target;
-- Goal planner, verifier, strategist, and summarizer requests are mapped whenever
-  their resolved source model is present in the map.
+- ordinary subagents using a mapped source use its target;
+- Goal planner, verifier, strategist, and summarizer requests are mapped when
+  their resolved source is present in the map.
 
-Grok Build still controls the harness, system prompt, tools, permissions,
-capability mode, context, and subagent lifecycle. The proxy changes only the
-upstream model ID and the associated Responses/Responses Lite request shape.
-
-### Route built-in Grok entries through the proxy
-
-The map only affects traffic sent to `grok-build-proxy`. Point each matching
-Grok model entry at the local endpoint. Generate ready-to-paste blocks using the
-same map:
-
-```sh
-GROK_BUILD_PROXY_MODEL_MAP='grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol' \
-  grok-build-proxy --print-grok-config
-```
-
-The output includes blocks like:
-
-```toml
-[model.grok-build]
-model = "grok-build"
-name = "Grok Build via Codex GPT-5.6 Terra"
-base_url = "http://127.0.0.1:18765/v1"
-api_backend = "responses"
-api_key = "unused"
-context_window = 372000
-
-# Quoted because the key contains a dot.
-[model."grok-4.5"]
-model = "grok-4.5"
-name = "Grok 4.5 via Codex GPT-5.6 Sol"
-base_url = "http://127.0.0.1:18765/v1"
-api_backend = "responses"
-api_key = "unused"
-context_window = 372000
-```
-
-Copy the relevant blocks into `~/.grok/config.toml`. The complete commented
-example is in [`examples/grok-config.toml`](examples/grok-config.toml).
+Grok Build still controls the agent definition, system prompt, tools,
+permissions, capability mode, context, and subagent lifecycle. A Goal role
+explicitly routed to an unmapped source is unchanged, and any model entry still
+pointing to an xAI endpoint bypasses this proxy completely.
 
 ### Resolution rules
 
@@ -312,19 +375,23 @@ GROK_BUILD_PROXY_MODEL_MAP='composer=grok-build,grok-build=gpt-5.6-terra' \
   grok-build-proxy
 ```
 
-A `-fast` suffix on the requested source or any target in the chain selects the
-final base model with `service_tier = "priority"`:
+A `-fast` suffix on the requested source or any target selects the final base
+model with `service_tier = "priority"`:
 
 ```sh
-GROK_BUILD_PROXY_MODEL_MAP='grok-4.5=gpt-5.6-sol-fast' grok-build-proxy
+GROK_BUILD_PROXY_MODEL_MAP='grok-4.5=gpt-5.6-sol-fast' \
+  grok-build-proxy
 ```
 
-Duplicate sources, empty IDs, self-maps, and cycles are rejected before the
-server starts. `GET /v1/models` advertises configured source IDs and reports the
-resolved `target_model`. `grok-build-proxy doctor` validates the map from
-`GROK_BUILD_PROXY_MODEL_MAP` or `doctor --model-map`.
+The parser accepts comma-, semicolon-, or newline-separated pairs. Duplicate
+sources, empty IDs, whitespace inside IDs, self-maps, and cycles are rejected
+before the server starts.
 
-## Supported models
+`GET /v1/models` advertises mapped source IDs and their resolved targets.
+`grok-build-proxy doctor` validates the map supplied through the environment or
+`doctor --model-map`.
+
+## Supported Codex models
 
 The built-in catalog currently exposes:
 
@@ -339,7 +406,7 @@ The built-in catalog currently exposes:
 A catalog entry does not grant model access. Availability can differ by plan,
 workspace, region, and server-side rollout.
 
-Append `-fast` to a model ID to have the proxy remove the suffix and set
+Append `-fast` to a supported model ID to remove the suffix upstream and set
 `service_tier = "priority"`:
 
 ```toml
@@ -354,16 +421,16 @@ context_window = 372000
 
 Fast-tier availability and usage effects are account-dependent.
 
-Override the advertised catalog with a comma-separated list:
+Override the advertised canonical catalog with:
 
 ```sh
-GROK_BUILD_PROXY_MODELS="gpt-5.6-sol,gpt-5.6-terra" \
+GROK_BUILD_PROXY_MODELS='gpt-5.6-sol,gpt-5.6-terra' \
   grok-build-proxy
 ```
 
-Unknown model IDs are passed through so newly enabled account-specific models
-can be tested before the catalog is updated. Model substitution is resolved
-before this catalog lookup.
+Unknown non-empty IDs pass through so account-specific models can be tested
+before a proxy release adds them. The proxy infers Responses Lite for unknown
+`gpt-5.6-*` targets and uses regular Responses for other unknown targets.
 
 ## How it works
 
@@ -375,26 +442,27 @@ Grok Build
   grok-build-proxy
   - reads the official Codex CLI auth.json
   - refreshes OAuth tokens before expiry
-  - substitutes configured Grok model IDs with Codex targets
+  - resolves an optional Grok-to-Codex model map
   - adds ChatGPT-Account-ID and Codex headers
-  - adapts GPT-5.6 requests to Responses Lite
+  - adapts Responses Lite requests when required
   - forwards SSE bytes as they arrive
           |
           v
   ChatGPT Codex Responses backend
 ```
 
-For Responses Lite models, the proxy performs these request transformations:
+For Responses Lite models, the proxy:
 
 - moves top-level `tools` into an `additional_tools` developer input item;
 - moves `instructions` into a developer message;
 - sets `reasoning.context = "all_turns"`;
 - sets `parallel_tool_calls = false`;
 - adds the Responses Lite header and client metadata;
-- streams returned Responses SSE events to Grok Build unchanged.
+- streams returned Responses SSE events unchanged.
 
-Normal Responses models retain their request structure and receive only the
-required authentication and routing headers.
+Regular Responses models retain their request structure and receive only the
+required authentication and routing metadata. On an upstream `401`, the proxy
+forces one token refresh and retries once.
 
 ## Commands
 
@@ -404,56 +472,124 @@ required authentication and routing headers.
 | `grok-build-proxy serve` | Start the proxy explicitly |
 | `grok-build-proxy auth login` | Run official browser-based Codex login |
 | `grok-build-proxy auth device` | Run official Codex device-code login |
-| `grok-build-proxy auth status` | Show official login status and a redacted local summary |
+| `grok-build-proxy auth status` | Show login status and a redacted credential summary |
 | `grok-build-proxy auth logout` | Run official Codex logout |
-| `grok-build-proxy doctor` | Diagnose the complete local setup |
-| `grok-build-proxy --print-grok-config` | Print Grok Build model blocks |
+| `grok-build-proxy doctor` | Diagnose the local setup |
+| `grok-build-proxy --print-grok-config` | Print Grok model blocks |
+| `grok-build-proxy version` | Print the installed version |
+| `grok-build-proxy --help` | Show command help |
 
-## Configuration
+Command-specific help:
 
-| Flag or command flag | Environment variable | Default |
+```sh
+grok-build-proxy serve --help
+grok-build-proxy auth login --help
+grok-build-proxy doctor --help
+```
+
+## Configuration reference
+
+### Proxy server
+
+| Flag | Environment variable | Default |
 |---|---|---|
 | `--listen` | `GROK_BUILD_PROXY_LISTEN` | `127.0.0.1:18765` |
-| `--auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | `$GROK_BUILD_PROXY_CODEX_HOME/auth.json` |
-| `auth --codex-home` / `doctor --codex-home` | `GROK_BUILD_PROXY_CODEX_HOME`, then `CODEX_HOME` | `~/.codex-grok-build-proxy` |
+| `--auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | Resolved Codex home plus `/auth.json` |
 | `--upstream` | `GROK_BUILD_PROXY_UPSTREAM` | ChatGPT Codex Responses endpoint |
 | `--refresh-url` | `GROK_BUILD_PROXY_REFRESH_URL` | OpenAI OAuth token endpoint |
 | `--models` | `GROK_BUILD_PROXY_MODELS` | Built-in catalog |
-| `--model-map` / `doctor --model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | Empty; model IDs pass through |
+| `--model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | Empty; IDs pass through |
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | Empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
-| `auth --codex-binary` | `GROK_BUILD_PROXY_CODEX_BINARY` | `codex` |
+
+### Auth and doctor
+
+| Flag | Environment variable | Default |
+|---|---|---|
+| `auth <action> --codex-home` | `GROK_BUILD_PROXY_CODEX_HOME`, then `CODEX_HOME` | `~/.codex-grok-build-proxy` |
+| `auth <action> --codex-binary` | `GROK_BUILD_PROXY_CODEX_BINARY` | `codex` |
+| `doctor --auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | Resolved Codex home plus `/auth.json` |
+| `doctor --codex-binary` | `GROK_BUILD_PROXY_CODEX_BINARY` | `codex` |
 | `doctor --grok-binary` | `GROK_BUILD_PROXY_GROK_BINARY` | `grok` |
 | `doctor --grok-config` | `GROK_BUILD_PROXY_GROK_CONFIG` | `~/.grok/config.toml` |
+| `doctor --model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | Empty |
+| `doctor --client-token` | `GROK_BUILD_PROXY_TOKEN` | Empty |
+| `doctor --timeout` | None | `5s` |
 
 ### Non-loopback binding
 
 A bearer token is mandatory when binding to a LAN or all-interface address:
 
 ```sh
-export GROK_BUILD_PROXY_TOKEN="replace-with-a-long-random-value"
+export GROK_BUILD_PROXY_TOKEN='replace-with-a-long-random-value'
 grok-build-proxy --listen 0.0.0.0:18765
 ```
 
-Set the same value as `api_key` in the Grok Build model configuration. Do not
-expose this proxy directly to the public internet.
+Set the same value as `api_key` in each Grok model block. Do not expose this
+proxy directly to the public internet.
+
+## Troubleshooting
+
+| Symptom | What to check |
+|---|---|
+| Installer asks for Go | No matching release asset was found. Install Go 1.23+, select a tagged release, or use `--from-source` intentionally. |
+| `codex` is not found | Install the official Codex CLI and confirm `codex --version` works. |
+| `auth.json` is missing | Run `grok-build-proxy auth login`; the wrapper configures file-backed storage in its dedicated Codex home. |
+| Device-code login is unavailable | Enable it in ChatGPT security/workspace settings or use `grok-build-proxy auth login`. |
+| `readyz` or upstream returns `401` | Run `grok-build-proxy auth status`, then log in again if the session was revoked. |
+| Upstream rejects a model | The target is not enabled for the current account or workspace. Select another target. |
+| A mapping has no effect | Confirm the proxy started with the map, the Grok model points to this proxy, and its `model` value exactly matches the source. |
+| Plan or Goal uses another model | Check Goal-role or subagent overrides; only mapped source IDs routed through this endpoint are changed. |
+| Port `18765` is occupied | Run `lsof -nP -iTCP:18765 -sTCP:LISTEN`, stop the process, or change both `--listen` and Grok `base_url`. |
+| Grok still contacts xAI | The selected model entry is not overridden to use the local proxy, or a different model entry is active. |
+
+Inspect live routing with:
+
+```sh
+curl -fsS http://127.0.0.1:18765/v1/models | python3 -m json.tool
+```
+
+Proxy logs include `requested_model`, final `model`, and `mapped` fields without
+logging prompts or credentials.
 
 ## Security
 
 - Keep the default loopback binding whenever possible.
-- Never commit `auth.json` or copy it into logs, issues, chat messages, or build
-  artifacts.
+- Never commit or share `auth.json`.
 - The proxy does not log request bodies, response bodies, or Authorization
   headers.
-- Authentication commands execute the official Codex CLI instead of collecting
-  passwords or browser credentials themselves.
-- Use the dedicated default `CODEX_HOME` to reduce refresh-token races with
-  normal Codex CLI sessions.
-- Prefer an official OpenAI API key for unattended production automation where
+- Auth commands execute the official Codex CLI instead of collecting passwords
+  or browser credentials.
+- Use the dedicated Codex home to reduce refresh-token races.
+- Treat model maps as routing configuration, not as a security boundary.
+- Prefer an official OpenAI API key for unattended production automation when
   the ChatGPT subscription path is not appropriate.
 - See [`SECURITY.md`](SECURITY.md) for vulnerability reporting guidance.
 
-## Development
+## Update and uninstall
+
+Update to the latest release by rerunning the installer, or install current
+`main` with `--from-source`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh | sh
+
+curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh \
+  | sh -s -- --from-source
+```
+
+Uninstall the default setup:
+
+```sh
+grok-build-proxy auth logout
+rm -f "$HOME/.local/bin/grok-build-proxy"
+rm -rf "$HOME/.codex-grok-build-proxy"
+```
+
+Adjust the binary path for a custom install directory. Remove related entries
+from `~/.grok/config.toml` and any model-map export from your shell config.
+
+## Development and releases
 
 Development and CI target macOS only. Go 1.23 or newer is required.
 
@@ -463,7 +599,7 @@ cd grok-build-proxy
 make check
 ```
 
-Individual commands:
+Individual checks:
 
 ```sh
 test -z "$(gofmt -l .)"
@@ -473,16 +609,14 @@ go build ./cmd/grok-build-proxy
 sh -n install.sh
 ```
 
-Build both supported macOS archives locally:
+Build both macOS archives:
 
 ```sh
 make dist
 ```
 
-## Release process
-
-Pushing a semantic-version tag such as `v0.1.0` runs the release workflow. It
-builds and publishes these assets:
+Pushing a semantic-version tag such as `v0.1.0` runs the release workflow and
+publishes:
 
 ```text
 grok-build-proxy_Darwin_arm64.tar.gz
@@ -490,26 +624,22 @@ grok-build-proxy_Darwin_amd64.tar.gz
 checksums.txt
 ```
 
-The curl installer selects the correct archive using `uname -m`.
-
 ## Limitations
 
 - macOS is the only supported operating system.
-- The proxy requires the official Codex CLI for login, status, device-code login,
-  and logout.
+- The official Codex CLI is required for login, status, device-code login, and
+  logout.
 - The proxy cannot read credentials stored only in the macOS Keychain. Its auth
-  wrapper configures a dedicated file-backed Codex home instead.
-- The ChatGPT Codex backend is separate from the public OpenAI Platform API and
-  can change server-side.
-- Model substitution affects only requests routed through this proxy; a built-in
-  entry that still points to an xAI endpoint bypasses the map.
+  wrapper configures a dedicated file-backed Codex home.
+- The ChatGPT Codex backend can change server-side.
+- Model substitution affects only traffic routed through this proxy.
 - The current transport uses HTTP Responses/SSE, not Codex WebSocket transport.
-- The proxy targets function tools executed locally by Grok Build. Compatibility
-  with Codex-hosted search tools is not guaranteed.
+- Compatibility with Codex-hosted search tools is not guaranteed.
+- A local catalog entry does not prove account entitlement to that model.
 
 ## References
 
-- [OpenAI Codex authentication](https://developers.openai.com/codex/auth)
+- [OpenAI Codex authentication](https://learn.chatgpt.com/docs/auth)
 - [OpenAI Codex repository](https://github.com/openai/codex)
 - [xAI Grok Build repository](https://github.com/xai-org/grok-build)
 - [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy)
