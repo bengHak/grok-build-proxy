@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -14,9 +15,10 @@ import (
 const DefaultCodexCompatibilityVersion = "0.144.0"
 
 type codexCompatTransport struct {
-	base          http.RoundTripper
-	logger        *slog.Logger
-	compatVersion string
+	base            http.RoundTripper
+	logger          *slog.Logger
+	compatVersion   string
+	responsesCompat responsesCompatMode
 }
 
 // NewCodexHTTPClient returns an HTTP client that normalizes Grok Build's
@@ -38,9 +40,10 @@ func NewCodexHTTPClient(logger *slog.Logger, compatVersion string) *http.Client 
 		ForceAttemptHTTP2:     true,
 	}
 	return &http.Client{Transport: &codexCompatTransport{
-		base:          base,
-		logger:        logger,
-		compatVersion: compatVersion,
+		base:            base,
+		logger:          logger,
+		compatVersion:   compatVersion,
+		responsesCompat: parseResponsesCompatMode(os.Getenv("GROK_BUILD_PROXY_RESPONSES_COMPAT")),
 	}}
 }
 
@@ -52,8 +55,8 @@ func (t *codexCompatTransport) RoundTrip(req *http.Request) (*http.Response, err
 	if err != nil {
 		return nil, err
 	}
-	if shouldNormalizeCodexSSEResponse(req, resp) {
-		resp.Body = newResponsesLiteSSEBody(resp.Body)
+	if t.responsesCompat != responsesCompatOff && shouldNormalizeCodexSSEResponse(req, resp) {
+		resp.Body = newResponsesLiteSSEBodyWithMode(resp.Body, t.responsesCompat)
 		resp.ContentLength = -1
 		resp.Header.Del("Content-Length")
 	}
@@ -71,13 +74,16 @@ func normalizeCodexHTTPRequest(req *http.Request, compatVersion string) error {
 	)
 	threadID := firstNonEmpty(req.Header.Get("thread-id"), sessionID)
 	windowID := firstNonEmpty(req.Header.Get("x-codex-window-id"), sessionID+":0")
+	clientRequestID := firstNonEmpty(req.Header.Get("x-client-request-id"), sessionID)
 
 	req.Header.Del("OpenAI-Beta")
 	req.Header.Del("session_id")
 	if sessionID != "" {
 		req.Header.Set("session-id", sessionID)
 		req.Header.Set("x-session-affinity", sessionID)
-		req.Header.Set("x-client-request-id", sessionID)
+	}
+	if clientRequestID != "" {
+		req.Header.Set("x-client-request-id", clientRequestID)
 	}
 	if threadID != "" {
 		req.Header.Set("thread-id", threadID)
