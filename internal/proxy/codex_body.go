@@ -25,6 +25,7 @@ func normalizeCodexBody(body map[string]any, identity codexIdentity, lite bool) 
 		body["prompt_cache_key"] = identity.sessionID
 	}
 	input := normalizeCompatInput(body["input"])
+	normalizeCompatMessageRoles(input)
 	stripCompatInputIDs(input)
 	stripCompatImageDetail(input)
 	if err := ensureCompatEncryptedReasoning(body); err != nil {
