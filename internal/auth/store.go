@@ -31,6 +31,19 @@ type Credentials struct {
 	ExpiresAt   time.Time
 }
 
+// Status is a read-only summary of a Codex authentication file. It never
+// contains access or refresh token values.
+type Status struct {
+	Path            string
+	AuthMode        string
+	AccountID       string
+	ExpiresAt       time.Time
+	HasRefreshToken bool
+	LastRefresh     time.Time
+	FileMode        os.FileMode
+	FileSize        int64
+}
+
 // Config controls how Store loads and refreshes the official Codex CLI cache.
 type Config struct {
 	Path          string
@@ -77,6 +90,42 @@ func NewStore(cfg Config) (*Store, error) {
 }
 
 func (s *Store) Path() string { return s.path }
+
+// Inspect returns a read-only authentication summary without refreshing or
+// modifying credentials.
+func (s *Store) Inspect() (Status, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	doc, tokens, err := s.load()
+	if err != nil {
+		return Status{Path: s.path}, err
+	}
+	creds, refreshToken, err := credentialsFromTokens(tokens)
+	if err != nil {
+		return Status{Path: s.path}, err
+	}
+	info, err := os.Stat(s.path)
+	if err != nil {
+		return Status{Path: s.path}, fmt.Errorf("stat Codex auth file: %w", err)
+	}
+
+	status := Status{
+		Path:            s.path,
+		AuthMode:        resolvedAuthMode(doc),
+		AccountID:       creds.AccountID,
+		ExpiresAt:       creds.ExpiresAt,
+		HasRefreshToken: refreshToken != "",
+		FileMode:        info.Mode(),
+		FileSize:        info.Size(),
+	}
+	if value := strings.TrimSpace(stringValue(doc["last_refresh"])); value != "" {
+		if parsed, parseErr := time.Parse(time.RFC3339Nano, value); parseErr == nil {
+			status.LastRefresh = parsed
+		}
+	}
+	return status, nil
+}
 
 // Get returns valid credentials. When forceRefresh is true, the refresh token
 // flow is attempted even if the access token has not reached its refresh margin.
@@ -238,6 +287,8 @@ func (s *Store) save(doc map[string]any) error {
 		return err
 	}
 	if err := os.Rename(tmpName, s.path); err != nil {
+		// Windows may not replace an existing file atomically. Fall back to a
+		// mode-restricted direct write while retaining the temp file cleanup.
 		if writeErr := os.WriteFile(s.path, data, 0o600); writeErr != nil {
 			return fmt.Errorf("rename temp auth file: %v; fallback write: %w", err, writeErr)
 		}
@@ -262,7 +313,24 @@ func credentialsFromTokens(tokens map[string]any) (Credentials, string, error) {
 	if expiresAt.IsZero() {
 		expiresAt = expirationFromJWT(idToken)
 	}
-	return Credentials{AccessToken: accessToken, AccountID: accountID, ExpiresAt: expiresAt}, strings.TrimSpace(stringValue(tokens["refresh_token"])), nil
+	return Credentials{
+		AccessToken: accessToken,
+		AccountID:   accountID,
+		ExpiresAt:   expiresAt,
+	}, strings.TrimSpace(stringValue(tokens["refresh_token"])), nil
+}
+
+func resolvedAuthMode(doc map[string]any) string {
+	if mode := strings.TrimSpace(stringValue(doc["auth_mode"])); mode != "" {
+		return mode
+	}
+	if strings.TrimSpace(stringValue(doc["OPENAI_API_KEY"])) != "" {
+		return "api_key"
+	}
+	if _, ok := doc["tokens"].(map[string]any); ok {
+		return "chatgpt"
+	}
+	return "unknown"
 }
 
 func stringValue(v any) string {
