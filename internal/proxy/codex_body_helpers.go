@@ -1,6 +1,9 @@
 package proxy
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
 
 const staleWSMetadataKey = "ws_request_header_x_openai_internal_codex_responses_lite"
 
@@ -20,6 +23,25 @@ func normalizeCompatInput(value any) []any {
 		return []any{}
 	default:
 		return []any{input}
+	}
+}
+
+// normalizeCompatMessageRoles adapts public Responses API roles to the
+// ChatGPT Codex endpoint, which rejects role=system input messages.
+func normalizeCompatMessageRoles(input []any) {
+	for _, item := range input {
+		message, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		messageType, _ := message["type"].(string)
+		if messageType != "" && messageType != "message" {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if strings.EqualFold(strings.TrimSpace(role), "system") {
+			message["role"] = "developer"
+		}
 	}
 }
 

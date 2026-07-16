@@ -121,3 +121,45 @@ func TestSummarizeUpstreamErrorRedactsSecrets(t *testing.T) {
 		t.Fatalf("summary lost useful fields: %s", summary)
 	}
 }
+
+func TestNormalizeCodexBodyConvertsSystemMessagesToDeveloper(t *testing.T) {
+	body := map[string]any{
+		"model": "gpt-5.6-sol",
+		"input": []any{
+			map[string]any{
+				"type": "message",
+				"role": "system",
+				"content": []any{map[string]any{
+					"type": "input_text",
+					"text": "You are a coding agent.",
+				}},
+			},
+			map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []any{map[string]any{
+					"type": "input_text",
+					"text": "Hello",
+				}},
+			},
+		},
+	}
+
+	if err := normalizeCodexBody(body, codexIdentity{}, true); err != nil {
+		t.Fatal(err)
+	}
+	input, _ := body["input"].([]any)
+	if len(input) != 3 {
+		t.Fatalf("input length = %d: %#v", len(input), input)
+	}
+	message, _ := input[1].(map[string]any)
+	if message["role"] != "developer" {
+		t.Fatalf("system role was not normalized: %#v", message)
+	}
+	for _, item := range input {
+		object, _ := item.(map[string]any)
+		if object["role"] == "system" {
+			t.Fatalf("system role leaked upstream: %#v", object)
+		}
+	}
+}
