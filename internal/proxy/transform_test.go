@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bengHak/grok-build-proxy/internal/catalog"
+	"github.com/bengHak/grok-build-proxy/internal/modelmap"
 )
 
 func TestTransformFullResponsesRequest(t *testing.T) {
@@ -14,7 +15,7 @@ func TestTransformFullResponsesRequest(t *testing.T) {
       "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
       "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],
       "stream":true
-    }`), catalog.New(""))
+    }`), catalog.New(""), modelmap.Map{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +47,7 @@ func TestTransformResponsesLiteAndFastAlias(t *testing.T) {
       "input":"hello",
       "tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}],
       "reasoning":{"effort":"high"}
-    }`), catalog.New(""))
+    }`), catalog.New(""), modelmap.Map{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +94,48 @@ func TestTransformResponsesLiteAndFastAlias(t *testing.T) {
 }
 
 func TestTransformRequiresModel(t *testing.T) {
-	if _, err := transformRequest([]byte(`{"input":"hello"}`), catalog.New("")); err == nil {
+	if _, err := transformRequest([]byte(`{"input":"hello"}`), catalog.New(""), modelmap.Map{}); err == nil {
 		t.Fatal("expected missing model error")
+	}
+}
+
+func TestTransformAppliesConfiguredModelMapping(t *testing.T) {
+	mappings, err := modelmap.Parse("grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := transformRequest([]byte(`{
+      "model":"grok-4.5-fast",
+      "input":"review this repository"
+    }`), catalog.New(""), mappings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequestedModel != "grok-4.5-fast" || result.Model != "gpt-5.6-sol" || !result.Mapped || !result.Fast || !result.Lite {
+		t.Fatalf("unexpected result metadata: %#v", result)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(result.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["model"] != "gpt-5.6-sol" {
+		t.Fatalf("model = %#v", body["model"])
+	}
+	if body["service_tier"] != "priority" {
+		t.Fatalf("service_tier = %#v", body["service_tier"])
+	}
+}
+
+func TestTransformMappingCanSelectFastTarget(t *testing.T) {
+	mappings, err := modelmap.Parse("grok-build=gpt-5.6-terra-fast")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := transformRequest([]byte(`{"model":"grok-build","input":"hello"}`), catalog.New(""), mappings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Model != "gpt-5.6-terra" || !result.Mapped || !result.Fast {
+		t.Fatalf("unexpected result metadata: %#v", result)
 	}
 }

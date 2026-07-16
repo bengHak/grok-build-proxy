@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/bengHak/grok-build-proxy/internal/auth"
 	"github.com/bengHak/grok-build-proxy/internal/catalog"
+	"github.com/bengHak/grok-build-proxy/internal/modelmap"
 	proxyhandler "github.com/bengHak/grok-build-proxy/internal/proxy"
 )
 
@@ -26,6 +28,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 	upstream := flags.String("upstream", envOr("GROK_BUILD_PROXY_UPSTREAM", defaultUpstream), "ChatGPT Codex Responses endpoint")
 	refreshURL := flags.String("refresh-url", envOr("GROK_BUILD_PROXY_REFRESH_URL", auth.DefaultRefreshURL), "OpenAI OAuth token refresh endpoint")
 	modelsCSV := flags.String("models", strings.TrimSpace(os.Getenv("GROK_BUILD_PROXY_MODELS")), "comma-separated model IDs exposed by /v1/models")
+	modelMapSpec := flags.String("model-map", strings.TrimSpace(os.Getenv("GROK_BUILD_PROXY_MODEL_MAP")), "comma-separated Grok-to-Codex substitutions (source=target)")
 	clientToken := flags.String("client-token", strings.TrimSpace(os.Getenv("GROK_BUILD_PROXY_TOKEN")), "optional bearer token required from local clients")
 	logFormat := flags.String("log-format", envOr("GROK_BUILD_PROXY_LOG_FORMAT", "text"), "text or json")
 	printConfig := flags.Bool("print-grok-config", false, "print example Grok Build model configuration and exit")
@@ -48,9 +51,13 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 		fmt.Fprintln(streams.stdout, version)
 		return nil
 	}
+	mappings, err := modelmap.Parse(*modelMapSpec)
+	if err != nil {
+		return fmt.Errorf("parse model substitutions: %w", err)
+	}
 	models := catalog.New(*modelsCSV)
 	if *printConfig {
-		fmt.Fprint(streams.stdout, renderGrokConfig(*listen, models))
+		fmt.Fprint(streams.stdout, renderGrokConfig(*listen, models, mappings))
 		return nil
 	}
 	if !proxyhandler.IsLoopbackListen(*listen) && strings.TrimSpace(*clientToken) == "" {
@@ -69,6 +76,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 		UpstreamURL: *upstream,
 		Credentials: store,
 		Catalog:     models,
+		ModelMap:    mappings,
 		Logger:      logger,
 		ClientToken: *clientToken,
 		Version:     version,
@@ -91,6 +99,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 			"address", *listen,
 			"auth_file", *authFile,
 			"models", strings.Join(models.IDs(), ","),
+			"model_map", mappings.String(),
 			"version", version,
 		)
 		serveErr <- server.ListenAndServe()
@@ -110,10 +119,32 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 	}
 }
 
-func renderGrokConfig(listen string, models catalog.Catalog) string {
+func renderGrokConfig(listen string, models catalog.Catalog, mappings modelmap.Map) string {
 	var builder strings.Builder
 	builder.WriteString("# Add selected blocks to ~/.grok/config.toml\n\n")
+	mappedSources := make(map[string]struct{}, mappings.Len())
+	for _, entry := range mappings.Entries() {
+		mappedSources[entry.Source] = struct{}{}
+		resolved := mappings.Resolve(entry.Source)
+		target, _ := models.Lookup(resolved.Model)
+		targetName := target.DisplayName
+		if resolved.Fast {
+			targetName += " (Fast)"
+		}
+		fmt.Fprintf(&builder, "# Proxy mapping: %s -> %s\n", entry.Source, resolved.EffectiveModelID())
+		fmt.Fprintf(&builder, "[model.%s]\n", tomlTableKey(entry.Source))
+		fmt.Fprintf(&builder, "model = %q\n", entry.Source)
+		fmt.Fprintf(&builder, "name = %q\n", displayModelID(entry.Source)+" via Codex "+targetName)
+		fmt.Fprintf(&builder, "description = %q\n", fmt.Sprintf("Routes %s to %s through grok-build-proxy", entry.Source, resolved.EffectiveModelID()))
+		fmt.Fprintf(&builder, "base_url = %q\n", "http://"+listen+"/v1")
+		builder.WriteString("api_backend = \"responses\"\n")
+		builder.WriteString("api_key = \"unused\"\n")
+		fmt.Fprintf(&builder, "context_window = %d\n\n", target.ContextWindow)
+	}
 	for _, model := range models.Models() {
+		if _, mapped := mappedSources[model.ID]; mapped {
+			continue
+		}
 		name := strings.NewReplacer(".", "-", "_", "-", "/", "-").Replace(model.ID)
 		fmt.Fprintf(&builder, "[model.codex-%s]\n", name)
 		fmt.Fprintf(&builder, "model = %q\n", model.ID)
@@ -124,4 +155,46 @@ func renderGrokConfig(listen string, models catalog.Catalog) string {
 		fmt.Fprintf(&builder, "context_window = %d\n\n", model.ContextWindow)
 	}
 	return builder.String()
+}
+
+func displayModelID(value string) string {
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == '-' || r == '_' || r == '/'
+	})
+	for i, part := range parts {
+		switch strings.ToLower(part) {
+		case "grok":
+			parts[i] = "Grok"
+		case "gpt":
+			parts[i] = "GPT"
+		case "codex":
+			parts[i] = "Codex"
+		default:
+			if part != "" {
+				runes := []rune(part)
+				runes[0] = []rune(strings.ToUpper(string(runes[0])))[0]
+				parts[i] = string(runes)
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return value
+	}
+	return strings.Join(parts, " ")
+}
+
+func tomlTableKey(value string) string {
+	if value != "" {
+		bare := true
+		for _, r := range value {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
+				bare = false
+				break
+			}
+		}
+		if bare {
+			return value
+		}
+	}
+	return strconv.Quote(value)
 }

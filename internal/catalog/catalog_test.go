@@ -48,3 +48,14 @@ func TestNormalizeID(t *testing.T) {
 		}
 	}
 }
+
+func TestLookupRetainsKnownMetadataOutsideAdvertisedCatalog(t *testing.T) {
+	catalog := New("gpt-5.2")
+	model, known := catalog.Lookup("gpt-5.6-sol")
+	if !known {
+		t.Fatal("gpt-5.6-sol should remain known even when not advertised")
+	}
+	if !model.ResponsesLite || model.ContextWindow != 372000 {
+		t.Fatalf("model = %#v", model)
+	}
+}

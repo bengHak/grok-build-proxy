@@ -9,21 +9,24 @@ import (
 	"strings"
 
 	"github.com/bengHak/grok-build-proxy/internal/catalog"
+	"github.com/bengHak/grok-build-proxy/internal/modelmap"
 )
 
 type transformedRequest struct {
-	Body   []byte
-	Model  string
-	Lite   bool
-	Fast   bool
-	Stream bool
+	Body           []byte
+	RequestedModel string
+	Model          string
+	Mapped         bool
+	Lite           bool
+	Fast           bool
+	Stream         bool
 }
 
 // transformRequest converts Grok Build's standard Responses API payload into
 // the ChatGPT Codex wire shape. Most models are pass-through. Responses Lite
 // models move tools and developer instructions into input items, matching the
 // Codex client's current request format.
-func transformRequest(raw []byte, models catalog.Catalog) (transformedRequest, error) {
+func transformRequest(raw []byte, models catalog.Catalog, mappings modelmap.Map) (transformedRequest, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return transformedRequest{}, errors.New("request body is empty")
 	}
@@ -46,9 +49,9 @@ func transformRequest(raw []byte, models catalog.Catalog) (transformedRequest, e
 	if requestedModel == "" {
 		return transformedRequest{}, errors.New("model is required")
 	}
-	baseModel, fast := catalog.NormalizeID(requestedModel)
-	model, _ := models.Lookup(baseModel)
-	body["model"] = baseModel
+	resolution := mappings.Resolve(requestedModel)
+	model, _ := models.Lookup(resolution.Model)
+	body["model"] = resolution.Model
 	body["store"] = false
 
 	stream := true
@@ -57,7 +60,7 @@ func transformRequest(raw []byte, models catalog.Catalog) (transformedRequest, e
 	} else {
 		body["stream"] = true
 	}
-	if fast {
+	if resolution.Fast {
 		if _, exists := body["service_tier"]; !exists {
 			body["service_tier"] = "priority"
 		}
@@ -73,7 +76,15 @@ func transformRequest(raw []byte, models catalog.Catalog) (transformedRequest, e
 	if err != nil {
 		return transformedRequest{}, fmt.Errorf("encode transformed request: %w", err)
 	}
-	return transformedRequest{Body: encoded, Model: baseModel, Lite: model.ResponsesLite, Fast: fast, Stream: stream}, nil
+	return transformedRequest{
+		Body:           encoded,
+		RequestedModel: requestedModel,
+		Model:          resolution.Model,
+		Mapped:         resolution.Mapped,
+		Lite:           model.ResponsesLite,
+		Fast:           resolution.Fast,
+		Stream:         stream,
+	}, nil
 }
 
 func applyResponsesLite(body map[string]any) {

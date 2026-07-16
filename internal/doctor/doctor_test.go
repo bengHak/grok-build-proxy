@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,4 +113,39 @@ func jwt(claims map[string]any) string {
 	header, _ := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
 	payload, _ := json.Marshal(claims)
 	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+func TestRunRejectsInvalidModelMapping(t *testing.T) {
+	report := Run(context.Background(), Config{
+		RuntimeOS:    "darwin",
+		RuntimeArch:  "arm64",
+		Version:      "test",
+		ModelMap:     "grok-4.5",
+		SkipCommands: true,
+	})
+	if !report.HasFailures() {
+		t.Fatalf("expected invalid model map failure: %#v", report.Checks)
+	}
+	found := false
+	for _, check := range report.Checks {
+		if check.Name == "Model substitutions" {
+			found = true
+			if check.Level != Fail {
+				t.Fatalf("model substitutions level = %s", check.Level)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("model substitutions check missing: %#v", report.Checks)
+	}
+}
+
+func TestModelSubstitutionCheckReportsResolvedChain(t *testing.T) {
+	check := checkModelMap(Config{ModelMap: "composer=grok-build,grok-build=gpt-5.6-terra-fast"})
+	if check.Level != Pass {
+		t.Fatalf("level = %s detail=%s", check.Level, check.Detail)
+	}
+	if want := "composer -> gpt-5.6-terra-fast"; !strings.Contains(check.Detail, want) {
+		t.Fatalf("detail = %q, missing %q", check.Detail, want)
+	}
 }

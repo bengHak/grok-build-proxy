@@ -20,6 +20,7 @@ back without an Anthropic/Claude translation layer.
 - [Run the doctor](#run-the-doctor)
 - [Start the proxy](#start-the-proxy)
 - [Configure Grok Build](#configure-grok-build)
+- [Model substitutions](#model-substitutions)
 - [Supported models](#supported-models)
 - [How it works](#how-it-works)
 - [Commands](#commands)
@@ -147,6 +148,7 @@ The doctor does not print token values. It checks:
 - file-backed Codex credential settings;
 - ChatGPT auth mode, token expiry, refresh-token presence, and file permissions;
 - the `grok` executable and `~/.grok/config.toml`;
+- proxy-side model substitution syntax and cycles;
 - whether the proxy is already running or its port is available;
 - `/healthz` and `/readyz` when a proxy instance is running.
 
@@ -227,6 +229,101 @@ Generate model blocks from the proxy's current catalog:
 grok-build-proxy --print-grok-config
 ```
 
+## Model substitutions
+
+The proxy can replace any Grok-facing model ID with a user-selected Codex model
+ID. This lets Grok Build keep its existing agent definitions—including Plan and
+Goal subagents—while only the model ID sent to the Codex backend changes.
+Substitution is disabled by default.
+
+Configure comma-separated `source=target` pairs:
+
+```sh
+export GROK_BUILD_PROXY_MODEL_MAP='grok-build=gpt-5.6-terra,grok-composer-2.5=gpt-5.6-terra,grok-4.5=gpt-5.6-sol'
+grok-build-proxy
+```
+
+The equivalent flag is:
+
+```sh
+grok-build-proxy \
+  --model-map 'grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol'
+```
+
+The source is the exact `model` value Grok Build sends, not merely the display
+name. Use `grok models` to inspect the IDs available in your installation. It is
+valid to map several source IDs to the same Codex target.
+
+A substitution is applied to every `POST /v1/responses` request that reaches the
+proxy. Consequently:
+
+- a parent session using a mapped model uses the configured Codex target;
+- `/plan` continues to use that mapped parent model;
+- ordinary subagents that inherit or explicitly select a mapped source use its
+  target;
+- Goal planner, verifier, strategist, and summarizer requests are mapped whenever
+  their resolved source model is present in the map.
+
+Grok Build still controls the harness, system prompt, tools, permissions,
+capability mode, context, and subagent lifecycle. The proxy changes only the
+upstream model ID and the associated Responses/Responses Lite request shape.
+
+### Route built-in Grok entries through the proxy
+
+The map only affects traffic sent to `grok-build-proxy`. Point each matching
+Grok model entry at the local endpoint. Generate ready-to-paste blocks using the
+same map:
+
+```sh
+GROK_BUILD_PROXY_MODEL_MAP='grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol' \
+  grok-build-proxy --print-grok-config
+```
+
+The output includes blocks like:
+
+```toml
+[model.grok-build]
+model = "grok-build"
+name = "Grok Build via Codex GPT-5.6 Terra"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+context_window = 372000
+
+# Quoted because the key contains a dot.
+[model."grok-4.5"]
+model = "grok-4.5"
+name = "Grok 4.5 via Codex GPT-5.6 Sol"
+base_url = "http://127.0.0.1:18765/v1"
+api_backend = "responses"
+api_key = "unused"
+context_window = 372000
+```
+
+Copy the relevant blocks into `~/.grok/config.toml`. The complete commented
+example is in [`examples/grok-config.toml`](examples/grok-config.toml).
+
+### Resolution rules
+
+Mappings may chain:
+
+```sh
+GROK_BUILD_PROXY_MODEL_MAP='composer=grok-build,grok-build=gpt-5.6-terra' \
+  grok-build-proxy
+```
+
+A `-fast` suffix on the requested source or any target in the chain selects the
+final base model with `service_tier = "priority"`:
+
+```sh
+GROK_BUILD_PROXY_MODEL_MAP='grok-4.5=gpt-5.6-sol-fast' grok-build-proxy
+```
+
+Duplicate sources, empty IDs, self-maps, and cycles are rejected before the
+server starts. `GET /v1/models` advertises configured source IDs and reports the
+resolved `target_model`. `grok-build-proxy doctor` validates the map from
+`GROK_BUILD_PROXY_MODEL_MAP` or `doctor --model-map`.
+
 ## Supported models
 
 The built-in catalog currently exposes:
@@ -265,7 +362,8 @@ GROK_BUILD_PROXY_MODELS="gpt-5.6-sol,gpt-5.6-terra" \
 ```
 
 Unknown model IDs are passed through so newly enabled account-specific models
-can be tested before the catalog is updated.
+can be tested before the catalog is updated. Model substitution is resolved
+before this catalog lookup.
 
 ## How it works
 
@@ -277,6 +375,7 @@ Grok Build
   grok-build-proxy
   - reads the official Codex CLI auth.json
   - refreshes OAuth tokens before expiry
+  - substitutes configured Grok model IDs with Codex targets
   - adds ChatGPT-Account-ID and Codex headers
   - adapts GPT-5.6 requests to Responses Lite
   - forwards SSE bytes as they arrive
@@ -320,6 +419,7 @@ required authentication and routing headers.
 | `--upstream` | `GROK_BUILD_PROXY_UPSTREAM` | ChatGPT Codex Responses endpoint |
 | `--refresh-url` | `GROK_BUILD_PROXY_REFRESH_URL` | OpenAI OAuth token endpoint |
 | `--models` | `GROK_BUILD_PROXY_MODELS` | Built-in catalog |
+| `--model-map` / `doctor --model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | Empty; model IDs pass through |
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | Empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
 | `auth --codex-binary` | `GROK_BUILD_PROXY_CODEX_BINARY` | `codex` |
@@ -401,6 +501,8 @@ The curl installer selects the correct archive using `uname -m`.
   wrapper configures a dedicated file-backed Codex home instead.
 - The ChatGPT Codex backend is separate from the public OpenAI Platform API and
   can change server-side.
+- Model substitution affects only requests routed through this proxy; a built-in
+  entry that still points to an xAI endpoint bypasses the map.
 - The current transport uses HTTP Responses/SSE, not Codex WebSocket transport.
 - The proxy targets function tools executed locally by Grok Build. Compatibility
   with Codex-hosted search tools is not guaranteed.

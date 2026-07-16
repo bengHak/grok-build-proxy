@@ -20,6 +20,7 @@ func runDoctor(ctx context.Context, args []string, streams commandIO, defaults c
 	grokBinary := flags.String("grok-binary", envOr("GROK_BUILD_PROXY_GROK_BINARY", "grok"), "path or command name for Grok Build")
 	grokConfig := flags.String("grok-config", defaults.grokConfig, "path to Grok Build config.toml")
 	listen := flags.String("listen", envOr("GROK_BUILD_PROXY_LISTEN", "127.0.0.1:18765"), "proxy listen address to inspect")
+	modelMapSpec := flags.String("model-map", envOr("GROK_BUILD_PROXY_MODEL_MAP", ""), "comma-separated Grok-to-Codex substitutions (source=target)")
 	clientToken := flags.String("client-token", envOr("GROK_BUILD_PROXY_TOKEN", ""), "bearer token for a protected local proxy")
 	timeout := flags.Duration("timeout", 5*time.Second, "timeout for each command and HTTP check")
 	flags.Usage = func() {
@@ -49,6 +50,7 @@ func runDoctor(ctx context.Context, args []string, streams commandIO, defaults c
 		GrokBinary:  *grokBinary,
 		GrokConfig:  *grokConfig,
 		Listen:      *listen,
+		ModelMap:    *modelMapSpec,
 		ClientToken: *clientToken,
 		Timeout:     *timeout,
 	})

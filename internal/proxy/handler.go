@@ -19,6 +19,7 @@ import (
 
 	"github.com/bengHak/grok-build-proxy/internal/auth"
 	"github.com/bengHak/grok-build-proxy/internal/catalog"
+	"github.com/bengHak/grok-build-proxy/internal/modelmap"
 )
 
 const defaultMaxBodyBytes int64 = 64 << 20
@@ -31,6 +32,7 @@ type Config struct {
 	UpstreamURL  string
 	Credentials  CredentialProvider
 	Catalog      catalog.Catalog
+	ModelMap     modelmap.Map
 	HTTPClient   *http.Client
 	Logger       *slog.Logger
 	ClientToken  string
@@ -42,6 +44,7 @@ type Handler struct {
 	upstream     *url.URL
 	credentials  CredentialProvider
 	catalog      catalog.Catalog
+	modelMap     modelmap.Map
 	httpClient   *http.Client
 	logger       *slog.Logger
 	clientToken  string
@@ -61,14 +64,16 @@ func New(cfg Config) (*Handler, error) {
 		return nil, fmt.Errorf("unsupported upstream URL scheme %q", upstream.Scheme)
 	}
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Transport: &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   20,
-			IdleConnTimeout:       90 * time.Second,
-			ResponseHeaderTimeout: 90 * time.Second,
-			ForceAttemptHTTP2:     true,
-		}}
+		cfg.HTTPClient = &http.Client{
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				MaxIdleConns:          100,
+				MaxIdleConnsPerHost:   20,
+				IdleConnTimeout:       90 * time.Second,
+				ResponseHeaderTimeout: 90 * time.Second,
+				ForceAttemptHTTP2:     true,
+			},
+		}
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
@@ -80,6 +85,7 @@ func New(cfg Config) (*Handler, error) {
 		upstream:     upstream,
 		credentials:  cfg.Credentials,
 		catalog:      cfg.Catalog,
+		modelMap:     cfg.ModelMap,
 		httpClient:   cfg.HTTPClient,
 		logger:       cfg.Logger,
 		clientToken:  strings.TrimSpace(cfg.ClientToken),
@@ -132,9 +138,10 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"service": "grok-build-proxy",
-		"version": h.version,
+		"ok":                  true,
+		"service":             "grok-build-proxy",
+		"version":             h.version,
+		"model_substitutions": h.modelMap.Len(),
 	})
 }
 
@@ -165,32 +172,110 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		Description   string `json:"description,omitempty"`
 		ContextWindow int    `json:"context_window,omitempty"`
 		APIBackend    string `json:"api_backend,omitempty"`
+		TargetModel   string `json:"target_model,omitempty"`
+		ServiceTier   string `json:"service_tier,omitempty"`
 	}
-	models := h.catalog.Models()
-	data := make([]modelResponse, 0, len(models)*2)
-	for _, model := range models {
+
+	type route struct {
+		id          string
+		target      string
+		displayName string
+		description string
+		context     int
+		fast        bool
+	}
+
+	routes := make([]route, 0, len(h.catalog.Models())+h.modelMap.Len())
+	seen := make(map[string]struct{}, cap(routes)*2)
+	appendRoute := func(item route) {
+		if item.id == "" {
+			return
+		}
+		if _, exists := seen[item.id]; exists {
+			return
+		}
+		seen[item.id] = struct{}{}
+		routes = append(routes, item)
+	}
+
+	// Explicit substitutions are listed first and shadow a canonical entry with
+	// the same ID. This makes Grok's built-in names visible in the model picker.
+	for _, entry := range h.modelMap.Entries() {
+		resolved := h.modelMap.Resolve(entry.Source)
+		model, _ := h.catalog.Lookup(resolved.Model)
+		name := entry.Source + " via " + model.DisplayName
+		if resolved.Fast {
+			name += " (Fast)"
+		}
+		effectiveTarget := resolved.EffectiveModelID()
+		appendRoute(route{
+			id:          entry.Source,
+			target:      resolved.Model,
+			displayName: name,
+			description: fmt.Sprintf("Maps %s to %s through ChatGPT Codex.", entry.Source, effectiveTarget),
+			context:     model.ContextWindow,
+			fast:        resolved.Fast,
+		})
+	}
+
+	for _, model := range h.catalog.Models() {
+		appendRoute(route{
+			id:          model.ID,
+			target:      model.ID,
+			displayName: model.DisplayName,
+			description: model.Description,
+			context:     model.ContextWindow,
+		})
+	}
+
+	// Generate convenience -fast routes after explicit routes so a user-defined
+	// exact mapping for source-fast always wins.
+	baseRoutes := append([]route(nil), routes...)
+	for _, item := range baseRoutes {
+		if item.fast || strings.HasSuffix(item.id, "-fast") || !supportsFastModel(item.target) {
+			continue
+		}
+		appendRoute(route{
+			id:          item.id + "-fast",
+			target:      item.target,
+			displayName: item.displayName + " (Fast)",
+			description: item.description,
+			context:     item.context,
+			fast:        true,
+		})
+	}
+
+	data := make([]modelResponse, 0, len(routes))
+	for _, item := range routes {
+		target := ""
+		if item.id != item.target || item.fast {
+			target = item.target
+			if item.fast {
+				target += "-fast"
+			}
+		}
+		serviceTier := ""
+		if item.fast {
+			serviceTier = "priority"
+		}
 		data = append(data, modelResponse{
-			ID:            model.ID,
+			ID:            item.id,
 			Object:        "model",
 			OwnedBy:       "openai-codex",
-			DisplayName:   model.DisplayName,
-			Description:   model.Description,
-			ContextWindow: model.ContextWindow,
+			DisplayName:   item.displayName,
+			Description:   item.description,
+			ContextWindow: item.context,
 			APIBackend:    "responses",
+			TargetModel:   target,
+			ServiceTier:   serviceTier,
 		})
-		if strings.HasPrefix(model.ID, "gpt-5.6-") || model.ID == "gpt-5.5" {
-			data = append(data, modelResponse{
-				ID:            model.ID + "-fast",
-				Object:        "model",
-				OwnedBy:       "openai-codex",
-				DisplayName:   model.DisplayName + " (Fast)",
-				Description:   model.Description,
-				ContextWindow: model.ContextWindow,
-				APIBackend:    "responses",
-			})
-		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+func supportsFastModel(id string) bool {
+	base, _ := catalog.NormalizeID(id)
+	return strings.HasPrefix(base, "gpt-5.6-") || base == "gpt-5.5"
 }
 
 func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +298,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	transformed, err := transformRequest(body, h.catalog)
+	transformed, err := transformRequest(body, h.catalog, h.modelMap)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -246,7 +331,9 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	h.logger.Info("request complete",
 		"request_id", requestID,
+		"requested_model", transformed.RequestedModel,
 		"model", transformed.Model,
+		"mapped", transformed.Mapped,
 		"responses_lite", transformed.Lite,
 		"fast", transformed.Fast,
 		"status", resp.StatusCode,

@@ -130,6 +130,11 @@ func (c Catalog) Lookup(id string) (Model, bool) {
 	if ok {
 		return model, true
 	}
+	// A mapping target may be a built-in Codex model that the user chose not to
+	// advertise via --models. Keep its authoritative request-shape metadata.
+	if model, ok := knownModels[base]; ok {
+		return model, true
+	}
 	// Unknown account-specific models are allowed through. Infer the only wire
 	// distinction currently needed by the proxy from the model family.
 	if base != "" {

@@ -19,6 +19,7 @@ import (
 
 	"github.com/bengHak/grok-build-proxy/internal/auth"
 	"github.com/bengHak/grok-build-proxy/internal/codexcli"
+	"github.com/bengHak/grok-build-proxy/internal/modelmap"
 )
 
 type Level string
@@ -87,6 +88,7 @@ type Config struct {
 	GrokBinary   string
 	GrokConfig   string
 	Listen       string
+	ModelMap     string
 	ClientToken  string
 	Timeout      time.Duration
 	Now          func() time.Time
@@ -99,6 +101,7 @@ func Run(ctx context.Context, cfg Config) Report {
 	cfg = withDefaults(cfg)
 	report := Report{}
 	report.Checks = append(report.Checks, checkPlatform(cfg))
+	report.Checks = append(report.Checks, checkModelMap(cfg))
 	report.Checks = append(report.Checks, checkCodexCLI(ctx, cfg)...)
 	report.Checks = append(report.Checks, checkCodexConfig(cfg))
 	report.Checks = append(report.Checks, checkAuthFile(cfg)...)
@@ -131,6 +134,31 @@ func withDefaults(cfg Config) Config {
 		cfg.HTTPClient = &http.Client{Timeout: cfg.Timeout}
 	}
 	return cfg
+}
+
+func checkModelMap(cfg Config) Check {
+	mappings, err := modelmap.Parse(cfg.ModelMap)
+	if err != nil {
+		return Check{
+			Level:       Fail,
+			Name:        "Model substitutions",
+			Detail:      err.Error(),
+			Remediation: "fix GROK_BUILD_PROXY_MODEL_MAP or --model-map; use comma-separated source=target pairs",
+		}
+	}
+	if mappings.Len() == 0 {
+		return Check{Level: Pass, Name: "Model substitutions", Detail: "none configured; model IDs pass through unchanged"}
+	}
+	parts := make([]string, 0, mappings.Len())
+	for _, entry := range mappings.SortedEntries() {
+		resolved := mappings.Resolve(entry.Source)
+		parts = append(parts, entry.Source+" -> "+resolved.EffectiveModelID())
+	}
+	return Check{
+		Level:  Pass,
+		Name:   "Model substitutions",
+		Detail: fmt.Sprintf("%d configured: %s", mappings.Len(), strings.Join(parts, ", ")),
+	}
 }
 
 func checkPlatform(cfg Config) Check {

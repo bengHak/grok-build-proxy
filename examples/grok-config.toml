@@ -37,3 +37,38 @@ base_url = "http://127.0.0.1:18765/v1"
 api_backend = "responses"
 api_key = "unused"
 context_window = 372000
+
+
+# Built-in Grok model substitution
+#
+# Start the proxy with the same source=target map used by these overrides:
+#
+#   GROK_BUILD_PROXY_MODEL_MAP='grok-build=gpt-5.6-terra,grok-composer-2.5=gpt-5.6-terra,grok-4.5=gpt-5.6-sol' \
+#     grok-build-proxy
+#
+# Uncomment only the source IDs present in `grok models`. Quoted table keys are
+# required when an ID contains a dot.
+#
+# [model.grok-build]
+# model = "grok-build"
+# name = "Grok Build via Codex GPT-5.6 Terra"
+# base_url = "http://127.0.0.1:18765/v1"
+# api_backend = "responses"
+# api_key = "unused"
+# context_window = 372000
+#
+# [model."grok-composer-2.5"]
+# model = "grok-composer-2.5"
+# name = "Grok Composer 2.5 via Codex GPT-5.6 Terra"
+# base_url = "http://127.0.0.1:18765/v1"
+# api_backend = "responses"
+# api_key = "unused"
+# context_window = 372000
+#
+# [model."grok-4.5"]
+# model = "grok-4.5"
+# name = "Grok 4.5 via Codex GPT-5.6 Sol"
+# base_url = "http://127.0.0.1:18765/v1"
+# api_backend = "responses"
+# api_key = "unused"
+# context_window = 372000

@@ -14,6 +14,7 @@ import (
 
 	"github.com/bengHak/grok-build-proxy/internal/auth"
 	"github.com/bengHak/grok-build-proxy/internal/catalog"
+	"github.com/bengHak/grok-build-proxy/internal/modelmap"
 )
 
 type fakeCredentials struct {
@@ -181,5 +182,113 @@ func TestIsLoopbackListen(t *testing.T) {
 		if got := IsLoopbackListen(address); got != want {
 			t.Errorf("IsLoopbackListen(%q) = %v, want %v", address, got, want)
 		}
+	}
+}
+
+func TestHandlerMapsGrokModelAliasAndAdvertisesIt(t *testing.T) {
+	mappings, err := modelmap.Parse("grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response"}`)
+	}))
+	defer upstream.Close()
+
+	handler, err := New(Config{
+		UpstreamURL: upstream.URL,
+		Credentials: &fakeCredentials{tokens: []string{"token"}},
+		Catalog:     catalog.New(""),
+		ModelMap:    mappings,
+		HTTPClient:  upstream.Client(),
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Version:     "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"grok-4.5","input":"hello","stream":false}`))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if gotBody["model"] != "gpt-5.6-sol" {
+		t.Fatalf("upstream model = %#v", gotBody["model"])
+	}
+	if _, exists := gotBody["tools"]; exists {
+		t.Fatal("unexpected tools in request")
+	}
+
+	modelsRequest := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	modelsResponse := httptest.NewRecorder()
+	handler.ServeHTTP(modelsResponse, modelsRequest)
+	if modelsResponse.Code != http.StatusOK {
+		t.Fatalf("models status = %d", modelsResponse.Code)
+	}
+	var listing struct {
+		Data []struct {
+			ID            string `json:"id"`
+			DisplayName   string `json:"name"`
+			ContextWindow int    `json:"context_window"`
+			TargetModel   string `json:"target_model"`
+			ServiceTier   string `json:"service_tier"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(modelsResponse.Body.Bytes(), &listing); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, model := range listing.Data {
+		if model.ID == "grok-4.5" {
+			found = true
+			if !strings.Contains(model.DisplayName, "GPT-5.6 Sol") || model.ContextWindow != 372000 || model.TargetModel != "gpt-5.6-sol" {
+				t.Fatalf("alias model = %#v", model)
+			}
+		}
+		if model.ID == "grok-4.5-fast" {
+			if model.TargetModel != "gpt-5.6-sol-fast" || model.ServiceTier != "priority" {
+				t.Fatalf("fast alias model = %#v", model)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("grok-4.5 alias missing from %#v", listing.Data)
+	}
+}
+
+func TestHealthReportsModelSubstitutionCount(t *testing.T) {
+	mappings, err := modelmap.Parse("grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := New(Config{
+		UpstreamURL: "http://example.test/responses",
+		Credentials: &fakeCredentials{tokens: []string{"token"}},
+		Catalog:     catalog.New(""),
+		ModelMap:    mappings,
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Version:     "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["model_substitutions"] != float64(2) {
+		t.Fatalf("model_substitutions = %#v", body["model_substitutions"])
 	}
 }
