@@ -16,11 +16,13 @@ back without an Anthropic/Claude translation layer.
 
 - [Requirements](#requirements)
 - [Install with curl](#install-with-curl)
-- [Authenticate Codex](#authenticate-codex)
+- [Authenticate with the official Codex CLI](#authenticate-with-the-official-codex-cli)
+- [Run the doctor](#run-the-doctor)
 - [Start the proxy](#start-the-proxy)
 - [Configure Grok Build](#configure-grok-build)
 - [Supported models](#supported-models)
 - [How it works](#how-it-works)
+- [Commands](#commands)
 - [Configuration](#configuration)
 - [Security](#security)
 - [Development](#development)
@@ -31,7 +33,7 @@ back without an Anthropic/Claude translation layer.
 
 - macOS on Apple Silicon (`arm64`) or Intel (`x86_64`)
 - The official Codex CLI
-- A ChatGPT account that is allowed to use the selected Codex model
+- A ChatGPT account allowed to use the selected Codex model
 - Grok Build
 
 The installer intentionally rejects Linux and Windows. Release artifacts are
@@ -59,8 +61,8 @@ grok-build-proxy --version
 ```
 
 The installer downloads the architecture-specific release archive and verifies
-its SHA-256 checksum. Before the first tagged release exists, it downloads the
-source from `main` and builds it locally when Go 1.23 or newer is available.
+its SHA-256 checksum. Before the first tagged release exists, it falls back to a
+local source build when Go 1.23 or newer is available.
 
 Install a specific release or choose another directory:
 
@@ -81,33 +83,98 @@ curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/insta
 Review [`install.sh`](install.sh) before piping it to a shell when required by
 your security policy.
 
-## Authenticate Codex
+## Authenticate with the official Codex CLI
 
-Use a dedicated `CODEX_HOME` so the proxy and another Codex process do not try
-to rotate the same refresh token at the same time.
+The proxy does **not** implement or imitate OpenAI's OAuth login flow. Its auth
+commands prepare a dedicated, file-backed `CODEX_HOME` and then execute the
+official Codex CLI.
+
+Browser login:
 
 ```sh
-export CODEX_HOME="$HOME/.codex-grok-build-proxy"
-mkdir -p "$CODEX_HOME"
-cat > "$CODEX_HOME/config.toml" <<'EOF'
+grok-build-proxy auth login
+```
+
+Device-code login for a headless Mac:
+
+```sh
+grok-build-proxy auth device
+```
+
+Check or clear the current login:
+
+```sh
+grok-build-proxy auth status
+grok-build-proxy auth logout
+```
+
+By default these commands use:
+
+```text
+~/.codex-grok-build-proxy
+```
+
+They preserve unrelated Codex settings while ensuring these top-level values in
+`config.toml`:
+
+```toml
 cli_auth_credentials_store = "file"
-EOF
-CODEX_HOME="$CODEX_HOME" codex login
+forced_login_method = "chatgpt"
 ```
 
-For a headless Mac, use the official device-code flow:
+The resulting `auth.json` contains access and refresh tokens and must be
+protected like a password. To use another dedicated directory:
 
 ```sh
-CODEX_HOME="$HOME/.codex-grok-build-proxy" codex login --device-auth
+grok-build-proxy auth login --codex-home "$HOME/.my-codex-proxy"
 ```
 
-After login, `$CODEX_HOME/auth.json` must exist. It contains access and refresh
-tokens and must be protected like a password.
+`GROK_BUILD_PROXY_CODEX_HOME` and `CODEX_HOME` are also supported. The proxy
+prefers them in that order.
+
+## Run the doctor
+
+Run the built-in diagnostic before starting Grok Build:
+
+```sh
+grok-build-proxy doctor
+```
+
+The doctor does not print token values. It checks:
+
+- macOS and CPU architecture;
+- the official `codex` executable and `codex login status`;
+- file-backed Codex credential settings;
+- ChatGPT auth mode, token expiry, refresh-token presence, and file permissions;
+- the `grok` executable and `~/.grok/config.toml`;
+- whether the proxy is already running or its port is available;
+- `/healthz` and `/readyz` when a proxy instance is running.
+
+Warnings do not make the command fail. Missing required CLIs or configuration,
+authentication failures, unsafe permissions, and port conflicts return a
+non-zero exit status.
+
+Useful overrides:
+
+```sh
+grok-build-proxy doctor \
+  --codex-home "$HOME/.codex-grok-build-proxy" \
+  --grok-config "$HOME/.grok/config.toml" \
+  --listen 127.0.0.1:18765
+```
 
 ## Start the proxy
 
+After authentication succeeds:
+
 ```sh
-CODEX_HOME="$HOME/.codex-grok-build-proxy" grok-build-proxy
+grok-build-proxy
+```
+
+The explicit form is equivalent:
+
+```sh
+grok-build-proxy serve
 ```
 
 The default address is `http://127.0.0.1:18765`. Check readiness with:
@@ -154,7 +221,7 @@ Start Grok Build with the custom model:
 grok -m codex-terra
 ```
 
-You can also generate configuration blocks from the proxy's current catalog:
+Generate model blocks from the proxy's current catalog:
 
 ```sh
 grok-build-proxy --print-grok-config
@@ -208,7 +275,7 @@ Grok Build
           |
           v
   grok-build-proxy
-  - loads Codex CLI auth.json
+  - reads the official Codex CLI auth.json
   - refreshes OAuth tokens before expiry
   - adds ChatGPT-Account-ID and Codex headers
   - adapts GPT-5.6 requests to Responses Lite
@@ -230,17 +297,34 @@ For Responses Lite models, the proxy performs these request transformations:
 Normal Responses models retain their request structure and receive only the
 required authentication and routing headers.
 
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `grok-build-proxy` | Start the proxy |
+| `grok-build-proxy serve` | Start the proxy explicitly |
+| `grok-build-proxy auth login` | Run official browser-based Codex login |
+| `grok-build-proxy auth device` | Run official Codex device-code login |
+| `grok-build-proxy auth status` | Show official login status and a redacted local summary |
+| `grok-build-proxy auth logout` | Run official Codex logout |
+| `grok-build-proxy doctor` | Diagnose the complete local setup |
+| `grok-build-proxy --print-grok-config` | Print Grok Build model blocks |
+
 ## Configuration
 
-| Flag | Environment variable | Default |
+| Flag or command flag | Environment variable | Default |
 |---|---|---|
 | `--listen` | `GROK_BUILD_PROXY_LISTEN` | `127.0.0.1:18765` |
-| `--auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | `$CODEX_HOME/auth.json` or `~/.codex/auth.json` |
+| `--auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | `$GROK_BUILD_PROXY_CODEX_HOME/auth.json` |
+| `auth --codex-home` / `doctor --codex-home` | `GROK_BUILD_PROXY_CODEX_HOME`, then `CODEX_HOME` | `~/.codex-grok-build-proxy` |
 | `--upstream` | `GROK_BUILD_PROXY_UPSTREAM` | ChatGPT Codex Responses endpoint |
 | `--refresh-url` | `GROK_BUILD_PROXY_REFRESH_URL` | OpenAI OAuth token endpoint |
 | `--models` | `GROK_BUILD_PROXY_MODELS` | Built-in catalog |
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | Empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
+| `auth --codex-binary` | `GROK_BUILD_PROXY_CODEX_BINARY` | `codex` |
+| `doctor --grok-binary` | `GROK_BUILD_PROXY_GROK_BINARY` | `grok` |
+| `doctor --grok-config` | `GROK_BUILD_PROXY_GROK_CONFIG` | `~/.grok/config.toml` |
 
 ### Non-loopback binding
 
@@ -261,7 +345,10 @@ expose this proxy directly to the public internet.
   artifacts.
 - The proxy does not log request bodies, response bodies, or Authorization
   headers.
-- Use a dedicated `CODEX_HOME` to reduce refresh-token races.
+- Authentication commands execute the official Codex CLI instead of collecting
+  passwords or browser credentials themselves.
+- Use the dedicated default `CODEX_HOME` to reduce refresh-token races with
+  normal Codex CLI sessions.
 - Prefer an official OpenAI API key for unattended production automation where
   the ChatGPT subscription path is not appropriate.
 - See [`SECURITY.md`](SECURITY.md) for vulnerability reporting guidance.
@@ -308,8 +395,10 @@ The curl installer selects the correct archive using `uname -m`.
 ## Limitations
 
 - macOS is the only supported operating system.
-- The proxy cannot read credentials stored only in the macOS Keychain. Configure
-  the dedicated Codex home with `cli_auth_credentials_store = "file"`.
+- The proxy requires the official Codex CLI for login, status, device-code login,
+  and logout.
+- The proxy cannot read credentials stored only in the macOS Keychain. Its auth
+  wrapper configures a dedicated file-backed Codex home instead.
 - The ChatGPT Codex backend is separate from the public OpenAI Platform API and
   can change server-side.
 - The current transport uses HTTP Responses/SSE, not Codex WebSocket transport.
