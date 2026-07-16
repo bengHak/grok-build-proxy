@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -78,9 +79,11 @@ type responseOutputState struct {
 	argumentsDone     string
 	argumentsDoneSeen bool
 
-	customInputDelta    strings.Builder
-	customInputDone     string
-	customInputDoneSeen bool
+	customInputDelta           strings.Builder
+	customInputDone            string
+	customInputDoneSeen        bool
+	customInputDonePresent     bool
+	customDoneItemInputPresent bool
 }
 
 func newResponsesSSEAssembler(mode responsesCompatMode) *responsesSSEAssembler {
@@ -191,7 +194,7 @@ func (s *responsesSSEAssembler) transformTerminal(eventName string, event map[st
 	if response == nil {
 		s.terminalSeen = true
 		if strict {
-			return encodeSSEError("proxy_invalid_terminal_response", "Responses Lite terminal event did not contain a response object")
+			return s.encodeError("proxy_invalid_terminal_response", "Responses Lite terminal event did not contain a response object")
 		}
 		if modified {
 			return encodeSSEEvent(firstNonEmptyString(eventName, stringValue(event["type"])), event)
@@ -202,11 +205,11 @@ func (s *responsesSSEAssembler) transformTerminal(eventName string, event map[st
 	patched, err := s.mergeResponse(response, status, strict)
 	if err != nil {
 		s.terminalSeen = true
-		return encodeSSEError("proxy_incomplete_output", err.Error())
+		return s.encodeError("proxy_incomplete_output", err.Error())
 	}
 	if strict && !responseHasUsableOutput(response) {
 		s.terminalSeen = true
-		return encodeSSEError("proxy_missing_terminal_output", "Responses Lite completed without a usable final text or tool call")
+		return s.encodeError("proxy_missing_terminal_output", "Responses Lite completed without a usable final text or tool call")
 	}
 	s.terminalSeen = true
 	if modified || patched {
@@ -218,25 +221,25 @@ func (s *responsesSSEAssembler) transformTerminal(eventName string, event map[st
 func (s *responsesSSEAssembler) synthesizeTerminal() []byte {
 	if s.stateErr != nil {
 		s.terminalSeen = true
-		return encodeSSEError("proxy_stream_state_error", s.stateErr.Error())
+		return s.encodeError("proxy_stream_state_error", s.stateErr.Error())
 	}
 	if s.responseSnapshot == nil {
 		s.terminalSeen = true
-		return encodeSSEError("proxy_missing_terminal_response", "Responses Lite stream ended without a terminal response snapshot")
+		return s.encodeError("proxy_missing_terminal_response", "Responses Lite stream ended without a terminal response snapshot")
 	}
 	response := cloneJSONObject(s.responseSnapshot)
 	if response == nil {
 		s.terminalSeen = true
-		return encodeSSEError("proxy_invalid_response_snapshot", "Responses Lite response snapshot could not be cloned")
+		return s.encodeError("proxy_invalid_response_snapshot", "Responses Lite response snapshot could not be cloned")
 	}
 	patched, err := s.mergeResponse(response, "completed", true)
 	if err != nil {
 		s.terminalSeen = true
-		return encodeSSEError("proxy_incomplete_output", err.Error())
+		return s.encodeError("proxy_incomplete_output", err.Error())
 	}
 	if !patched && !responseHasUsableOutput(response) {
 		s.terminalSeen = true
-		return encodeSSEError("proxy_missing_terminal_output", "Responses Lite stream ended without a usable final text or tool call")
+		return s.encodeError("proxy_missing_terminal_output", "Responses Lite stream ended without a usable final text or tool call")
 	}
 	response["status"] = "completed"
 	s.maxSequence++
@@ -248,22 +251,40 @@ func (s *responsesSSEAssembler) synthesizeTerminal() []byte {
 	})
 }
 
+func (s *responsesSSEAssembler) encodeError(kind, message string) []byte {
+	slog.Warn(
+		"responses lite normalization failed",
+		"error_type", kind,
+		"error", message,
+		"response_id", stringValue(s.responseSnapshot["id"]),
+		"output_states", len(s.outputs),
+		"state_bytes", s.stateBytes,
+		"done_seen", s.doneSeen,
+	)
+	return encodeSSEError(kind, message)
+}
+
 func (s *responsesSSEAssembler) captureOutputItem(event map[string]any, done bool) bool {
 	item := jsonObject(event["item"])
 	if item == nil {
 		return false
 	}
+	kind := stringValue(item["type"])
+	_, customInputPresent := item["input"].(string)
 	eventKind := outputEventItemAdded
 	if done {
 		eventKind = outputEventItemDone
 	}
-	state := s.outputForEvent(event, item, stringValue(item["type"]), eventKind)
+	state := s.outputForEvent(event, item, kind, eventKind)
 	if state == nil {
 		return false
 	}
 	modified := s.normalizeOutputItemEvent(event, item, state, done)
 	if done {
 		state.doneItem = cloneJSONObject(item)
+		if kind == "custom_tool_call" {
+			state.customDoneItemInputPresent = customInputPresent
+		}
 	} else {
 		state.addedItem = cloneJSONObject(item)
 	}
@@ -281,7 +302,15 @@ func (s *responsesSSEAssembler) captureText(event map[string]any, done bool) boo
 	}
 	modified := s.normalizeContentEvent(event, state, true)
 	if done {
-		state.textDone = stringValue(event["text"])
+		text := stringValue(event["text"])
+		if text == "" {
+			text = state.textDelta.String()
+			if text != "" {
+				event["text"] = text
+				modified = true
+			}
+		}
+		state.textDone = text
 		state.textDoneSeen = true
 		s.addStateBytes(len(state.textDone))
 		return modified
@@ -305,7 +334,15 @@ func (s *responsesSSEAssembler) captureRefusal(event map[string]any, done bool) 
 	}
 	modified := s.normalizeContentEvent(event, state, true)
 	if done {
-		state.refusalDone = stringValue(event["refusal"])
+		refusal := stringValue(event["refusal"])
+		if refusal == "" {
+			refusal = state.refusalDelta.String()
+			if refusal != "" {
+				event["refusal"] = refusal
+				modified = true
+			}
+		}
+		state.refusalDone = refusal
 		state.refusalDoneSeen = true
 		s.addStateBytes(len(state.refusalDone))
 		return modified
@@ -329,7 +366,14 @@ func (s *responsesSSEAssembler) captureFunctionArguments(event map[string]any, d
 	}
 	modified := s.normalizeContentEvent(event, state, false)
 	if done {
-		state.argumentsDone = stringValue(event["arguments"])
+		arguments := stringValue(event["arguments"])
+		fallback := state.argumentsDelta.String()
+		if (arguments == "" || !json.Valid([]byte(arguments))) && fallback != "" && json.Valid([]byte(fallback)) {
+			arguments = fallback
+			event["arguments"] = arguments
+			modified = true
+		}
+		state.argumentsDone = arguments
 		state.argumentsDoneSeen = true
 		s.addStateBytes(len(state.argumentsDone))
 		return modified
@@ -353,7 +397,16 @@ func (s *responsesSSEAssembler) captureCustomToolInput(event map[string]any, don
 	}
 	modified := s.normalizeContentEvent(event, state, false)
 	if done {
-		state.customInputDone = stringValue(event["input"])
+		input, present := event["input"].(string)
+		fallback := state.customInputDelta.String()
+		if (!present || input == "") && fallback != "" {
+			input = fallback
+			present = true
+			event["input"] = input
+			modified = true
+		}
+		state.customInputDone = input
+		state.customInputDonePresent = present
 		state.customInputDoneSeen = true
 		s.addStateBytes(len(state.customInputDone))
 		return modified
