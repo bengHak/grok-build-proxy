@@ -22,7 +22,19 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test -race ./...
+        shell: bash
+        run: |
+          set +e
+          go test -race ./... 2>&1 | tee test.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log
+          path: test.log
+          if-no-files-found: error
       - name: Validate installer
         run: sh -n install.sh
       - name: Build current Mac architecture
