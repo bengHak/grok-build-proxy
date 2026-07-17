@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"github.com/bengHak/grok-build-proxy/internal/auth"
 	"github.com/bengHak/grok-build-proxy/internal/catalog"
 	"github.com/bengHak/grok-build-proxy/internal/modelmap"
+	"github.com/bengHak/grok-build-proxy/internal/monitor"
 	proxyhandler "github.com/bengHak/grok-build-proxy/internal/proxy"
 )
 
@@ -32,6 +34,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 	codexCompatVersion := flags.String("codex-compat-version", envOr("GROK_BUILD_PROXY_CODEX_COMPAT_VERSION", proxyhandler.DefaultCodexCompatibilityVersion), "Codex backend compatibility version header")
 	clientToken := flags.String("client-token", strings.TrimSpace(os.Getenv("GROK_BUILD_PROXY_TOKEN")), "optional bearer token required from local clients")
 	logFormat := flags.String("log-format", envOr("GROK_BUILD_PROXY_LOG_FORMAT", "text"), "text or json")
+	noMonitor := flags.Bool("no-monitor", false, "use plain logs instead of the interactive monitor")
 	printConfig := flags.Bool("print-grok-config", false, "print example Grok Build model configuration and exit")
 	showVersion := flags.Bool("version", false, "print version and exit")
 	flags.Usage = func() {
@@ -65,13 +68,28 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 		return errors.New("refusing to bind to a non-loopback address without --client-token or GROK_BUILD_PROXY_TOKEN")
 	}
 
-	logger := newLogger(*logFormat, streams.stderr)
+	inputFile, inputFileOK := streams.stdin.(*os.File)
+	outputFile, outputFileOK := streams.stdout.(*os.File)
+	monitorEnabled := !*noMonitor && inputFileOK && outputFileOK && monitor.IsInteractive(streams.stdin, streams.stdout)
+	logOutput := streams.stderr
+	if monitorEnabled {
+		logOutput = io.Discard
+	}
+	logger := newLogger(*logFormat, logOutput)
+	var dashboard *monitor.Dashboard
+	if monitorEnabled {
+		dashboard = monitor.NewDashboard()
+	}
 	store, err := auth.NewStore(auth.Config{
 		Path:       *authFile,
 		RefreshURL: *refreshURL,
 	})
 	if err != nil {
 		return err
+	}
+	var observer proxyhandler.Observer
+	if dashboard != nil {
+		observer = dashboard
 	}
 	handler, err := proxyhandler.New(proxyhandler.Config{
 		UpstreamURL: *upstream,
@@ -80,6 +98,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 		ModelMap:    mappings,
 		HTTPClient:  proxyhandler.NewCodexHTTPClient(logger, *codexCompatVersion),
 		Logger:      logger,
+		Observer:    observer,
 		ClientToken: *clientToken,
 		Version:     version,
 	})
@@ -108,6 +127,49 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 		serveErr <- server.ListenAndServe()
 	}()
 
+	shutdown := func() error {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		logger.Info("shutting down")
+		return server.Shutdown(shutdownCtx)
+	}
+
+	if dashboard != nil {
+		monitorCtx, cancelMonitor := context.WithCancel(ctx)
+		defer cancelMonitor()
+		programErr := make(chan error, 1)
+		go func() {
+			programErr <- (&monitor.Program{
+				Dashboard: dashboard,
+				Input:     streams.stdin,
+				Output:    streams.stdout,
+				Terminal:  monitor.NewTerminal(inputFile, outputFile),
+				Address:   *listen,
+				Version:   version,
+			}).Run(monitorCtx)
+		}()
+		select {
+		case err := <-serveErr:
+			cancelMonitor()
+			<-programErr
+			if errors.Is(err, http.ErrServerClosed) {
+				return nil
+			}
+			return err
+		case err := <-programErr:
+			cancelMonitor()
+			shutdownErr := shutdown()
+			if err != nil {
+				return err
+			}
+			return shutdownErr
+		case <-ctx.Done():
+			cancelMonitor()
+			<-programErr
+			return shutdown()
+		}
+	}
+
 	select {
 	case err := <-serveErr:
 		if errors.Is(err, http.ErrServerClosed) {
@@ -115,10 +177,7 @@ func runServe(ctx context.Context, args []string, streams commandIO, defaults co
 		}
 		return err
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		logger.Info("shutting down")
-		return server.Shutdown(shutdownCtx)
+		return shutdown()
 	}
 }
 

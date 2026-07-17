@@ -35,6 +35,7 @@ type Config struct {
 	ModelMap     modelmap.Map
 	HTTPClient   *http.Client
 	Logger       *slog.Logger
+	Observer     Observer
 	ClientToken  string
 	Version      string
 	MaxBodyBytes int64
@@ -47,6 +48,7 @@ type Handler struct {
 	modelMap     modelmap.Map
 	httpClient   *http.Client
 	logger       *slog.Logger
+	observer     Observer
 	clientToken  string
 	version      string
 	maxBodyBytes int64
@@ -88,6 +90,7 @@ func New(cfg Config) (*Handler, error) {
 		modelMap:     cfg.ModelMap,
 		httpClient:   cfg.HTTPClient,
 		logger:       cfg.Logger,
+		observer:     cfg.Observer,
 		clientToken:  strings.TrimSpace(cfg.ClientToken),
 		version:      cfg.Version,
 		maxBodyBytes: cfg.MaxBodyBytes,
@@ -304,17 +307,42 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	sessionID := firstValidHeader(r.Header.Get("x-grok-session-id"), r.Header.Get("x-grok-conv-id"), r.Header.Get("x-request-id"))
+	if sessionID == "" {
+		sessionID = "default"
+	}
+	event := RequestEvent{
+		Type:           RequestStarted,
+		RequestID:      requestID,
+		SessionID:      sessionID,
+		RequestedModel: transformed.RequestedModel,
+		Model:          transformed.Model,
+		StartedAt:      started,
+	}
+	if h.observer != nil {
+		h.observer.Observe(event)
+		defer func() {
+			event.EndedAt = time.Now()
+			h.observer.Observe(event)
+		}()
+	}
+	event.Type = RequestFailed
+
 	resp, err := h.sendUpstream(r.Context(), r, transformed, requestID, false)
 	if err != nil {
+		event.StatusCode = http.StatusBadGateway
+		event.Error = err.Error()
 		h.logger.Error("upstream request failed", "request_id", requestID, "model", transformed.Model, "error", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		resp, err = h.sendUpstream(r.Context(), r, transformed, requestID, true)
 		if err != nil {
+			event.StatusCode = http.StatusBadGateway
+			event.Error = err.Error()
 			h.logger.Error("upstream retry failed", "request_id", requestID, "model", transformed.Model, "error", err)
 			writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 			return
@@ -322,10 +350,24 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	event.StatusCode = resp.StatusCode
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("X-Grok-Build-Proxy-Version", h.version)
 	w.WriteHeader(resp.StatusCode)
-	copyErr := copyResponseBody(w, resp.Body, strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream"))
+	var responseBody io.Reader = resp.Body
+	var capture *tailCapture
+	if h.observer != nil {
+		capture = newTailCapture(256 << 10)
+		responseBody = io.TeeReader(resp.Body, capture)
+	}
+	copyErr := copyResponseBody(w, responseBody, strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream"))
+	if capture != nil {
+		event.OutputTokens = observedOutputTokens(capture.buf)
+	}
+	event.Error = requestFailure(resp.StatusCode, copyErr)
+	if event.Error == "" {
+		event.Type = RequestCompleted
+	}
 	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
 		h.logger.Warn("response stream ended with error", "request_id", requestID, "model", transformed.Model, "error", copyErr)
 	}
@@ -337,6 +379,7 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"responses_lite", transformed.Lite,
 		"fast", transformed.Fast,
 		"status", resp.StatusCode,
+		"output_tokens", event.OutputTokens,
 		"duration_ms", time.Since(started).Milliseconds(),
 	)
 }
