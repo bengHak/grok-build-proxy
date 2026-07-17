@@ -19,6 +19,7 @@ type codexCompatTransport struct {
 	logger          *slog.Logger
 	compatVersion   string
 	responsesCompat responsesCompatMode
+	traceSSE        bool
 }
 
 // NewCodexHTTPClient returns an HTTP client that normalizes Grok Build's
@@ -44,6 +45,7 @@ func NewCodexHTTPClient(logger *slog.Logger, compatVersion string) *http.Client 
 		logger:          logger,
 		compatVersion:   compatVersion,
 		responsesCompat: parseResponsesCompatMode(os.Getenv("GROK_BUILD_PROXY_RESPONSES_COMPAT")),
+		traceSSE:        envEnabled("GROK_BUILD_PROXY_SSE_TRACE"),
 	}}
 }
 
@@ -51,14 +53,52 @@ func (t *codexCompatTransport) RoundTrip(req *http.Request) (*http.Response, err
 	if err := normalizeCodexHTTPRequest(req, t.compatVersion); err != nil {
 		return nil, fmt.Errorf("normalize Codex request: %w", err)
 	}
+
+	model := codexRequestString(req, "model")
+	requestID := firstNonEmpty(
+		req.Header.Get("x-client-request-id"),
+		req.Header.Get("session-id"),
+		req.Header.Get("thread-id"),
+	)
+	lite := strings.EqualFold(strings.TrimSpace(req.Header.Get(responsesLiteHeader)), "true")
+	acceptsSSE := headerContainsToken(req.Header.Get("Accept"), "text/event-stream")
+	if lite && acceptsSSE {
+		// Responses Lite is a text stream. Avoid an opaque compressed response
+		// bypassing the compatibility reader when an intermediary changes headers.
+		req.Header.Set("Accept-Encoding", "identity")
+	}
+
 	resp, err := t.base.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
-	if t.responsesCompat != responsesCompatOff && shouldNormalizeCodexSSEResponse(req, resp) {
-		resp.Body = newResponsesLiteSSEBodyWithMode(resp.Body, t.responsesCompat)
+
+	normalize := t.responsesCompat != responsesCompatOff && shouldNormalizeCodexSSEResponse(req, resp)
+	if lite {
+		t.logger.Info(
+			"codex responses compatibility",
+			"request_id", requestID,
+			"model", model,
+			"responses_lite", true,
+			"compat_mode", t.responsesCompat.String(),
+			"request_accept", req.Header.Get("Accept"),
+			"upstream_content_type", resp.Header.Get("Content-Type"),
+			"upstream_content_encoding", resp.Header.Get("Content-Encoding"),
+			"normalizer_applied", normalize,
+		)
+	}
+	if normalize {
+		resp.Body = newResponsesLiteSSEBodyWithOptions(resp.Body, responsesLiteSSEOptions{
+			Mode:      t.responsesCompat,
+			Model:     model,
+			RequestID: requestID,
+			Logger:    t.logger,
+			Trace:     t.traceSSE,
+		})
 		resp.ContentLength = -1
 		resp.Header.Del("Content-Length")
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Set("Content-Type", "text/event-stream; charset=utf-8")
 	}
 	if resp.StatusCode >= 400 {
 		logUpstreamError(t.logger, req, resp)
@@ -121,6 +161,33 @@ func normalizeCodexHTTPRequest(req *http.Request, compatVersion string) error {
 		return io.NopCloser(bytes.NewReader(encoded)), nil
 	}
 	return nil
+}
+
+func codexRequestString(req *http.Request, key string) string {
+	if req == nil || req.GetBody == nil || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return ""
+	}
+	defer body.Close()
+	var payload map[string]any
+	decoder := json.NewDecoder(body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(stringValue(payload[key]))
+}
+
+func envEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on", "debug", "summary":
+		return true
+	default:
+		return false
+	}
 }
 
 func firstNonEmpty(values ...string) string {
