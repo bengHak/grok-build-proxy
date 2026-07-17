@@ -13,19 +13,20 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version: "1.23.x"
-          cache: true
+          components: rustfmt, clippy
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
       - name: Check formatting
-        run: test -z "$(gofmt -l .)"
-      - name: Vet
-        run: go vet ./...
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
-        run: go test -race ./...
+        run: cargo test --all-targets
       - name: Validate installer
         run: sh -n install.sh
       - name: Build current Mac architecture
-        run: make build VERSION=ci
+        run: make build
       - name: Build Apple Silicon and Intel archives
-        run: make dist VERSION=ci
+        run: make dist

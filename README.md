@@ -305,10 +305,10 @@ default loopback binding whenever possible.
 ```sh
 git clone https://github.com/bengHak/grok-build-proxy.git
 cd grok-build-proxy
-gofmt -w $(find . -name '*.go' -type f)
-go vet ./...
-go test -race ./...
-make dist VERSION=0.0.7
+cargo fmt
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+make dist
 ```
 
 Release assets are built for macOS arm64 and amd64 and published with a SHA-256

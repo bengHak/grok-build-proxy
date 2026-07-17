@@ -90,7 +90,7 @@ outside the proxy's protocol responsibilities.
 
 ## Validation
 
-The repository CI runs formatting, `go vet`, race-enabled unit and integration
+The repository CI runs `cargo fmt --check`, strict Clippy, unit and integration
 tests, installer validation, and macOS arm64/amd64 release builds. Stream tests
 cover indexed and indexless text, empty text/refusal done payloads, mixed
 text/tool output, `exit_plan_mode`, `ask_user_question`, `update_goal`, valid

@@ -17,7 +17,7 @@ Usage:
 Options:
   --version VERSION       Release tag or source ref (for example v0.1.0)
   --install-dir DIRECTORY Installation directory (default: ~/.local/bin)
-  --from-source           Skip release assets and build from source with Go
+  --from-source           Skip release assets and build from source with Cargo
   -h, --help              Show this help
 
 Environment variables:
@@ -148,25 +148,16 @@ install_binary() {
   install_executable "$TMP_DIR/extract/$BINARY_NAME"
 }
 
-check_go_version() {
-  command -v go >/dev/null 2>&1 || fail \
-    "no compatible release asset was found and Go 1.23+ is not installed"
-
-  go_semver=$(go env GOVERSION 2>/dev/null | sed 's/^go//')
-  go_major=$(printf '%s' "$go_semver" | cut -d. -f1)
-  go_minor=$(printf '%s' "$go_semver" | cut -d. -f2 | sed 's/[^0-9].*$//')
-  case "$go_major:$go_minor" in
-    *[!0-9:]*|:*) fail "could not determine the installed Go version" ;;
-  esac
-  if [ "$go_major" -lt 1 ] || { [ "$go_major" -eq 1 ] && [ "$go_minor" -lt 23 ]; }; then
-    fail "Go 1.23 or newer is required for a source install (found $go_semver)"
-  fi
+check_rust_toolchain() {
+  command -v cargo >/dev/null 2>&1 || fail \
+    "no compatible release asset was found and the Rust toolchain is not installed"
+  command -v rustc >/dev/null 2>&1 || fail "rustc is required for a source install"
 }
 
 install_from_source() {
   ref=$1
-  check_go_version
-  say "building $ref from source with $(go env GOVERSION)"
+  check_rust_toolchain
+  say "building $ref from source with $(rustc --version)"
 
   archive="$TMP_DIR/source.tar.gz"
   source_url="https://github.com/$REPOSITORY/archive/refs/heads/$ref.tar.gz"
@@ -186,11 +177,15 @@ install_from_source() {
   source_dir=$1
   [ -d "$source_dir" ] || fail "source archive is empty"
 
+  case "$ARCH" in
+    arm64) target=aarch64-apple-darwin ;;
+    amd64) target=x86_64-apple-darwin ;;
+  esac
+  command -v rustup >/dev/null 2>&1 && rustup target add "$target" >/dev/null
   (
     cd "$source_dir"
-    CGO_ENABLED=0 GOOS=darwin GOARCH="$ARCH" \
-      go build -trimpath -ldflags "-s -w -X main.version=$ref" \
-      -o "$TMP_DIR/$BINARY_NAME" ./cmd/grok-build-proxy
+    cargo build --locked --release --target "$target"
+    cp "target/$target/release/$BINARY_NAME" "$TMP_DIR/$BINARY_NAME"
   )
   install_executable "$TMP_DIR/$BINARY_NAME"
 }
