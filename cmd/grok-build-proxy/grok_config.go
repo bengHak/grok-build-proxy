@@ -32,7 +32,9 @@ func renderGrokConfig(listen string, models catalog.Catalog, mappings modelmap.M
 		fmt.Fprintf(&builder, "base_url = %q\n", "http://"+listen+"/v1")
 		builder.WriteString("api_backend = \"responses\"\n")
 		builder.WriteString("api_key = \"unused\"\n")
-		fmt.Fprintf(&builder, "context_window = %d\n\n", target.ContextWindow)
+		fmt.Fprintf(&builder, "context_window = %d\n", target.ContextWindow)
+		writeReasoningConfig(&builder, target.Reasoning)
+		builder.WriteString("\n")
 	}
 	for _, model := range models.Models() {
 		if _, mapped := mappedSources[model.ID]; mapped {
@@ -45,9 +47,23 @@ func renderGrokConfig(listen string, models catalog.Catalog, mappings modelmap.M
 		fmt.Fprintf(&builder, "base_url = %q\n", "http://"+listen+"/v1")
 		builder.WriteString("api_backend = \"responses\"\n")
 		builder.WriteString("api_key = \"unused\"\n")
-		fmt.Fprintf(&builder, "context_window = %d\n\n", model.ContextWindow)
+		fmt.Fprintf(&builder, "context_window = %d\n", model.ContextWindow)
+		writeReasoningConfig(&builder, model.Reasoning)
+		builder.WriteString("\n")
 	}
 	return builder.String()
+}
+
+func writeReasoningConfig(builder *strings.Builder, capability *catalog.ReasoningCapability) {
+	if capability == nil {
+		return
+	}
+	efforts := make([]string, 0, len(capability.Efforts))
+	for _, effort := range capability.Efforts {
+		efforts = append(efforts, strconv.Quote(effort.Value))
+	}
+	builder.WriteString("supports_reasoning_effort = true\n")
+	fmt.Fprintf(builder, "reasoning_efforts = [%s]\n", strings.Join(efforts, ", "))
 }
 
 func displayModelID(value string) string {

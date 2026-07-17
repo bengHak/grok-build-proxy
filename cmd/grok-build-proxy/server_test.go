@@ -105,6 +105,85 @@ func TestRenderGrokConfigIncludesModelMappings(t *testing.T) {
 	}
 }
 
+func TestRenderGrokConfigReasoningCapabilities(t *testing.T) {
+	mappings, err := modelmap.Parse("grok-build=gpt-5.6-terra,grok-fast=gpt-5.6-sol-fast,grok-unknown=account-model")
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := renderGrokConfig("127.0.0.1:18765", catalog.New("gpt-5.5,gpt-5.2"), mappings)
+
+	const reasoningFields = "supports_reasoning_effort = true\nreasoning_efforts = [\"low\", \"medium\", \"high\", \"xhigh\"]"
+	tests := []struct {
+		name              string
+		table             string
+		want              []string
+		supportsReasoning bool
+	}{
+		{
+			name:              "canonical reasoning model",
+			table:             "model.codex-gpt-5-5",
+			want:              []string{`model = "gpt-5.5"`, `name = "Codex GPT-5.5"`},
+			supportsReasoning: true,
+		},
+		{
+			name:              "mapped alias",
+			table:             "model.grok-build",
+			want:              []string{`model = "grok-build"`},
+			supportsReasoning: true,
+		},
+		{
+			name:              "mapped fast target",
+			table:             "model.grok-fast",
+			want:              []string{`model = "grok-fast"`, "GPT-5.6 Sol (Fast)"},
+			supportsReasoning: true,
+		},
+		{
+			name:              "canonical unsupported model",
+			table:             "model.codex-gpt-5-2",
+			want:              []string{`model = "gpt-5.2"`},
+			supportsReasoning: false,
+		},
+		{
+			name:              "mapped unsupported target",
+			table:             "model.grok-unknown",
+			want:              []string{`model = "grok-unknown"`},
+			supportsReasoning: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			block := configModelBlock(t, output, test.table)
+			for _, want := range test.want {
+				if !strings.Contains(block, want) {
+					t.Fatalf("block does not contain %q:\n%s", want, block)
+				}
+			}
+			if got := strings.Contains(block, reasoningFields); got != test.supportsReasoning {
+				t.Fatalf("reasoning capability present = %t, want %t:\n%s", got, test.supportsReasoning, block)
+			}
+			if !test.supportsReasoning && (strings.Contains(block, "supports_reasoning_effort") || strings.Contains(block, "reasoning_efforts")) {
+				t.Fatalf("unsupported model contains reasoning fields:\n%s", block)
+			}
+		})
+	}
+}
+
+func configModelBlock(t *testing.T, config, table string) string {
+	t.Helper()
+	marker := "[" + table + "]\n"
+	start := strings.Index(config, marker)
+	if start < 0 {
+		t.Fatalf("config does not contain table %q:\n%s", table, config)
+	}
+	start += len(marker)
+	end := strings.Index(config[start:], "\n\n")
+	if end < 0 {
+		return config[start:]
+	}
+	return config[start : start+end]
+}
+
 func TestTOMLTableKey(t *testing.T) {
 	cases := map[string]string{
 		"grok-build":         "grok-build",
