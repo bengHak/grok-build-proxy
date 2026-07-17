@@ -174,7 +174,11 @@ impl Assembler {
                     response,
                     &self.response_id,
                     &self.model,
-                    typ.trim_start_matches("response."),
+                    if typ == "response.created" {
+                        "in_progress"
+                    } else {
+                        typ.trim_start_matches("response.")
+                    },
                 );
                 self.snapshot = Some(response.clone());
             }
