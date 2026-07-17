@@ -154,6 +154,11 @@ pub struct Dashboard {
     inner: Arc<Mutex<State>>,
 }
 
+fn lock_state(inner: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    // Recover from poison so a prior panic during apply cannot permanently kill the monitor.
+    inner.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Dashboard {
     pub fn new() -> Self {
         Self::default()
@@ -161,12 +166,12 @@ impl Dashboard {
 
     pub fn with_failure_cap(cap: usize) -> Self {
         let d = Self::new();
-        d.inner.lock().unwrap().failure_cap = cap.max(1);
+        lock_state(&d.inner).failure_cap = cap.max(1);
         d
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let state = self.inner.lock().unwrap();
+        let state = lock_state(&self.inner);
         let mut sessions: Vec<_> = state.sessions.values().cloned().collect();
         sessions.sort_by(|a, b| {
             b.updated_at
@@ -188,7 +193,7 @@ impl Dashboard {
 
     /// Failures for later report export (newest first). Optional kind filter.
     pub fn failures_for_report(&self, kind: Option<FailureKind>) -> Vec<FailureRecord> {
-        let state = self.inner.lock().unwrap();
+        let state = lock_state(&self.inner);
         state
             .failures
             .iter()
@@ -198,14 +203,24 @@ impl Dashboard {
     }
 
     fn apply(&self, event: RequestEvent) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = lock_state(&self.inner);
         let request_id = sanitize(&event.request_id);
         let session_id = sanitize(&event.session_id);
         match event.kind {
             RequestEventKind::Started => {
-                if state.active.contains_key(&event.request_id)
-                    || state.completed.contains(&event.request_id)
-                {
+                if state.completed.contains(&event.request_id) {
+                    return;
+                }
+                // Re-observe Started after auth retry: refresh in-flight attempt flags only.
+                if let Some(active) = state.active.get_mut(&event.request_id) {
+                    active.auth_retried = event.auth_retried;
+                    active.attempt = event.attempt.max(1);
+                    active.mapped = event.mapped;
+                    active.lite = event.lite;
+                    active.fast = event.fast;
+                    if let Some(session) = state.sessions.get_mut(&event.session_id) {
+                        session.updated_at = Some(Utc::now());
+                    }
                     return;
                 }
                 state.active.insert(
@@ -498,6 +513,24 @@ mod tests {
         assert!(s.failures[0].auth_retried);
         assert_eq!(s.failures[0].kind, FailureKind::AuthRetryFailed);
         assert_eq!(s.recent[0].attempt, 2);
+    }
+
+    #[test]
+    fn started_reobserve_updates_active_attempt() {
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        assert_eq!(d.snapshot().active[0].attempt, 1);
+        assert!(!d.snapshot().active[0].auth_retried);
+        let mut retry = base_event(RequestEventKind::Started);
+        retry.auth_retried = true;
+        retry.attempt = 2;
+        d.observe(retry);
+        let s = d.snapshot();
+        assert_eq!(s.active.len(), 1);
+        assert_eq!(s.active[0].attempt, 2);
+        assert!(s.active[0].auth_retried);
+        assert_eq!(s.sessions[0].requests, 1); // not double-counted
+        assert_eq!(s.sessions[0].active, 1);
     }
 
     #[test]

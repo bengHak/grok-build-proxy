@@ -123,15 +123,24 @@ impl RequestEvent {
 
 /// Sanitize monitor-facing strings: strip control chars, cap length.
 pub fn sanitize(value: &str) -> String {
-    let count = value.chars().count();
+    let original_len = value.chars().count();
     let mut out: String = value
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .take(256)
         .collect();
     out = out.trim().to_owned();
-    if count > 256 {
-        out.pop();
+    // Ellipsis only when the original exceeded the cap (post-trim may be shorter).
+    if original_len > 256 && out.chars().count() >= 256 {
+        while out.chars().count() >= 256 {
+            out.pop();
+        }
+        out.push('…');
+    } else if original_len > 256 && !out.is_empty() && !out.ends_with('…') {
+        // Trim ate trailing space; still mark truncation when we took a full prefix.
+        if out.chars().count() >= 255 {
+            out.pop();
+        }
         out.push('…');
     }
     out
@@ -149,12 +158,33 @@ pub struct CaptureDiagnostics {
     pub has_stream_terminal_failure: bool,
 }
 
+const KNOWN_PROXY_ERROR_TYPES: &[&str] =
+    &["proxy_incomplete_output", "proxy_missing_terminal_output"];
+
+fn is_known_proxy_error_type(et: &str) -> bool {
+    KNOWN_PROXY_ERROR_TYPES.contains(&et) || {
+        // Accept only exact known tokens or future proxy_* kinds that look like error type ids
+        // (snake_case, no spaces) — still only when extracted from structured error.type fields.
+        et.starts_with("proxy_")
+            && et.len() > "proxy_".len()
+            && et
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+}
+
 /// Extract failure diagnostics from a capture tail (SSE frames or JSON body).
+///
+/// Failure signals are taken only from:
+/// - terminal SSE events (`error`, `response.failed`, `response.incomplete`)
+/// - plain non-SSE JSON error bodies (no `event:` frames)
+///
+/// Model content / completed-frame payloads are never scanned for `proxy_` substrings.
 pub fn parse_capture_diagnostics(bytes: &[u8]) -> CaptureDiagnostics {
     let text = String::from_utf8_lossy(bytes);
     let mut diag = CaptureDiagnostics::default();
 
-    // response_id: last occurrence of "id":"resp_..." or "response_id":"..."
+    // response_id: last occurrence of "response_id":"..." or "id":"resp_..."
     for marker in ["\"response_id\"", "\"id\""] {
         for (index, _) in text.match_indices(marker) {
             if let Some(id) = extract_json_string_after(&text[index + marker.len()..]) {
@@ -165,43 +195,36 @@ pub fn parse_capture_diagnostics(bytes: &[u8]) -> CaptureDiagnostics {
         }
     }
 
-    // Count output items roughly via "type":"function_call" / message / custom_tool_call in output
-    // Prefer response.output array length if present; fallback to item type markers.
     if let Some(count) = count_output_items(&text) {
         diag.output_count = count;
     }
 
-    // Walk SSE-ish frames and JSON fragments for terminal / error markers.
+    let mut saw_sse_event = false;
+    let mut saw_completed = false;
+
     for frame in text.split("\n\n") {
         let mut event_name = None;
         let mut data_lines = Vec::new();
         for line in frame.lines() {
             if let Some(v) = line.strip_prefix("event:") {
                 event_name = Some(v.trim());
+                saw_sse_event = true;
             } else if let Some(v) = line.strip_prefix("data:") {
                 data_lines.push(v.strip_prefix(' ').unwrap_or(v));
             }
         }
-        let data = if data_lines.is_empty() {
-            frame.trim()
-        } else {
-            // join without allocating much for large frames — data is already in text
-            // Use joined only when multi-line data.
-            if data_lines.len() == 1 {
-                data_lines[0]
-            } else {
-                // fall through via temporary
-                ""
-            }
-        };
         let joined;
-        let data = if data.is_empty() && !data_lines.is_empty() {
+        let data = if data_lines.is_empty() {
+            let trimmed = frame.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            trimmed
+        } else if data_lines.len() == 1 {
+            data_lines[0]
+        } else {
             joined = data_lines.join("\n");
             joined.as_str()
-        } else if data.is_empty() {
-            continue;
-        } else {
-            data
         };
         if data == "[DONE]" {
             continue;
@@ -213,120 +236,62 @@ pub fn parse_capture_diagnostics(bytes: &[u8]) -> CaptureDiagnostics {
             .unwrap_or_default();
 
         match typ.as_str() {
+            "response.completed" => {
+                saw_completed = true;
+            }
             "response.failed" | "response.incomplete" => {
-                diag.has_stream_terminal_failure = true;
-                diag.terminal_event = typ.clone();
-                if let Some(msg) = extract_nested_error_message(data) {
-                    if diag.error_message.is_empty() {
-                        diag.error_message = sanitize(&msg);
-                    }
-                }
-                if let Some(et) = extract_nested_error_type(data) {
-                    diag.error_type = sanitize(&et);
-                    if et.starts_with("proxy_") {
-                        diag.has_proxy_error = true;
-                    }
-                }
+                apply_terminal_error(&mut diag, &typ, data);
             }
             "error" => {
-                diag.has_stream_terminal_failure = true;
-                diag.terminal_event = "error".into();
-                if let Some(et) = extract_json_string_field(data, "type")
-                    .filter(|t| t != "error")
-                    .or_else(|| extract_nested_error_type(data))
-                {
-                    diag.error_type = sanitize(&et);
-                    if et.starts_with("proxy_") {
-                        diag.has_proxy_error = true;
-                    }
-                } else if let Some(et) = extract_nested_error_type(data) {
-                    diag.error_type = sanitize(&et);
-                    if et.starts_with("proxy_") {
-                        diag.has_proxy_error = true;
-                    }
-                }
-                // error event often: {"type":"error","error":{"type":"...","message":"..."}}
-                if let Some(et) = extract_nested_error_type(data) {
-                    diag.error_type = sanitize(&et);
-                    if et.starts_with("proxy_") {
-                        diag.has_proxy_error = true;
-                    }
-                }
-                if let Some(msg) = extract_nested_error_message(data)
-                    .or_else(|| extract_json_string_field(data, "message"))
-                {
-                    diag.error_message = sanitize(&msg);
-                }
+                apply_terminal_error(&mut diag, "error", data);
             }
-            _ => {
-                // Non-SSE JSON body or embedded error object
-                if let Some(et) = extract_nested_error_type(data) {
-                    if et.starts_with("proxy_") {
-                        diag.has_proxy_error = true;
-                        diag.error_type = sanitize(&et);
-                        if let Some(msg) = extract_nested_error_message(data) {
-                            diag.error_message = sanitize(&msg);
-                        }
-                    } else if diag.error_type.is_empty() {
-                        diag.error_type = sanitize(&et);
-                        if let Some(msg) = extract_nested_error_message(data) {
-                            diag.error_message = sanitize(&msg);
-                        }
-                    }
-                }
-            }
+            // Non-terminal frames (deltas, output items, completed payloads): ignore nested
+            // "error" objects so model-visible JSON cannot trip ProxyAssemble.
+            _ => {}
         }
     }
 
-    // Also scan whole text for proxy_ error types (synthetic frames may nest oddly)
-    if diag.error_type.is_empty() || !diag.has_proxy_error {
-        for marker in [
-            "proxy_incomplete_output",
-            "proxy_missing_terminal_output",
-            "proxy_",
-        ] {
-            if let Some(pos) = text.find(marker) {
-                // extract surrounding quoted type if possible
-                let slice = &text[pos..];
-                let end = slice
-                    .find(|c: char| {
-                        c == '"' || c == '\'' || c.is_whitespace() || c == ',' || c == '}'
-                    })
-                    .unwrap_or(slice.len().min(64));
-                let et = &slice[..end];
-                if et.starts_with("proxy_") {
-                    diag.has_proxy_error = true;
-                    if diag.error_type.is_empty() {
-                        diag.error_type = sanitize(et);
-                    }
-                }
-            }
-        }
-    }
-
-    // Whole-body JSON error.type for non-SSE upstream error responses
-    if diag.error_type.is_empty() {
+    // Plain JSON error body (non-SSE upstream HTTP responses). Never mark proxy errors from
+    // successful completed streams.
+    if !saw_sse_event && !saw_completed && !diag.has_stream_terminal_failure {
         if let Some(et) = extract_nested_error_type(&text) {
             diag.error_type = sanitize(&et);
-            if et.starts_with("proxy_") {
+            if is_known_proxy_error_type(&et) {
                 diag.has_proxy_error = true;
+                diag.has_stream_terminal_failure = true;
+                diag.terminal_event = "error".into();
             }
         }
-    }
-    if diag.error_message.is_empty() {
-        if let Some(msg) = extract_nested_error_message(&text) {
-            diag.error_message = sanitize(&msg);
-        }
-    }
-
-    if diag.has_proxy_error {
-        diag.has_stream_terminal_failure = true;
-        if diag.terminal_event.is_empty() {
-            diag.terminal_event = "error".into();
+        if diag.error_message.is_empty() {
+            if let Some(msg) = extract_nested_error_message(&text) {
+                diag.error_message = sanitize(&msg);
+            }
         }
     }
 
     diag
+}
+
+fn apply_terminal_error(diag: &mut CaptureDiagnostics, terminal: &str, data: &str) {
+    diag.has_stream_terminal_failure = true;
+    diag.terminal_event = terminal.to_owned();
+
+    // Prefer nested error.type; fall back to top-level type when it is not the event name.
+    let et = extract_nested_error_type(data).or_else(|| {
+        extract_json_string_field(data, "type").filter(|t| t != "error" && t != terminal)
+    });
+    if let Some(et) = et {
+        diag.error_type = sanitize(&et);
+        if is_known_proxy_error_type(&et) {
+            diag.has_proxy_error = true;
+        }
+    }
+
+    if let Some(msg) =
+        extract_nested_error_message(data).or_else(|| extract_json_string_field(data, "message"))
+    {
+        diag.error_message = sanitize(&msg);
+    }
 }
 
 fn extract_json_string_after(rest: &str) -> Option<String> {
@@ -381,7 +346,6 @@ fn extract_nested_error_message(json: &str) -> Option<String> {
 }
 
 fn count_output_items(text: &str) -> Option<u32> {
-    // Look for "output":[ ... ] and count top-level objects roughly via "type":
     let marker = "\"output\"";
     let idx = text.rfind(marker)?;
     let rest = text[idx + marker.len()..].trim_start();
@@ -449,7 +413,6 @@ pub fn classify_stream_end(
     }
 
     if !status_success {
-        // HTTP failure path — finer auth/connect handled by callers
         let error_type = if !diag.error_type.is_empty() {
             diag.error_type.clone()
         } else {
@@ -469,7 +432,9 @@ pub fn classify_stream_end(
     }
 
     // 2xx but stream terminal / proxy assembly failure
-    if diag.has_proxy_error || diag.error_type.starts_with("proxy_") {
+    if diag.has_proxy_error
+        || (diag.has_stream_terminal_failure && is_known_proxy_error_type(&diag.error_type))
+    {
         let et = if diag.error_type.is_empty() {
             "proxy_assemble".into()
         } else {
@@ -553,6 +518,36 @@ data: {"type":"response.failed","response":{"id":"resp_abc","error":{"type":"ser
     }
 
     #[test]
+    fn classifies_response_incomplete() {
+        let sse = r#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc","status":"incomplete"}}
+
+"#;
+        let diag = parse_capture_diagnostics(sse.as_bytes());
+        assert!(diag.has_stream_terminal_failure);
+        assert!(!diag.has_proxy_error);
+        let (kind, fk, et, _) = classify_stream_end(true, None, &diag);
+        assert_eq!(kind, RequestEventKind::Failed);
+        assert_eq!(fk, Some(FailureKind::StreamTerminalFailed));
+        assert_eq!(et, "response.incomplete");
+        assert_eq!(diag.response_id, "resp_inc");
+    }
+
+    #[test]
+    fn classifies_response_incomplete_with_nested_error_type() {
+        let sse = r#"event: response.incomplete
+data: {"type":"response.incomplete","response":{"id":"resp_inc","error":{"type":"max_output_tokens","message":"hit limit"}}}
+
+"#;
+        let diag = parse_capture_diagnostics(sse.as_bytes());
+        let (kind, fk, et, msg) = classify_stream_end(true, None, &diag);
+        assert_eq!(kind, RequestEventKind::Failed);
+        assert_eq!(fk, Some(FailureKind::StreamTerminalFailed));
+        assert_eq!(et, "max_output_tokens");
+        assert!(msg.contains("hit limit"));
+    }
+
+    #[test]
     fn classifies_stream_io() {
         let diag = CaptureDiagnostics::default();
         let (kind, fk, et, msg) = classify_stream_end(true, Some("connection reset"), &diag);
@@ -581,5 +576,48 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
         assert_eq!(kind, RequestEventKind::Completed);
         assert_eq!(fk, None);
         assert_eq!(diag.response_id, "resp_ok");
+    }
+
+    #[test]
+    fn content_mentioning_proxy_mode_does_not_fail() {
+        let sse = r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"configure proxy_mode now"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":"message","content":[{"type":"output_text","text":"configure proxy_mode now"}]}]}}
+
+"#;
+        let diag = parse_capture_diagnostics(sse.as_bytes());
+        assert!(!diag.has_proxy_error);
+        assert!(!diag.has_stream_terminal_failure);
+        let (kind, fk, _, _) = classify_stream_end(true, None, &diag);
+        assert_eq!(kind, RequestEventKind::Completed);
+        assert_eq!(fk, None);
+    }
+
+    #[test]
+    fn embedded_error_json_in_completed_output_does_not_fail() {
+        let sse = r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":"message","content":[{"type":"output_text","text":"{\"error\":{\"type\":\"proxy_incomplete_output\",\"message\":\"nope\"}}"}]}]}}
+
+"#;
+        let diag = parse_capture_diagnostics(sse.as_bytes());
+        assert!(!diag.has_proxy_error);
+        let (kind, fk, _, _) = classify_stream_end(true, None, &diag);
+        assert_eq!(kind, RequestEventKind::Completed);
+        assert_eq!(fk, None);
+    }
+
+    #[test]
+    fn plain_json_upstream_error_body() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"bad model"}}"#;
+        let diag = parse_capture_diagnostics(body.as_bytes());
+        assert_eq!(diag.error_type, "invalid_request_error");
+        assert!(!diag.has_proxy_error);
+        let (kind, fk, et, msg) = classify_stream_end(false, None, &diag);
+        assert_eq!(kind, RequestEventKind::Failed);
+        assert_eq!(fk, Some(FailureKind::UpstreamHttp));
+        assert_eq!(et, "invalid_request_error");
+        assert!(msg.contains("bad model"));
     }
 }
