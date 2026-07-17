@@ -1,4 +1,4 @@
-//! Interactive serve monitor (ratatui panels: header / sessions / active / footer).
+//! Interactive serve monitor (ratatui panels: header / sessions / active / failures / footer).
 
 mod app;
 mod theme;
@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 use theme::Theme;
-use widgets::{ActivePanel, Footer, Header, HelpOverlay, SessionsPanel, TurnKind};
+use widgets::{ActivePanel, FailuresPanel, Footer, Header, HelpOverlay, SessionsPanel, TurnKind};
 
 pub use crate::store::{Dashboard, FailureRecord, Request, Session, Snapshot};
 
@@ -62,7 +62,8 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
         let snapshot = dashboard.snapshot();
         let sessions_len = snapshot.sessions.len();
         let active_len = ActivePanel::row_count(&snapshot);
-        app.clamp_selection(sessions_len, active_len);
+        let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
+        app.clamp_selection(sessions_len, active_len, failures_len);
 
         terminal.draw(|frame| {
             draw(
@@ -83,9 +84,12 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
                 if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
-                if app.handle(key, sessions_len, active_len) {
+                if app.handle(key, sessions_len, active_len, failures_len) {
                     return Ok(());
                 }
+                // Filter cycle (`f`) may shrink the list; re-clamp with new filter.
+                let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
+                app.clamp_selection(sessions_len, active_len, failures_len);
             }
         }
         tokio::task::yield_now().await;
@@ -114,7 +118,7 @@ fn draw(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(5),    // body
+            Constraint::Min(5),    // body (sessions|active + failures)
             Constraint::Length(3), // footer
         ])
         .split(area);
@@ -128,10 +132,16 @@ fn draw(
     }
     .render(chunks[0], buf);
 
+    // Body: top row sessions|active, bottom full-width failures.
     let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(chunks[1]);
+
+    let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(chunks[1]);
+        .split(body[0]);
 
     SessionsPanel {
         snapshot,
@@ -139,12 +149,21 @@ fn draw(
         focused: app.focus == Focus::Sessions && app.mode == Mode::Dashboard,
         theme,
     }
-    .render(body[0], buf);
+    .render(top[0], buf);
 
     ActivePanel {
         snapshot,
         selected: app.selected,
         focused: app.focus == Focus::Active && app.mode == Mode::Dashboard,
+        theme,
+    }
+    .render(top[1], buf);
+
+    FailuresPanel {
+        snapshot,
+        selected: app.selected,
+        focused: app.focus == Focus::Failures && app.mode == Mode::Dashboard,
+        filter: app.failure_filter,
         theme,
     }
     .render(body[1], buf);
@@ -166,8 +185,10 @@ fn draw_detail(
     theme: Theme,
 ) {
     let text = detail_text(snapshot, app);
-    let width = area.width.min(72);
-    let height = area.height.min(12);
+    let width = area.width.min(76);
+    let height = area
+        .height
+        .min(if app.focus == Focus::Failures { 18 } else { 12 });
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let modal = Rect {
@@ -233,6 +254,47 @@ fn detail_text(snapshot: &Snapshot, app: &App) -> String {
                 "No turn selected".into()
             }
         }
+        Focus::Failures => {
+            let rows = FailuresPanel::filtered(snapshot, app.failure_filter);
+            if let Some(f) = rows.get(app.selected) {
+                format!(
+                    "Failure {}\n  ts: {}\n  kind: {}\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration_ms: {}  session_fail#: {}\n  error_type: {}\n  message: {}\n  response_id: {}\n  mapped: {}  lite: {}  fast: {}\n  auth_retried: {}  outputs: {}  capture_bytes: {}",
+                    f.request_id,
+                    f.ts.to_rfc3339(),
+                    f.kind.as_str(),
+                    f.session_id,
+                    f.model,
+                    f.requested_model,
+                    f.status_code,
+                    f.attempt,
+                    f.duration_ms,
+                    f.session_failure_index,
+                    if f.error_type.is_empty() {
+                        "-"
+                    } else {
+                        f.error_type.as_str()
+                    },
+                    if f.error_message.is_empty() {
+                        "-"
+                    } else {
+                        f.error_message.as_str()
+                    },
+                    if f.response_id.is_empty() {
+                        "-"
+                    } else {
+                        f.response_id.as_str()
+                    },
+                    f.mapped,
+                    f.lite,
+                    f.fast,
+                    f.auth_retried,
+                    f.output_count,
+                    f.capture_bytes,
+                )
+            } else {
+                "No failure selected".into()
+            }
+        }
     }
 }
 
@@ -285,6 +347,7 @@ fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
 mod tests {
     use super::*;
     use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind};
+    use crate::monitor::app::FailureFilter;
     use std::time::{Duration, Instant};
 
     fn base_event(kind: RequestEventKind) -> RequestEvent {
@@ -325,6 +388,19 @@ mod tests {
         failed.error_type = "upstream_http".into();
         failed.status_code = 502;
         d.observe(failed);
+
+        // Second failure: ProxyAssemble for filter tests.
+        let mut fail3 = base_event(RequestEventKind::Started);
+        fail3.request_id = "req-3".into();
+        d.observe(fail3);
+        let mut failed3 = base_event(RequestEventKind::Failed);
+        failed3.request_id = "req-3".into();
+        failed3.failure_kind = Some(FailureKind::ProxyAssemble);
+        failed3.error_type = "proxy_incomplete_output".into();
+        failed3.status_code = 200;
+        failed3.error = "could not assemble".into();
+        d.observe(failed3);
+
         // Leave one in-flight turn for the active panel.
         let mut inflight = base_event(RequestEventKind::Started);
         inflight.request_id = "req-live".into();
@@ -333,10 +409,10 @@ mod tests {
     }
 
     #[test]
-    fn render_header_sessions_footer() {
+    fn render_header_sessions_failures_footer() {
         let snap = fixture_dashboard().snapshot();
         let app = App::new();
-        let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(
             text.contains("grok-build-proxy"),
             "header missing version banner:\n{text}"
@@ -350,7 +426,7 @@ mod tests {
             "header missing active count from store:\n{text}"
         );
         assert!(
-            text.contains("err●1"),
+            text.contains("err●2"),
             "header missing failure count from store:\n{text}"
         );
         assert!(
@@ -361,26 +437,89 @@ mod tests {
             text.contains("active / recent"),
             "active panel title missing:\n{text}"
         );
-        assert!(text.contains("sess-abc"), "session id missing:\n{text}");
         assert!(
-            text.contains("gpt-test"),
-            "model from store missing in body:\n{text}"
+            text.contains("failures"),
+            "failures panel title missing:\n{text}"
         );
         assert!(
-            text.contains("req-1") || text.contains("req-2"),
-            "recent turn id from store missing:\n{text}"
+            text.contains("All") || text.contains("[All]"),
+            "failures filter label missing:\n{text}"
+        );
+        assert!(text.contains("sess-abc"), "session id missing:\n{text}");
+        assert!(
+            text.contains("UpstreamHttp") || text.contains("upstream_http"),
+            "failure kind/error_type missing in failures panel:\n{text}"
+        );
+        assert!(
+            text.contains("ProxyAssemble") || text.contains("proxy_incomplete"),
+            "ProxyAssemble failure missing in panel:\n{text}"
         );
         assert!(
             text.contains("req-live"),
             "active turn id from store missing:\n{text}"
         );
         assert!(
-            text.contains("upstream_http") || text.contains("HTTP 502"),
-            "failed recent status from store missing:\n{text}"
+            text.contains("j/k") || text.contains("quit") || text.contains("filter"),
+            "footer bindings missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn failures_filter_hides_non_matching() {
+        let snap = fixture_dashboard().snapshot();
+        let mut app = App::new();
+        app.failure_filter = FailureFilter::ProxyAssemble;
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        assert!(
+            text.contains("ProxyAssemble") || text.contains("proxy_incomplete"),
+            "filtered ProxyAssemble missing:\n{text}"
+        );
+        // Title should show filter name.
+        assert!(
+            text.contains("ProxyAssemble"),
+            "filter name in title missing:\n{text}"
+        );
+        // UpstreamHttp row should not appear when filter is ProxyAssemble.
+        // Kind label in the list uses as_str(); filter title also contains ProxyAssemble.
+        let without_title = text.replacen("ProxyAssemble", "", 1);
+        assert!(
+            !without_title.contains("UpstreamHttp"),
+            "UpstreamHttp should be filtered out:\n{text}"
+        );
+    }
+
+    #[test]
+    fn detail_overlay_renders_failure_fields() {
+        let snap = fixture_dashboard().snapshot();
+        let mut app = App::new();
+        app.focus = Focus::Failures;
+        app.selected = 0;
+        app.mode = Mode::Detail;
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        assert!(text.contains("detail"), "detail title missing:\n{text}");
+        assert!(
+            text.contains("Failure"),
+            "detail missing failure header:\n{text}"
         );
         assert!(
-            text.contains("j/k") || text.contains("quit"),
-            "footer bindings missing:\n{text}"
+            text.contains("kind:")
+                || text.contains("UpstreamHttp")
+                || text.contains("ProxyAssemble"),
+            "detail missing kind:\n{text}"
+        );
+        assert!(
+            text.contains("sess-abc"),
+            "detail missing session id:\n{text}"
+        );
+        assert!(
+            text.contains("attempt:") || text.contains("attempt"),
+            "detail missing attempt:\n{text}"
+        );
+        assert!(
+            text.contains("error_type")
+                || text.contains("upstream_http")
+                || text.contains("proxy_incomplete"),
+            "detail missing error_type:\n{text}"
         );
     }
 
@@ -391,7 +530,7 @@ mod tests {
         app.focus = Focus::Active;
         app.selected = 0; // req-live (active first)
         app.mode = Mode::Detail;
-        let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(text.contains("detail"), "detail title missing:\n{text}");
         assert!(
             text.contains("req-live"),
@@ -415,13 +554,15 @@ mod tests {
         app.focus = Focus::Sessions;
         app.selected = 0;
         app.mode = Mode::Detail;
-        let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(
             text.contains("Session sess-abc"),
             "detail missing session header:\n{text}"
         );
         assert!(
-            text.contains("last_failure: UpstreamHttp") || text.contains("UpstreamHttp"),
+            text.contains("last_failure:")
+                || text.contains("UpstreamHttp")
+                || text.contains("ProxyAssemble"),
             "detail missing last failure kind:\n{text}"
         );
         assert!(
@@ -435,11 +576,15 @@ mod tests {
         let snap = Snapshot::default();
         let mut app = App::new();
         app.mode = Mode::Help;
-        let text = render_test(80, 20, &snap, "127.0.0.1:1", "0.0.12", &app);
+        let text = render_test(80, 22, &snap, "127.0.0.1:1", "0.0.12", &app);
         assert!(text.contains("Monitor help"), "help text missing:\n{text}");
         assert!(
             text.contains("Shift-Tab") || text.contains("Tab"),
             "help missing panel switch keys:\n{text}"
+        );
+        assert!(
+            text.contains("filter") || text.contains(" f "),
+            "help missing filter key:\n{text}"
         );
     }
 }

@@ -21,6 +21,8 @@ impl Widget for Footer {
             Span::styled("panel ", self.theme.footer),
             Span::styled(" Enter ", self.theme.highlight),
             Span::styled("detail ", self.theme.footer),
+            Span::styled(" f ", self.theme.highlight),
+            Span::styled("filter ", self.theme.footer),
             Span::styled(" ? ", self.theme.highlight),
             Span::styled("help ", self.theme.footer),
             Span::styled(" Esc ", self.theme.highlight),

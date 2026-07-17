@@ -15,8 +15,8 @@ pub struct HelpOverlay {
 impl Widget for HelpOverlay {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Center a modal within the full frame.
-        let width = area.width.min(56);
-        let height = area.height.min(14);
+        let width = area.width.min(62);
+        let height = area.height.min(16);
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let modal = Rect {
@@ -32,14 +32,16 @@ impl Widget for HelpOverlay {
             Line::from(Span::styled("Monitor help", self.theme.highlight)),
             Line::from(""),
             Line::from("  ↑/k  ↓/j     move selection"),
-            Line::from("  Tab/Shift-Tab switch panel (sessions ↔ active)"),
+            Line::from("  Tab/Shift-Tab cycle panels (sessions → active → failures)"),
             Line::from("  Enter        open details"),
+            Line::from("  f            cycle failure filter"),
+            Line::from("               All / ProxyAssemble / Upstream / Auth / Stream"),
             Line::from("  Esc/Backspace return"),
             Line::from("  ?            toggle help"),
             Line::from("  q/Q / Ctrl-C stop proxy"),
             Line::from(""),
             Line::from(Span::styled(
-                "  (failures panel & report export in later PRs)",
+                "  (report export y/w in a later PR)",
                 self.theme.muted,
             )),
         ];

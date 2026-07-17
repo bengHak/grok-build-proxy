@@ -14,6 +14,12 @@ pub struct Theme {
     pub fail: Style,
     pub muted: Style,
     pub highlight: Style,
+    /// AuthRetryFailed rows.
+    pub auth: Style,
+    /// StreamIo / StreamTerminalFailed rows.
+    pub stream: Style,
+    /// ProxyAssemble rows.
+    pub assemble: Style,
 }
 
 impl Default for Theme {
@@ -36,6 +42,9 @@ impl Default for Theme {
             highlight: Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
+            auth: Style::default().fg(Color::Yellow),
+            stream: Style::default().fg(Color::Magenta),
+            assemble: Style::default().fg(Color::LightRed),
         }
     }
 }
