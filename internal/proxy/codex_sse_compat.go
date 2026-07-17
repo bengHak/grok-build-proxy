@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -83,26 +84,43 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 			rawFrame := append([]byte(nil), frame...)
 			captureVisibleSSEContent(rawFrame, &b.visibleText, &b.visibleRefusal)
 
-			report := responsesResponseNormalizationReport{}
-			if b.envelope != nil {
-				frame, report = b.envelope.normalizeFrame(frame)
+			if eventType, drop := codexPrivateSSEEventType(frame); drop {
+				b.eventIndex++
+				if b.trace {
+					logResponsesSSEFrame(
+						b.logger,
+						b.requestID,
+						b.eventIndex,
+						rawFrame,
+						nil,
+						responsesResponseNormalizationReport{
+							EventType: eventType,
+							Filled:    []string{"private_event.dropped"},
+						},
+					)
+				}
+			} else {
+				report := responsesResponseNormalizationReport{}
+				if b.envelope != nil {
+					frame, report = b.envelope.normalizeFrame(frame)
+				}
+				frame = b.state.normalizeAuxiliaryFrame(frame)
+				terminalCandidate := completedTerminalFrame(frame)
+				normalized := b.state.transformFrame(frame)
+				var fallbackApplied bool
+				normalized, fallbackApplied = repairVisibleTerminalOutput(
+					normalized,
+					terminalCandidate,
+					b.visibleText.String(),
+					b.visibleRefusal.String(),
+				)
+				report.VisibleFallback = fallbackApplied
+				b.eventIndex++
+				if b.trace {
+					logResponsesSSEFrame(b.logger, b.requestID, b.eventIndex, rawFrame, normalized, report)
+				}
+				b.pending = append(b.pending, normalized...)
 			}
-			frame = b.state.normalizeAuxiliaryFrame(frame)
-			terminalCandidate := completedTerminalFrame(frame)
-			normalized := b.state.transformFrame(frame)
-			var fallbackApplied bool
-			normalized, fallbackApplied = repairVisibleTerminalOutput(
-				normalized,
-				terminalCandidate,
-				b.visibleText.String(),
-				b.visibleRefusal.String(),
-			)
-			report.VisibleFallback = fallbackApplied
-			b.eventIndex++
-			if b.trace {
-				logResponsesSSEFrame(b.logger, b.requestID, b.eventIndex, rawFrame, normalized, report)
-			}
-			b.pending = append(b.pending, normalized...)
 		}
 		if err != nil {
 			b.finished = true
@@ -145,6 +163,33 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return 0, io.EOF
+}
+
+// codexPrivateSSEEventType identifies transport-only Codex events that are not
+// part of the public Responses API event enum used by Grok Build. Codex's own
+// client consumes response.metadata out of band for turn state, model and
+// moderation metadata. Passing it through makes async-openai reject the stream
+// before the following Plan/function-call event can be processed.
+func codexPrivateSSEEventType(frame []byte) (string, bool) {
+	eventName, data, ok := parseSSEFrame(frame)
+	if eventName == "response.metadata" && (!ok || strings.TrimSpace(data) == "") {
+		return eventName, true
+	}
+	if !ok || data == "[DONE]" {
+		return "", false
+	}
+
+	var event map[string]any
+	decoder := json.NewDecoder(strings.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&event); err != nil {
+		return "", false
+	}
+	eventType := firstNonEmptyString(stringValue(event["type"]), eventName)
+	if eventType == "response.metadata" {
+		return eventType, true
+	}
+	return "", false
 }
 
 func (b *responsesLiteSSEBody) Close() error {
