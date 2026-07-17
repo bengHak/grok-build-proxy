@@ -77,6 +77,8 @@ pub struct App {
     pub focus: Focus,
     pub selected: usize,
     pub failure_filter: FailureFilter,
+    /// Stable identity for Failure detail overlay (avoids index shift on push_front).
+    pub detail_request_id: Option<String>,
     /// Wall-clock start of the monitor loop (for uptime).
     pub started_at: Option<std::time::Instant>,
 }
@@ -120,7 +122,16 @@ impl App {
         }
     }
 
+    /// Pin failure detail identity after Enter (call with the selected row's request_id).
+    pub fn pin_failure_detail(&mut self, request_id: impl Into<String>) {
+        self.detail_request_id = Some(request_id.into());
+    }
+
     /// Handle a key. Returns `true` when the monitor should quit.
+    ///
+    /// On `f` with Failures focused, selection is reset to 0 and the in-handle clamp
+    /// is skipped so callers must re-clamp with the **post-filter** `failures_len`
+    /// (see `run` loop). Other keys clamp with the lengths passed here.
     pub fn handle(
         &mut self,
         key: KeyEvent,
@@ -141,6 +152,7 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace => {
                 if self.mode != Mode::Dashboard {
                     self.mode = Mode::Dashboard;
+                    self.detail_request_id = None;
                 }
             }
             KeyCode::Enter => {
@@ -149,6 +161,9 @@ impl App {
                         Self::focus_count(self.focus, sessions_len, active_len, failures_len);
                     if count > 0 {
                         self.mode = Mode::Detail;
+                        // Failures: caller pins request_id via `pin_failure_detail`.
+                        // Clear any stale pin from a previous overlay session.
+                        self.detail_request_id = None;
                     }
                 }
             }
@@ -174,11 +189,12 @@ impl App {
             }
             KeyCode::Char('f' | 'F') if self.mode == Mode::Dashboard => {
                 self.failure_filter = self.failure_filter.next();
-                // Filter change may shrink the list under the current selection.
+                // Selection under Failures must not be clamped against the *pre-filter*
+                // failures_len. Reset to 0 and return so the caller re-clamps with the
+                // new filtered length.
                 if self.focus == Focus::Failures {
-                    // Clamp after handle returns using the new filtered length from caller;
-                    // reset selection to top so the user sees the new set immediately.
                     self.selected = 0;
+                    return false;
                 }
             }
             KeyCode::Up | KeyCode::Char('k') if self.mode == Mode::Dashboard => {
@@ -267,6 +283,35 @@ mod tests {
         assert!(FailureFilter::Stream.matches(FailureKind::StreamTerminalFailed));
         assert!(FailureFilter::Auth.matches(FailureKind::AuthRetryFailed));
         assert!(!FailureFilter::Auth.matches(FailureKind::UpstreamHttp));
+        // ClientRejected / Unknown only under All.
+        assert!(FailureFilter::All.matches(FailureKind::ClientRejected));
+        assert!(FailureFilter::All.matches(FailureKind::Unknown));
+        assert!(!FailureFilter::ProxyAssemble.matches(FailureKind::ClientRejected));
+        assert!(!FailureFilter::Upstream.matches(FailureKind::Unknown));
+        assert!(!FailureFilter::Auth.matches(FailureKind::ClientRejected));
+        assert!(!FailureFilter::Stream.matches(FailureKind::Unknown));
+    }
+
+    #[test]
+    fn filter_resets_selection_when_failures_focused() {
+        let mut app = App::new();
+        app.focus = Focus::Failures;
+        app.selected = 3;
+        app.handle(key(KeyCode::Char('f')), 0, 0, 5);
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.failure_filter, FailureFilter::ProxyAssemble);
+    }
+
+    #[test]
+    fn empty_failures_clamps_and_blocks_detail() {
+        let mut app = App::new();
+        app.focus = Focus::Failures;
+        app.selected = 2;
+        app.clamp_selection(0, 0, 0);
+        assert_eq!(app.selected, 0);
+        app.handle(key(KeyCode::Enter), 0, 0, 0);
+        assert_eq!(app.mode, Mode::Dashboard);
+        assert!(app.detail_request_id.is_none());
     }
 
     #[test]
@@ -291,6 +336,7 @@ mod tests {
         assert_eq!(app.mode, Mode::Detail);
         app.handle(key(KeyCode::Esc), 1, 0, 0);
         assert_eq!(app.mode, Mode::Dashboard);
+        assert!(app.detail_request_id.is_none());
     }
 
     #[test]
@@ -299,6 +345,11 @@ mod tests {
         app.focus = Focus::Failures;
         app.handle(key(KeyCode::Enter), 0, 0, 2);
         assert_eq!(app.mode, Mode::Detail);
+        app.pin_failure_detail("req-x");
+        assert_eq!(app.detail_request_id.as_deref(), Some("req-x"));
+        app.handle(key(KeyCode::Esc), 0, 0, 2);
+        assert!(app.detail_request_id.is_none());
+
         let mut app = App::new();
         app.focus = Focus::Failures;
         app.handle(key(KeyCode::Enter), 0, 0, 0);

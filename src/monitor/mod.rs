@@ -24,9 +24,14 @@ use std::{
     time::Duration,
 };
 use theme::Theme;
-use widgets::{ActivePanel, FailuresPanel, Footer, Header, HelpOverlay, SessionsPanel, TurnKind};
+use widgets::{
+    ActivePanel, FailuresPanel, Footer, Header, HelpOverlay, SessionsPanel, TurnKind, truncate,
+};
 
 pub use crate::store::{Dashboard, FailureRecord, Request, Session, Snapshot};
+
+/// Max chars shown for `error_message` in the failure detail modal (full value stays in store).
+const DETAIL_MESSAGE_MAX: usize = 120;
 
 pub fn is_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -87,7 +92,18 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
                 if app.handle(key, sessions_len, active_len, failures_len) {
                     return Ok(());
                 }
-                // Filter cycle (`f`) may shrink the list; re-clamp with new filter.
+                // After Enter on Failures, pin stable request_id so live push_front
+                // does not swap the overlay to a different row.
+                if app.mode == Mode::Detail
+                    && app.focus == Focus::Failures
+                    && app.detail_request_id.is_none()
+                {
+                    let rows = FailuresPanel::filtered(&snapshot, app.failure_filter);
+                    if let Some(f) = rows.get(app.selected) {
+                        app.pin_failure_detail(f.request_id.clone());
+                    }
+                }
+                // Filter cycle (`f`) may shrink the list; re-clamp with new filter length.
                 let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
                 app.clamp_selection(sessions_len, active_len, failures_len);
             }
@@ -186,9 +202,13 @@ fn draw_detail(
 ) {
     let text = detail_text(snapshot, app);
     let width = area.width.min(76);
-    let height = area
-        .height
-        .min(if app.focus == Focus::Failures { 18 } else { 12 });
+    // Size height from content so longer failure detail is not hard-capped at 18.
+    // +2 for border rows; leave at least 2 rows of margin when possible.
+    let content_lines = text.lines().count() as u16;
+    let height = (content_lines.saturating_add(2))
+        .max(5)
+        .min(area.height.saturating_sub(2).max(5))
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let modal = Rect {
@@ -254,48 +274,63 @@ fn detail_text(snapshot: &Snapshot, app: &App) -> String {
                 "No turn selected".into()
             }
         }
-        Focus::Failures => {
-            let rows = FailuresPanel::filtered(snapshot, app.failure_filter);
-            if let Some(f) = rows.get(app.selected) {
-                format!(
-                    "Failure {}\n  ts: {}\n  kind: {}\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration_ms: {}  session_fail#: {}\n  error_type: {}\n  message: {}\n  response_id: {}\n  mapped: {}  lite: {}  fast: {}\n  auth_retried: {}  outputs: {}  capture_bytes: {}",
-                    f.request_id,
-                    f.ts.to_rfc3339(),
-                    f.kind.as_str(),
-                    f.session_id,
-                    f.model,
-                    f.requested_model,
-                    f.status_code,
-                    f.attempt,
-                    f.duration_ms,
-                    f.session_failure_index,
-                    if f.error_type.is_empty() {
-                        "-"
-                    } else {
-                        f.error_type.as_str()
-                    },
-                    if f.error_message.is_empty() {
-                        "-"
-                    } else {
-                        f.error_message.as_str()
-                    },
-                    if f.response_id.is_empty() {
-                        "-"
-                    } else {
-                        f.response_id.as_str()
-                    },
-                    f.mapped,
-                    f.lite,
-                    f.fast,
-                    f.auth_retried,
-                    f.output_count,
-                    f.capture_bytes,
-                )
-            } else {
-                "No failure selected".into()
-            }
-        }
+        Focus::Failures => failure_detail_text(snapshot, app),
     }
+}
+
+fn failure_detail_text(snapshot: &Snapshot, app: &App) -> String {
+    // Prefer stable request_id so live push_front / ring eviction does not swap identity.
+    let record = if let Some(id) = app.detail_request_id.as_ref() {
+        match snapshot.failures.iter().find(|f| &f.request_id == id) {
+            Some(f) => f,
+            None => return format!("Failure {id}\n  (failure no longer in ring)"),
+        }
+    } else {
+        // Fallback for tests / before pin: index into filtered list.
+        match FailuresPanel::filtered(snapshot, app.failure_filter).get(app.selected) {
+            Some(f) => *f,
+            None => return "No failure selected".into(),
+        }
+    };
+
+    let msg = if record.error_message.is_empty() {
+        "-".to_owned()
+    } else {
+        truncate(&record.error_message, DETAIL_MESSAGE_MAX)
+    };
+    let err_type = if record.error_type.is_empty() {
+        "-"
+    } else {
+        record.error_type.as_str()
+    };
+    let resp = if record.response_id.is_empty() {
+        "-"
+    } else {
+        record.response_id.as_str()
+    };
+
+    format!(
+        "Failure {}\n  ts: {}\n  kind: {}\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration_ms: {}  session_fail#: {}\n  error_type: {}\n  message: {}\n  response_id: {}\n  mapped: {}  lite: {}  fast: {}\n  auth_retried: {}  outputs: {}  capture_bytes: {}",
+        record.request_id,
+        record.ts.to_rfc3339(),
+        record.kind.as_str(),
+        record.session_id,
+        record.model,
+        record.requested_model,
+        record.status_code,
+        record.attempt,
+        record.duration_ms,
+        record.session_failure_index,
+        err_type,
+        msg,
+        resp,
+        record.mapped,
+        record.lite,
+        record.fast,
+        record.auth_retried,
+        record.output_count,
+        record.capture_bytes,
+    )
 }
 
 /// Render into a TestBackend buffer (unit tests / snapshots).
@@ -399,6 +434,8 @@ mod tests {
         failed3.error_type = "proxy_incomplete_output".into();
         failed3.status_code = 200;
         failed3.error = "could not assemble".into();
+        failed3.output_count = 2;
+        failed3.capture_bytes = 4096;
         d.observe(failed3);
 
         // Leave one in-flight turn for the active panel.
@@ -442,8 +479,8 @@ mod tests {
             "failures panel title missing:\n{text}"
         );
         assert!(
-            text.contains("All") || text.contains("[All]"),
-            "failures filter label missing:\n{text}"
+            text.contains("[All]") && text.contains("2/2"),
+            "failures filter title missing All 2/2:\n{text}"
         );
         assert!(text.contains("sess-abc"), "session id missing:\n{text}");
         assert!(
@@ -467,24 +504,61 @@ mod tests {
     #[test]
     fn failures_filter_hides_non_matching() {
         let snap = fixture_dashboard().snapshot();
+        assert_eq!(
+            FailuresPanel::row_count(&snap, FailureFilter::ProxyAssemble),
+            1
+        );
+        assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::All), 2);
+
         let mut app = App::new();
         app.failure_filter = FailureFilter::ProxyAssemble;
         let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(
-            text.contains("ProxyAssemble") || text.contains("proxy_incomplete"),
-            "filtered ProxyAssemble missing:\n{text}"
+            text.contains("failures [ProxyAssemble] 1/2"),
+            "title should show filter and 1/2 counts:\n{text}"
         );
-        // Title should show filter name.
         assert!(
-            text.contains("ProxyAssemble"),
-            "filter name in title missing:\n{text}"
+            !text.contains("UpstreamHttp"),
+            "UpstreamHttp should be filtered out of list:\n{text}"
         );
-        // UpstreamHttp row should not appear when filter is ProxyAssemble.
-        // Kind label in the list uses as_str(); filter title also contains ProxyAssemble.
-        let without_title = text.replacen("ProxyAssemble", "", 1);
+    }
+
+    #[test]
+    fn detail_text_failure_fields_and_stable_id() {
+        let snap = fixture_dashboard().snapshot();
+        // Newest-first: req-3 ProxyAssemble, then req-2 UpstreamHttp.
+        let mut app = App::new();
+        app.focus = Focus::Failures;
+        app.selected = 0;
+        app.pin_failure_detail("req-3");
+        let text = failure_detail_text(&snap, &app);
+        assert!(text.starts_with("Failure req-3"), "header:\n{text}");
+        assert!(text.contains("  ts:"), "ts label:\n{text}");
+        assert!(text.contains("  kind: ProxyAssemble"), "kind:\n{text}");
+        assert!(text.contains("  duration_ms:"), "duration_ms:\n{text}");
+        assert!(text.contains("  session_fail#:"), "session_fail#:\n{text}");
+        assert!(text.contains("  error_type:"), "error_type:\n{text}");
+        assert!(text.contains("  auth_retried:"), "auth_retried:\n{text}");
+        assert!(text.contains("  capture_bytes:"), "capture_bytes:\n{text}");
         assert!(
-            !without_title.contains("UpstreamHttp"),
-            "UpstreamHttp should be filtered out:\n{text}"
+            text.contains("proxy_incomplete_output"),
+            "etype val:\n{text}"
+        );
+
+        // Pinned id survives selection/index drift.
+        app.selected = 99;
+        let text2 = failure_detail_text(&snap, &app);
+        assert!(
+            text2.starts_with("Failure req-3"),
+            "stable id ignored selected index:\n{text2}"
+        );
+
+        // Evicted / unknown id.
+        app.pin_failure_detail("req-gone");
+        let gone = failure_detail_text(&snap, &app);
+        assert!(
+            gone.contains("failure no longer in ring"),
+            "missing eviction message:\n{gone}"
         );
     }
 
@@ -495,31 +569,29 @@ mod tests {
         app.focus = Focus::Failures;
         app.selected = 0;
         app.mode = Mode::Detail;
-        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        app.pin_failure_detail("req-3");
+        let text = render_test(100, 30, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(text.contains("detail"), "detail title missing:\n{text}");
+        // Labels unique to the detail template (not the list row format).
         assert!(
-            text.contains("Failure"),
-            "detail missing failure header:\n{text}"
+            text.contains("duration_ms:"),
+            "detail missing duration_ms:\n{text}"
         );
         assert!(
-            text.contains("kind:")
-                || text.contains("UpstreamHttp")
-                || text.contains("ProxyAssemble"),
-            "detail missing kind:\n{text}"
+            text.contains("session_fail#:"),
+            "detail missing session_fail#:\n{text}"
         );
         assert!(
-            text.contains("sess-abc"),
-            "detail missing session id:\n{text}"
+            text.contains("capture_bytes:"),
+            "detail missing capture_bytes:\n{text}"
         );
         assert!(
-            text.contains("attempt:") || text.contains("attempt"),
-            "detail missing attempt:\n{text}"
+            text.contains("auth_retried:"),
+            "detail missing auth_retried:\n{text}"
         );
         assert!(
-            text.contains("error_type")
-                || text.contains("upstream_http")
-                || text.contains("proxy_incomplete"),
-            "detail missing error_type:\n{text}"
+            text.contains("Failure req-3"),
+            "detail missing Failure header:\n{text}"
         );
     }
 

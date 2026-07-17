@@ -31,8 +31,13 @@ impl FailuresPanel<'_> {
             .collect()
     }
 
+    /// Count without allocating a filtered vector (called every tick).
     pub fn row_count(snapshot: &Snapshot, filter: FailureFilter) -> usize {
-        Self::filtered(snapshot, filter).len()
+        snapshot
+            .failures
+            .iter()
+            .filter(|f| filter.matches(f.kind))
+            .count()
     }
 }
 
@@ -150,18 +155,44 @@ mod tests {
             failures: vec![
                 rec(FailureKind::ProxyAssemble),
                 rec(FailureKind::UpstreamHttp),
+                rec(FailureKind::UpstreamConnect),
                 rec(FailureKind::StreamIo),
+                rec(FailureKind::StreamTerminalFailed),
                 rec(FailureKind::AuthRetryFailed),
+                rec(FailureKind::ClientRejected),
+                rec(FailureKind::Unknown),
             ],
             ..Default::default()
         };
-        assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::All), 4);
+        assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::All), 8);
         assert_eq!(
             FailuresPanel::row_count(&snap, FailureFilter::ProxyAssemble),
             1
         );
-        assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::Upstream), 1);
+        // UpstreamHttp + UpstreamConnect
+        assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::Upstream), 2);
         assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::Auth), 1);
-        assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::Stream), 1);
+        // StreamIo + StreamTerminalFailed
+        assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::Stream), 2);
+        // ClientRejected / Unknown only under All
+        for filter in [
+            FailureFilter::ProxyAssemble,
+            FailureFilter::Upstream,
+            FailureFilter::Auth,
+            FailureFilter::Stream,
+        ] {
+            let kinds: Vec<_> = FailuresPanel::filtered(&snap, filter)
+                .iter()
+                .map(|f| f.kind)
+                .collect();
+            assert!(
+                !kinds.contains(&FailureKind::ClientRejected),
+                "{filter:?} should not include ClientRejected"
+            );
+            assert!(
+                !kinds.contains(&FailureKind::Unknown),
+                "{filter:?} should not include Unknown"
+            );
+        }
     }
 }
