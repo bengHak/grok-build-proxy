@@ -522,12 +522,13 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
                     }
                 }
             }
+            // Observe before final yield so client drop at the last chunk cannot force StreamIo.
             let output = normalizer.finish();
             capture_tail(&mut guard.capture, &output);
+            guard.finish(None);
             if !output.is_empty() {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(output));
             }
-            guard.finish(None);
         })
     } else {
         let mut source = upstream.bytes_stream();
@@ -548,6 +549,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
                     }
                 }
             }
+            // Upstream EOF: observe immediately (no trailing yield after this).
             guard.finish(None);
         })
     };
@@ -645,16 +647,25 @@ impl StreamObserveGuard {
 
 impl Drop for StreamObserveGuard {
     fn drop(&mut self) {
-        if !self.finished {
-            self.finished = true;
-            observe_stream_end(
-                &self.observer,
-                self.event.clone(),
-                self.status,
-                &self.capture,
-                Some("client disconnected".into()),
-            );
+        if self.finished {
+            return;
         }
+        self.finished = true;
+        // If capture already has a terminal frame, classify from diagnostics — client often
+        // disconnects after the last SSE chunk without polling the generator to completion.
+        let diag = parse_capture_diagnostics(&self.capture);
+        let stream_io = if diag.has_terminal_end() {
+            None
+        } else {
+            Some("client disconnected".into())
+        };
+        observe_stream_end(
+            &self.observer,
+            self.event.clone(),
+            self.status,
+            &self.capture,
+            stream_io,
+        );
     }
 }
 
@@ -1493,12 +1504,54 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             let mut guard =
                 StreamObserveGuard::new(Some(obs.clone()), sample_event(), StatusCode::OK);
             capture_tail(&mut guard.capture, b"partial");
-            // drop without finish → client disconnect path
+            // drop without finish and without terminal → client disconnect path
         }
         let events = obs.events.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, RequestEventKind::Failed);
         assert_eq!(events[0].failure_kind, Some(FailureKind::StreamIo));
         assert!(events[0].error.contains("client disconnected"));
+    }
+
+    #[test]
+    fn stream_observe_guard_drop_with_completed_capture_stays_completed() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let completed = br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":"message"}]}}
+
+"#;
+        {
+            let mut guard =
+                StreamObserveGuard::new(Some(obs.clone()), sample_event(), StatusCode::OK);
+            capture_tail(&mut guard.capture, completed);
+            // Client drop after last chunk without finish() — must not force StreamIo.
+        }
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, RequestEventKind::Completed);
+        assert_eq!(events[0].failure_kind, None);
+        assert_eq!(events[0].response_id, "resp_ok");
+    }
+
+    #[test]
+    fn stream_observe_guard_drop_with_proxy_error_keeps_assemble() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = br#"event: error
+data: {"type":"error","error":{"type":"proxy_incomplete_output","message":"incomplete"}}
+
+"#;
+        {
+            let mut guard =
+                StreamObserveGuard::new(Some(obs.clone()), sample_event(), StatusCode::OK);
+            capture_tail(&mut guard.capture, err);
+        }
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events[0].kind, RequestEventKind::Failed);
+        assert_eq!(events[0].failure_kind, Some(FailureKind::ProxyAssemble));
+        assert_eq!(events[0].error_type, "proxy_incomplete_output");
     }
 }

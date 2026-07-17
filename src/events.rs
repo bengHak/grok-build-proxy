@@ -156,6 +156,15 @@ pub struct CaptureDiagnostics {
     pub output_count: u32,
     pub has_proxy_error: bool,
     pub has_stream_terminal_failure: bool,
+    /// True when a `response.completed` frame was seen (successful terminal).
+    pub has_completed: bool,
+}
+
+impl CaptureDiagnostics {
+    /// Capture already has a terminal signal (success or failure) — Drop must not force StreamIo.
+    pub fn has_terminal_end(&self) -> bool {
+        self.has_completed || self.has_stream_terminal_failure || self.has_proxy_error
+    }
 }
 
 const KNOWN_PROXY_ERROR_TYPES: &[&str] =
@@ -200,7 +209,6 @@ pub fn parse_capture_diagnostics(bytes: &[u8]) -> CaptureDiagnostics {
     }
 
     let mut saw_sse_event = false;
-    let mut saw_completed = false;
 
     for frame in text.split("\n\n") {
         let mut event_name = None;
@@ -237,7 +245,7 @@ pub fn parse_capture_diagnostics(bytes: &[u8]) -> CaptureDiagnostics {
 
         match typ.as_str() {
             "response.completed" => {
-                saw_completed = true;
+                diag.has_completed = true;
             }
             "response.failed" | "response.incomplete" => {
                 apply_terminal_error(&mut diag, &typ, data);
@@ -253,7 +261,7 @@ pub fn parse_capture_diagnostics(bytes: &[u8]) -> CaptureDiagnostics {
 
     // Plain JSON error body (non-SSE upstream HTTP responses). Never mark proxy errors from
     // successful completed streams.
-    if !saw_sse_event && !saw_completed && !diag.has_stream_terminal_failure {
+    if !saw_sse_event && !diag.has_completed && !diag.has_stream_terminal_failure {
         if let Some(et) = extract_nested_error_type(&text) {
             diag.error_type = sanitize(&et);
             if is_known_proxy_error_type(&et) {
@@ -572,6 +580,8 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
 
 "#;
         let diag = parse_capture_diagnostics(sse.as_bytes());
+        assert!(diag.has_completed);
+        assert!(diag.has_terminal_end());
         let (kind, fk, _, _) = classify_stream_end(true, None, &diag);
         assert_eq!(kind, RequestEventKind::Completed);
         assert_eq!(fk, None);
