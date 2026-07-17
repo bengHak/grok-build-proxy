@@ -34,7 +34,36 @@ The request adapter preserves:
 - explicit `tool_choice` values (`auto`, `none`, `required`, or an object);
 - `function_call_output.call_id` and output payloads;
 - the order of multi-turn input items;
-- developer instructions and tool definitions in Responses Lite input.
+- developer instructions and tool definitions in Responses Lite input;
+- request-level `reasoning.effort` on both `POST /v1/responses` and
+  `POST /responses`, without replacing it with a proxy-wide value.
+
+## Reasoning effort and model discovery
+
+For capable models, both `GET /v1/models` and `GET /models` advertise
+`supports_reasoning_effort`, the default `reasoning_effort`, and the available
+`reasoning_efforts`. The advertised values are `low`, `medium`, `high`, and
+`xhigh`. `grok-build-proxy --print-grok-config` emits the corresponding
+`supports_reasoning_effort = true` and `reasoning_efforts` fields for Grok Build
+model entries.
+
+Capability metadata is inherited by canonical catalog routes, configured
+model-map aliases, and eligible generated `-fast` routes. Unknown or unsupported
+models omit it. `[models].default_reasoning_effort` is Grok Build's default,
+while `/effort` changes the active session; the resulting request value is what
+the proxy forwards.
+
+Codex's `max` and `ultra` values are intentionally not exposed. Current Grok
+Build cannot represent those as distinct canonical wire values, and the proxy
+does not silently map them to another effort.
+
+When client-token authentication is enabled, `/readyz`, `/v1/models`, `/models`,
+`/v1/responses`, and `/responses` require
+`Authorization: Bearer $GROK_BUILD_PROXY_TOKEN`; `/healthz` and its `/` health
+alias are unauthenticated. Each proxy-backed Grok model must use that configured
+local proxy token as its API key instead of `unused`. This credential is separate
+from Codex or ChatGPT access tokens and `auth.json`; never use or expose those
+upstream secrets as local client credentials.
 
 ## Plan mode
 

@@ -48,11 +48,16 @@ that can use the selected Codex model.
    api_backend = "responses"
    api_key = "unused"
    context_window = 372000
+   supports_reasoning_effort = true
+   reasoning_efforts = ["low", "medium", "high", "xhigh"]
    ```
 
    When `[models]` already exists, add only the
    `default_reasoning_effort = "xhigh"` key to that table. TOML does not allow
-   the same table to be declared twice.
+   the same table to be declared twice. The shown `api_key = "unused"` assumes
+   client-token authentication is disabled. If it is enabled, set `api_key` in
+   each proxy-backed model entry to the configured local proxy token so Grok
+   sends it as the bearer credential.
 
 5. Validate the local setup:
 
@@ -60,15 +65,21 @@ that can use the selected Codex model.
    grok-build-proxy doctor
    ```
 
-6. Start the proxy and Grok Build in separate terminals:
+6. Start the proxy:
 
    ```sh
-   grok-build-proxy
+   grok-build-proxy serve
    ```
+
+7. In a separate terminal, launch Grok Build with the proxy-backed GPT model,
+   then use `/effort` to select the reasoning effort for the active session:
 
    ```sh
    grok -m codex-sol
    ```
+
+   The model picker surfaces effort choices for models that advertise this
+   capability.
 
 ### Serve monitor
 
@@ -90,6 +101,23 @@ grok-build-proxy serve --no-monitor
 ```
 
 Non-interactive output automatically keeps the existing plain-log behavior.
+
+## Reasoning effort selection
+
+`[models].default_reasoning_effort` sets Grok Build's default; `/effort` changes
+that selection for the current session. The proxy preserves each request's
+`reasoning.effort` on both `POST /v1/responses` and `POST /responses`; it does
+not force a global effort value.
+
+Capable models advertise `low`, `medium`, `high`, and `xhigh`. Codex also has
+`max` and `ultra` levels, but they are not exposed because the current Grok Build
+wire contract cannot represent them as distinct values. The proxy does not
+silently map them to another level.
+
+Capability metadata appears on both `GET /v1/models` and `GET /models`.
+Canonical catalog routes, configured model-map aliases, and eligible generated
+`-fast` routes inherit their target's capability. Unknown or unsupported models
+omit the capability fields.
 
 ## Why v0.0.7 is required for Responses Lite, Plan, and Goal
 
@@ -163,13 +191,34 @@ The default dedicated Codex home is `~/.codex-grok-build-proxy`. The wrapper
 uses the official Codex CLI and configures file-backed credentials; it does not
 implement its own OAuth login UI.
 
-Useful health checks:
+Useful health checks (these examples assume no client token is configured):
 
 ```sh
+# Always unauthenticated.
 curl --fail http://127.0.0.1:18765/healthz
+
+# Protected when client-token authentication is enabled.
 curl --fail http://127.0.0.1:18765/readyz
-curl -fsS http://127.0.0.1:18765/v1/models | python3 -m json.tool
+curl -fsS http://127.0.0.1:18765/v1/models | python3 -c '
+import json, sys
+for model in json.load(sys.stdin)["data"]:
+    fields = {key: model[key] for key in (
+        "supports_reasoning_effort", "reasoning_effort", "reasoning_efforts"
+    ) if key in model}
+    if fields:
+        print(model["id"], fields)
+'
 ```
+
+`GET /v1/models` and `GET /models` are equivalent route variants. When
+`--client-token` or `GROK_BUILD_PROXY_TOKEN` enables client authentication,
+`/readyz`, `/v1/models`, `/models`, `/v1/responses`, and `/responses` require
+`Authorization: Bearer $GROK_BUILD_PROXY_TOKEN`; add that header to direct
+requests. The proxy-backed Grok model must likewise use this configured local
+proxy token as its API key instead of `unused`. It is not a Codex or ChatGPT
+access token or the contents of `auth.json`; never use, send, paste, or expose
+those upstream secrets as local client credentials. `/healthz` and its `/`
+health alias remain unauthenticated.
 
 ## Plan and Goal
 
@@ -192,9 +241,10 @@ verifier, strategist, and summarizer requests concurrently.
 ## Model substitutions
 
 The proxy can preserve Grok-facing IDs while selecting Codex targets. The map
-applies to every `/v1/responses` request that reaches the proxy, including parent
-sessions, `/plan`, inherited subagents, and Goal planner/verifier/strategist/
-summarizer requests whose resolved source ID is mapped.
+applies to every `POST /v1/responses` or `POST /responses` request that reaches
+the proxy, including parent sessions, `/plan`, inherited subagents, and Goal
+planner/verifier/strategist/summarizer requests whose resolved source ID is
+mapped.
 
 ```sh
 export GROK_BUILD_PROXY_MODEL_MAP='grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol'
@@ -240,8 +290,10 @@ default loopback binding whenever possible.
   assembled; capture the Grok Build sampling log because the private stream shape
   may have changed.
 - `System messages are not allowed`: upgrade to `0.0.3` or newer.
-- Other 400 responses with a GPT-5.6 model: inspect the `upstream_error` log
-  field and confirm `grok-build-proxy --version` reports `0.0.7` or newer.
+- Other upstream rejections with a GPT-5.6 model: correlate the sanitized
+  `status`, `request_id`, and summarized `upstream_error` log fields, then
+  confirm `grok-build-proxy --version` reports `0.0.7` or newer. Do not share
+  credentials, `auth.json`, or unreviewed logs.
 - 401: run `grok-build-proxy auth status`, then log in again if required.
 - Mapping has no effect: confirm the selected Grok entry points to this local
   endpoint and its `model` value exactly matches the map source.
