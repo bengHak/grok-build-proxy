@@ -48,6 +48,7 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 	for len(b.pending) == 0 && !b.finished {
 		frame, err := readSSEFrame(b.reader)
 		if len(frame) > 0 {
+			frame = b.state.normalizeAuxiliaryFrame(frame)
 			b.pending = append(b.pending, b.state.transformFrame(frame)...)
 		}
 		if err != nil {
