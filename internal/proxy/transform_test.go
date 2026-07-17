@@ -93,6 +93,77 @@ func TestTransformResponsesLiteAndFastAlias(t *testing.T) {
 	}
 }
 
+func TestTransformPreservesReasoningEffort(t *testing.T) {
+	mappings, err := modelmap.Parse("grok-build=gpt-5.5")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		model       string
+		wantModel   string
+		wantContext bool
+		wantMapped  bool
+		wantFast    bool
+	}{
+		{name: "Responses Lite", model: "gpt-5.6-sol", wantModel: "gpt-5.6-sol", wantContext: true},
+		{name: "non-Lite Responses", model: "gpt-5.5", wantModel: "gpt-5.5"},
+		{name: "model map", model: "grok-build", wantModel: "gpt-5.5", wantMapped: true},
+		{name: "fast alias", model: "gpt-5.6-terra-fast", wantModel: "gpt-5.6-terra", wantContext: true, wantFast: true},
+	}
+	for _, effort := range []string{"low", "medium", "high", "xhigh"} {
+		for _, test := range tests {
+			t.Run(effort+"/"+test.name, func(t *testing.T) {
+				raw, err := json.Marshal(map[string]any{
+					"model":     test.model,
+					"input":     "hello",
+					"reasoning": map[string]any{"effort": effort},
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				result, err := transformRequest(raw, catalog.New(""), mappings)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.Model != test.wantModel || result.Mapped != test.wantMapped || result.Fast != test.wantFast {
+					t.Fatalf("unexpected result metadata: %#v", result)
+				}
+
+				var body map[string]any
+				if err := json.Unmarshal(result.Body, &body); err != nil {
+					t.Fatal(err)
+				}
+				if body["model"] != test.wantModel {
+					t.Fatalf("model = %#v, want %q", body["model"], test.wantModel)
+				}
+				reasoning, ok := body["reasoning"].(map[string]any)
+				if !ok {
+					t.Fatalf("reasoning = %#v", body["reasoning"])
+				}
+				if reasoning["effort"] != effort {
+					t.Fatalf("reasoning.effort = %#v, want %q", reasoning["effort"], effort)
+				}
+				if test.wantContext {
+					if reasoning["context"] != "all_turns" || len(reasoning) != 2 {
+						t.Fatalf("reasoning = %#v, want effort plus all_turns context", reasoning)
+					}
+				} else if len(reasoning) != 1 {
+					t.Fatalf("reasoning changed for non-Lite request: %#v", reasoning)
+				}
+				if test.wantFast {
+					if body["service_tier"] != "priority" {
+						t.Fatalf("service_tier = %#v, want priority", body["service_tier"])
+					}
+				} else if _, exists := body["service_tier"]; exists {
+					t.Fatalf("unexpected service_tier = %#v", body["service_tier"])
+				}
+			})
+		}
+	}
+}
+
 func TestTransformRequiresModel(t *testing.T) {
 	if _, err := transformRequest([]byte(`{"input":"hello"}`), catalog.New(""), modelmap.Map{}); err == nil {
 		t.Fatal("expected missing model error")
