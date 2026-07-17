@@ -266,6 +266,90 @@ func captureVisibleSSEContent(frame []byte, text, refusal *strings.Builder) {
 	}
 }
 
+func completedTerminalFrame(frame []byte) []byte {
+	eventName, data, ok := parseSSEFrame(frame)
+	if !ok || data == "[DONE]" {
+		return nil
+	}
+	var event map[string]any
+	decoder := json.NewDecoder(strings.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&event); err != nil {
+		return nil
+	}
+	if firstNonEmptyString(stringValue(event["type"]), eventName) != "response.completed" {
+		return nil
+	}
+	return append([]byte(nil), frame...)
+}
+
+func repairVisibleTerminalOutput(normalized, terminalCandidate []byte, text, refusal string) ([]byte, bool) {
+	if text == "" && refusal == "" {
+		return normalized, false
+	}
+
+	repaired, applied, completedSeen := patchCompletedFrames(normalized, text, refusal)
+	if applied || completedSeen {
+		return repaired, applied
+	}
+	if len(terminalCandidate) == 0 || !sseContainsErrorType(normalized, "proxy_missing_terminal_output") {
+		return normalized, false
+	}
+	return injectVisibleTerminalFallback(terminalCandidate, text, refusal)
+}
+
+func patchCompletedFrames(data []byte, text, refusal string) ([]byte, bool, bool) {
+	if len(data) == 0 {
+		return data, false, false
+	}
+	reader := bufio.NewReader(bytes.NewReader(data))
+	var output bytes.Buffer
+	applied := false
+	completedSeen := false
+	for {
+		frame, err := readSSEFrame(reader)
+		if len(frame) > 0 {
+			if len(completedTerminalFrame(frame)) > 0 {
+				completedSeen = true
+				if patched, changed := injectVisibleTerminalFallback(frame, text, refusal); changed {
+					frame = patched
+					applied = true
+				}
+			}
+			output.Write(frame)
+		}
+		if err != nil {
+			break
+		}
+	}
+	return output.Bytes(), applied, completedSeen
+}
+
+func sseContainsErrorType(data []byte, errorType string) bool {
+	reader := bufio.NewReader(bytes.NewReader(data))
+	for {
+		frame, err := readSSEFrame(reader)
+		if len(frame) > 0 {
+			_, payload, ok := parseSSEFrame(frame)
+			if ok && payload != "[DONE]" {
+				var event map[string]any
+				decoder := json.NewDecoder(strings.NewReader(payload))
+				decoder.UseNumber()
+				if decoder.Decode(&event) == nil {
+					errorObject := jsonObject(event["error"])
+					if stringValue(errorObject["type"]) == errorType {
+						return true
+					}
+				}
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+	return false
+}
+
 func injectVisibleTerminalFallback(frame []byte, text, refusal string) ([]byte, bool) {
 	if text == "" && refusal == "" {
 		return frame, false

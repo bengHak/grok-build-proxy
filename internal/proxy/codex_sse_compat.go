@@ -88,15 +88,16 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 				frame, report = b.envelope.normalizeFrame(frame)
 			}
 			frame = b.state.normalizeAuxiliaryFrame(frame)
+			terminalCandidate := completedTerminalFrame(frame)
+			normalized := b.state.transformFrame(frame)
 			var fallbackApplied bool
-			frame, fallbackApplied = injectVisibleTerminalFallback(
-				frame,
+			normalized, fallbackApplied = repairVisibleTerminalOutput(
+				normalized,
+				terminalCandidate,
 				b.visibleText.String(),
 				b.visibleRefusal.String(),
 			)
 			report.VisibleFallback = fallbackApplied
-
-			normalized := b.state.transformFrame(frame)
 			b.eventIndex++
 			if b.trace {
 				logResponsesSSEFrame(b.logger, b.requestID, b.eventIndex, rawFrame, normalized, report)
@@ -108,8 +109,9 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 			if errors.Is(err, io.EOF) {
 				terminal := b.state.finishAtEOF()
 				if len(terminal) > 0 {
-					terminal, _ = injectVisibleTerminalFallback(
+					terminal, _ = repairVisibleTerminalOutput(
 						terminal,
+						nil,
 						b.visibleText.String(),
 						b.visibleRefusal.String(),
 					)
