@@ -34,9 +34,14 @@ pub fn is_interactive() -> bool {
 
 struct TerminalGuard;
 impl TerminalGuard {
+    /// Enter alternate screen + raw mode. On partial failure, roll back so the
+    /// terminal is never left in raw mode without a live guard.
     fn enter() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, cursor::Hide)?;
+        if let Err(e) = terminal::enable_raw_mode() {
+            let _ = execute!(io::stdout(), cursor::Show, LeaveAlternateScreen);
+            return Err(e);
+        }
         Ok(Self)
     }
 }
@@ -73,8 +78,9 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
-                // Crossterm 0.28+ may emit Press/Release; only handle Press (or None on older).
-                if key.kind != KeyEventKind::Press {
+                // Crossterm may emit Press/Release/Repeat; accept Press + Repeat
+                // so held j/k navigates under enhanced keyboard protocols.
+                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
                 if app.handle(key, sessions_len, active_len) {
@@ -306,8 +312,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_header_sessions_footer() {
+    fn fixture_dashboard() -> Dashboard {
         let d = Dashboard::new();
         d.observe(base_event(RequestEventKind::Started));
         d.observe(base_event(RequestEventKind::Completed));
@@ -320,8 +325,16 @@ mod tests {
         failed.error_type = "upstream_http".into();
         failed.status_code = 502;
         d.observe(failed);
+        // Leave one in-flight turn for the active panel.
+        let mut inflight = base_event(RequestEventKind::Started);
+        inflight.request_id = "req-live".into();
+        d.observe(inflight);
+        d
+    }
 
-        let snap = d.snapshot();
+    #[test]
+    fn render_header_sessions_footer() {
+        let snap = fixture_dashboard().snapshot();
         let app = App::new();
         let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(
@@ -333,6 +346,14 @@ mod tests {
             "header missing listen address:\n{text}"
         );
         assert!(
+            text.contains("active↑1"),
+            "header missing active count from store:\n{text}"
+        );
+        assert!(
+            text.contains("err●1"),
+            "header missing failure count from store:\n{text}"
+        );
+        assert!(
             text.contains("sessions"),
             "sessions panel title missing:\n{text}"
         );
@@ -342,8 +363,70 @@ mod tests {
         );
         assert!(text.contains("sess-abc"), "session id missing:\n{text}");
         assert!(
+            text.contains("gpt-test"),
+            "model from store missing in body:\n{text}"
+        );
+        assert!(
+            text.contains("req-1") || text.contains("req-2"),
+            "recent turn id from store missing:\n{text}"
+        );
+        assert!(
+            text.contains("req-live"),
+            "active turn id from store missing:\n{text}"
+        );
+        assert!(
+            text.contains("upstream_http") || text.contains("HTTP 502"),
+            "failed recent status from store missing:\n{text}"
+        );
+        assert!(
             text.contains("j/k") || text.contains("quit"),
             "footer bindings missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn detail_overlay_renders_turn_fields() {
+        let snap = fixture_dashboard().snapshot();
+        let mut app = App::new();
+        app.focus = Focus::Active;
+        app.selected = 0; // req-live (active first)
+        app.mode = Mode::Detail;
+        let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        assert!(text.contains("detail"), "detail title missing:\n{text}");
+        assert!(
+            text.contains("req-live"),
+            "detail missing active turn id:\n{text}"
+        );
+        assert!(
+            text.contains("sess-abc"),
+            "detail missing session id:\n{text}"
+        );
+        assert!(text.contains("gpt-test"), "detail missing model:\n{text}");
+        assert!(
+            text.contains("active"),
+            "detail missing kind label:\n{text}"
+        );
+    }
+
+    #[test]
+    fn detail_overlay_renders_session_fields() {
+        let snap = fixture_dashboard().snapshot();
+        let mut app = App::new();
+        app.focus = Focus::Sessions;
+        app.selected = 0;
+        app.mode = Mode::Detail;
+        let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        assert!(
+            text.contains("Session sess-abc"),
+            "detail missing session header:\n{text}"
+        );
+        assert!(
+            text.contains("last_failure: UpstreamHttp") || text.contains("UpstreamHttp"),
+            "detail missing last failure kind:\n{text}"
+        );
+        assert!(
+            text.contains("requests:"),
+            "detail missing requests field:\n{text}"
         );
     }
 
@@ -354,5 +437,9 @@ mod tests {
         app.mode = Mode::Help;
         let text = render_test(80, 20, &snap, "127.0.0.1:1", "0.0.12", &app);
         assert!(text.contains("Monitor help"), "help text missing:\n{text}");
+        assert!(
+            text.contains("Shift-Tab") || text.contains("Tab"),
+            "help missing panel switch keys:\n{text}"
+        );
     }
 }

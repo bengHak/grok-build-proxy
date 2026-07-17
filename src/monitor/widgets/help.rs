@@ -32,11 +32,11 @@ impl Widget for HelpOverlay {
             Line::from(Span::styled("Monitor help", self.theme.highlight)),
             Line::from(""),
             Line::from("  ↑/k  ↓/j     move selection"),
-            Line::from("  Tab          switch panel (sessions ↔ active)"),
+            Line::from("  Tab/Shift-Tab switch panel (sessions ↔ active)"),
             Line::from("  Enter        open details"),
             Line::from("  Esc/Backspace return"),
             Line::from("  ?            toggle help"),
-            Line::from("  q / Ctrl-C   stop proxy"),
+            Line::from("  q/Q / Ctrl-C stop proxy"),
             Line::from(""),
             Line::from(Span::styled(
                 "  (failures panel & report export in later PRs)",

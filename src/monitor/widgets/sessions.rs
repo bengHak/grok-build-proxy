@@ -1,5 +1,6 @@
 //! Left panel: session list (id, model, requests, errors, tok/s).
 
+use super::truncate;
 use crate::monitor::theme::Theme;
 use crate::store::Snapshot;
 use ratatui::{
@@ -79,18 +80,5 @@ impl Widget for SessionsPanel<'_> {
             buf,
             &mut state,
         );
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.to_owned()
-    } else if max <= 1 {
-        "…".to_owned()
-    } else {
-        let mut out: String = s.chars().take(max - 1).collect();
-        out.push('…');
-        out
     }
 }

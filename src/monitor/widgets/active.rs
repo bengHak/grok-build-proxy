@@ -1,5 +1,6 @@
 //! Right panel: active + recent turns (id, model, duration/status).
 
+use super::truncate;
 use crate::monitor::theme::Theme;
 use crate::store::{Request, Snapshot};
 use ratatui::{
@@ -124,18 +125,5 @@ impl Widget for ActivePanel<'_> {
             buf,
             &mut state,
         );
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.to_owned()
-    } else if max <= 1 {
-        "…".to_owned()
-    } else {
-        let mut out: String = s.chars().take(max - 1).collect();
-        out.push('…');
-        out
     }
 }

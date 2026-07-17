@@ -21,7 +21,8 @@ pub struct Header<'a> {
 impl Widget for Header<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let active = self.snapshot.active.len();
-        let errors = self.snapshot.errors.len().max(self.snapshot.failures.len());
+        // Canonical failure ring (cap 200); prefer over legacy `errors` (cap 50).
+        let errors = self.snapshot.failures.len();
         let tok_s = average_tok_s(self.snapshot);
         let uptime = format_uptime(self.uptime_secs);
 

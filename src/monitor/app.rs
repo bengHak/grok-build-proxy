@@ -54,7 +54,7 @@ impl App {
     /// Handle a key. Returns `true` when the monitor should quit.
     pub fn handle(&mut self, key: KeyEvent, sessions_len: usize, active_len: usize) -> bool {
         match key.code {
-            KeyCode::Char('q') => return true,
+            KeyCode::Char('q' | 'Q') => return true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
             KeyCode::Char('?') => {
                 self.mode = if self.mode == Mode::Help {
@@ -151,6 +151,8 @@ mod tests {
     fn quit_keys() {
         let mut app = App::new();
         assert!(app.handle(key(KeyCode::Char('q')), 0, 0));
+        let mut app = App::new();
+        assert!(app.handle(key(KeyCode::Char('Q')), 0, 0));
         let mut app = App::new();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.handle(ctrl_c, 0, 0));
