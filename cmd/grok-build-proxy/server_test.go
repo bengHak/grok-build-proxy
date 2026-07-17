@@ -5,6 +5,7 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,17 +13,50 @@ import (
 	"github.com/bengHak/grok-build-proxy/internal/modelmap"
 )
 
+type notifyingBuffer struct {
+	mu    sync.Mutex
+	once  sync.Once
+	ready chan struct{}
+	bytes.Buffer
+}
+
+func newNotifyingBuffer() *notifyingBuffer {
+	return &notifyingBuffer{ready: make(chan struct{})}
+}
+
+func (b *notifyingBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n, err := b.Buffer.Write(p)
+	if strings.Contains(b.Buffer.String(), "proxy listening") {
+		b.once.Do(func() { close(b.ready) })
+	}
+	return n, err
+}
+
+func (b *notifyingBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
 func TestRunServeUsesPlainLogsForNonTTYAndNoMonitor(t *testing.T) {
 	for _, extraArgs := range [][]string{nil, {"--no-monitor"}} {
 		t.Run(strings.Join(extraArgs, "_"), func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
-			var stdout, stderr bytes.Buffer
+			defer cancel()
+			var stdout bytes.Buffer
+			stderr := newNotifyingBuffer()
 			args := append([]string{"--listen", "127.0.0.1:0", "--auth-file", filepath.Join(t.TempDir(), "auth.json")}, extraArgs...)
 			done := make(chan error, 1)
 			go func() {
-				done <- runServe(ctx, args, commandIO{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr}, commandDefaults{})
+				done <- runServe(ctx, args, commandIO{stdin: strings.NewReader(""), stdout: &stdout, stderr: stderr}, commandDefaults{})
 			}()
-			time.Sleep(50 * time.Millisecond)
+			select {
+			case <-stderr.ready:
+			case <-time.After(time.Second):
+				t.Fatal("proxy did not report readiness")
+			}
 			cancel()
 			if err := <-done; err != nil {
 				t.Fatal(err)

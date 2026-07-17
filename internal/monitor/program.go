@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -100,14 +101,32 @@ func (p *Program) Run(ctx context.Context) error {
 			return fmt.Errorf("enter terminal raw mode: %w", err)
 		}
 	}
-	defer restore()
-	defer func() { _, _ = io.WriteString(p.Output, "\x1b[0m\x1b[?25h\x1b[?1049l") }()
+	var cancelInput context.CancelFunc
+	var inputDone <-chan struct{}
+	defer func() {
+		_, _ = io.WriteString(p.Output, "\x1b[0m\x1b[?25h\x1b[?1049l")
+		restore()
+		if cancelInput != nil {
+			cancelInput()
+		}
+		if closer, ok := p.Input.(io.Closer); ok && inputDone != nil {
+			_ = closer.Close()
+			<-inputDone
+		}
+	}()
 	if _, err := io.WriteString(p.Output, "\x1b[?1049h\x1b[?25l"); err != nil {
 		return err
 	}
 
 	bytes := make(chan byte, 16)
-	go readInput(p.Input, bytes)
+	inputCtx, cancel := context.WithCancel(ctx)
+	cancelInput = cancel
+	done := make(chan struct{})
+	inputDone = done
+	go func() {
+		defer close(done)
+		readInput(inputCtx, p.Input, bytes)
+	}()
 	ticker := time.NewTicker(refresh)
 	defer ticker.Stop()
 	view := View{Address: p.Address, Version: p.Version}
@@ -118,7 +137,8 @@ func (p *Program) Run(ctx context.Context) error {
 		if p.Terminal != nil {
 			width, height = p.Terminal.Size()
 		}
-		_, err := fmt.Fprintf(p.Output, "\x1b[2J\x1b[H%s", view.Render(p.Dashboard.Snapshot(), width, height))
+		screen := strings.ReplaceAll(view.Render(p.Dashboard.Snapshot(), width, height), "\n", "\r\n")
+		_, err := fmt.Fprintf(p.Output, "\x1b[2J\x1b[H%s", screen)
 		return err
 	}
 	if err := render(); err != nil {
@@ -161,81 +181,5 @@ func (p *Program) Run(ctx context.Context) error {
 				return err
 			}
 		}
-	}
-}
-
-func readInput(reader io.Reader, output chan<- byte) {
-	defer close(output)
-	var buffer [1]byte
-	for {
-		n, err := reader.Read(buffer[:])
-		if n > 0 {
-			output <- buffer[0]
-		}
-		if err != nil {
-			return
-		}
-	}
-}
-
-type keyDecoder struct {
-	state int
-	timer *time.Timer
-}
-
-func (d *keyDecoder) feed(value byte) []string {
-	if d.timer != nil {
-		if !d.timer.Stop() {
-			select {
-			case <-d.timer.C:
-			default:
-			}
-		}
-		d.timer = nil
-	}
-	switch d.state {
-	case 1:
-		if value == '[' {
-			d.state = 2
-			d.timer = time.NewTimer(50 * time.Millisecond)
-			return nil
-		}
-		d.state = 0
-		return append([]string{"escape"}, keyName(value)...)
-	case 2:
-		d.state = 0
-		if value == 'A' {
-			return []string{"up"}
-		}
-		if value == 'B' {
-			return []string{"down"}
-		}
-		return nil
-	}
-	if value == 0x1b {
-		d.state = 1
-		d.timer = time.NewTimer(50 * time.Millisecond)
-		return nil
-	}
-	return keyName(value)
-}
-
-func (d *keyDecoder) expire() {
-	d.state = 0
-	d.timer = nil
-}
-
-func keyName(value byte) []string {
-	switch value {
-	case 3:
-		return []string{"ctrl+c"}
-	case '\r', '\n':
-		return []string{"enter"}
-	case 8, 127:
-		return []string{"backspace"}
-	case '?', 'q', 'j', 'k':
-		return []string{string(value)}
-	default:
-		return nil
 	}
 }

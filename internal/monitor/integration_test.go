@@ -90,7 +90,6 @@ func TestRealProxyHandlerFeedsDashboardAndPreservesHTTPRoutes(t *testing.T) {
 	if len(activeSnapshot.Active) != 1 || activeSnapshot.Active[0].SessionID != "session-success" {
 		t.Fatalf("active request was not visible: %#v", activeSnapshot.Active)
 	}
-	time.Sleep(5 * time.Millisecond)
 	close(release)
 	success := <-successDone
 	if success.Code != http.StatusOK || !strings.Contains(success.Body.String(), `"response-1"`) {
@@ -114,7 +113,7 @@ func TestRealProxyHandlerFeedsDashboardAndPreservesHTTPRoutes(t *testing.T) {
 	if completed.Status != "complete" || completed.StatusCode != 200 || completed.OutputTokens != 120 || completed.TokensPerSecond() <= 0 {
 		t.Fatalf("completed request = %#v rate=%.2f", completed, completed.TokensPerSecond())
 	}
-	if snapshot.Errors[0].SessionID != "default" || snapshot.Errors[0].StatusCode != 500 || snapshot.Errors[0].Error != "upstream returned HTTP 500" {
+	if snapshot.Errors[0].SessionID == "" || snapshot.Errors[0].SessionID == "default" || snapshot.Errors[0].SessionID != snapshot.Errors[0].ID || snapshot.Errors[0].StatusCode != 500 || snapshot.Errors[0].Error != "upstream returned HTTP 500" {
 		t.Fatalf("error event = %#v", snapshot.Errors[0])
 	}
 }

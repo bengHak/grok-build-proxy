@@ -12,9 +12,12 @@ import (
 const (
 	historyLimit = 50
 	dedupLimit   = 200
+	activeLimit  = 200
 )
 
 type Request struct {
+	key            string
+	sessionKey     string
 	ID             string
 	SessionID      string
 	RequestedModel string
@@ -47,6 +50,7 @@ func (r Request) TokensPerSecond() float64 {
 }
 
 type Session struct {
+	key             string
 	ID              string
 	Model           string
 	Requests        int
@@ -94,35 +98,40 @@ func (s *State) Observe(event proxy.RequestEvent) { s.Apply(event) }
 func (s *State) Apply(event proxy.RequestEvent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	requestKey := identityKey(event.RequestID)
+	sessionKey := identityKey(event.SessionID)
+	event = sanitizeEvent(event)
 
 	switch event.Type {
 	case proxy.RequestStarted:
-		if _, exists := s.active[event.RequestID]; exists {
+		if _, exists := s.active[requestKey]; exists {
 			return
 		}
-		if _, done := s.finished[event.RequestID]; done {
+		if _, done := s.finished[requestKey]; done {
 			return
 		}
-		request := requestFromEvent(event)
+		if len(s.active) >= activeLimit {
+			return
+		}
+		request := requestFromEvent(event, requestKey, sessionKey)
 		request.Status = "active"
-		s.active[event.RequestID] = request
-		session := s.session(event.SessionID)
-		session.Model = event.Model
+		s.active[requestKey] = request
+		session := s.session(sessionKey, event.SessionID)
 		session.Requests++
 		session.Active++
-		session.LastSeen = event.StartedAt
+		updateSessionDisplay(session, event.Model, event.StartedAt)
 	case proxy.RequestCompleted, proxy.RequestFailed:
-		if _, done := s.finished[event.RequestID]; done {
+		if _, done := s.finished[requestKey]; done {
 			return
 		}
-		request, exists := s.active[event.RequestID]
+		request, exists := s.active[requestKey]
 		if !exists {
-			request = requestFromEvent(event)
-			session := s.session(event.SessionID)
+			request = requestFromEvent(event, requestKey, sessionKey)
+			session := s.session(sessionKey, event.SessionID)
 			session.Requests++
 		}
-		delete(s.active, event.RequestID)
-		s.markFinished(event.RequestID)
+		delete(s.active, requestKey)
+		s.markFinished(requestKey)
 		mergeEvent(&request, event)
 		if event.Type == proxy.RequestCompleted {
 			request.Status = "complete"
@@ -130,12 +139,11 @@ func (s *State) Apply(event proxy.RequestEvent) {
 			request.Status = "failed"
 		}
 		s.prepend(&s.recent, request)
-		session := s.session(request.SessionID)
+		session := s.session(request.sessionKey, request.SessionID)
 		if session.Active > 0 {
 			session.Active--
 		}
-		session.Model = request.Model
-		session.LastSeen = request.EndedAt
+		updateSessionDisplay(session, request.Model, request.EndedAt)
 		if request.OutputTokens > 0 && request.Duration(request.EndedAt) > 0 {
 			session.OutputTokens += request.OutputTokens
 			session.SampledDuration += request.Duration(request.EndedAt)
@@ -162,22 +170,17 @@ func (s *State) Snapshot() Snapshot {
 	for _, request := range s.active {
 		result.Active = append(result.Active, request)
 	}
-	sort.Slice(result.Sessions, func(i, j int) bool { return result.Sessions[i].LastSeen.After(result.Sessions[j].LastSeen) })
-	sort.Slice(result.Active, func(i, j int) bool { return result.Active[i].StartedAt.Before(result.Active[j].StartedAt) })
+	sort.Slice(result.Sessions, func(i, j int) bool {
+		return result.Sessions[i].LastSeen.After(result.Sessions[j].LastSeen) ||
+			result.Sessions[i].LastSeen.Equal(result.Sessions[j].LastSeen) && (result.Sessions[i].ID < result.Sessions[j].ID ||
+				result.Sessions[i].ID == result.Sessions[j].ID && result.Sessions[i].key < result.Sessions[j].key)
+	})
+	sort.Slice(result.Active, func(i, j int) bool {
+		return result.Active[i].StartedAt.Before(result.Active[j].StartedAt) ||
+			result.Active[i].StartedAt.Equal(result.Active[j].StartedAt) && (result.Active[i].ID < result.Active[j].ID ||
+				result.Active[i].ID == result.Active[j].ID && result.Active[i].key < result.Active[j].key)
+	})
 	return result
-}
-
-func (s *State) session(id string) *Session {
-	if id == "" {
-		id = "default"
-	}
-	if session := s.sessions[id]; session != nil {
-		return session
-	}
-	s.pruneSessions()
-	session := &Session{ID: id}
-	s.sessions[id] = session
-	return session
 }
 
 func (s *State) markFinished(id string) {
@@ -190,26 +193,6 @@ func (s *State) markFinished(id string) {
 	}
 }
 
-func (s *State) pruneSessions() {
-	for len(s.sessions) > historyLimit {
-		var oldestID string
-		var oldest time.Time
-		for id, session := range s.sessions {
-			if session.Active != 0 {
-				continue
-			}
-			if oldestID == "" || session.LastSeen.Before(oldest) {
-				oldestID = id
-				oldest = session.LastSeen
-			}
-		}
-		if oldestID == "" {
-			return
-		}
-		delete(s.sessions, oldestID)
-	}
-}
-
 func (s *State) prepend(items *[]Request, request Request) {
 	*items = append([]Request{request}, *items...)
 	if len(*items) > historyLimit {
@@ -217,8 +200,10 @@ func (s *State) prepend(items *[]Request, request Request) {
 	}
 }
 
-func requestFromEvent(event proxy.RequestEvent) Request {
+func requestFromEvent(event proxy.RequestEvent, key, sessionKey string) Request {
 	return Request{
+		key:            key,
+		sessionKey:     sessionKey,
 		ID:             event.RequestID,
 		SessionID:      event.SessionID,
 		RequestedModel: event.RequestedModel,

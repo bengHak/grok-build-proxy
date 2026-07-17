@@ -18,11 +18,16 @@ const (
 )
 
 type View struct {
-	Mode      Mode
-	Selection int
-	Address   string
-	Version   string
-	Now       func() time.Time
+	Mode           Mode
+	Selection      int
+	Address        string
+	Version        string
+	Now            func() time.Time
+	selectionID    string
+	selectionGroup selectionGroup
+	selectionIndex int
+	detailID       string
+	detailGroup    selectionGroup
 }
 
 // HandleKey applies a complete key name and reports whether the program should
@@ -38,18 +43,35 @@ func (v *View) HandleKey(key string, snapshot Snapshot) bool {
 			v.Mode = ModeHelp
 		}
 	case "escape", "backspace":
+		if v.Mode == ModeDetail {
+			_, index := selectedByID(snapshot, v.detailID, v.detailGroup)
+			if index >= 0 {
+				v.Selection = index
+			}
+		}
 		v.Mode = ModeDashboard
+		v.rememberDashboardSelection(snapshot)
 	case "enter":
 		if v.Mode == ModeDashboard && selectableCount(snapshot) > 0 {
+			v.restoreDashboardSelection(snapshot)
+			item := selected(snapshot, v.Selection)
+			v.detailGroup = item.group
+			if item.session != nil {
+				v.detailID = item.session.identity()
+			} else if item.request != nil {
+				v.detailID = item.request.identity()
+			}
 			v.Mode = ModeDetail
 		}
 	case "up", "k":
 		if v.Mode == ModeDashboard && v.Selection > 0 {
 			v.Selection--
+			v.rememberDashboardSelection(snapshot)
 		}
 	case "down", "j":
 		if v.Mode == ModeDashboard && v.Selection+1 < selectableCount(snapshot) {
 			v.Selection++
+			v.rememberDashboardSelection(snapshot)
 		}
 	}
 	return false
@@ -62,10 +84,16 @@ func (v *View) Render(snapshot Snapshot, width, height int) string {
 	if height < 1 {
 		height = 1
 	}
+	if v.Mode == ModeDashboard {
+		v.restoreDashboardSelection(snapshot)
+	}
 	if count := selectableCount(snapshot); count == 0 {
 		v.Selection = 0
 	} else if v.Selection >= count {
 		v.Selection = count - 1
+	}
+	if v.Mode == ModeDashboard {
+		v.rememberDashboardSelection(snapshot)
 	}
 	now := time.Now()
 	if v.Now != nil {
@@ -80,18 +108,23 @@ func (v *View) Render(snapshot Snapshot, width, height int) string {
 			fit("Help", width),
 			fit("↑/k ↓/j  move selection", width),
 			fit("Enter    session/request details", width),
-			fit("? Esc    close overlay", width),
+			fit("? Esc Backspace  close overlay", width),
 			fit("q Ctrl-C quit and stop server", width),
 		)
 	case ModeDetail:
-		lines = append(lines, renderDetail(selected(snapshot, v.Selection), now, width)...)
+		item, _ := selectedByID(snapshot, v.detailID, v.detailGroup)
+		lines = append(lines, renderDetail(item, now, width)...)
 	default:
 		lines = append(lines, renderDashboard(snapshot, v.Selection, now, width, height)...)
 	}
-	lines = append(lines, fit("? help  Enter details  ↑/↓ move  q quit", width))
-	if len(lines) > height {
-		lines = lines[:height]
+	footer := fit("? help  Enter details  ↑/↓ move  q quit", width)
+	if height == 1 {
+		return footer
 	}
+	if len(lines) >= height {
+		lines = lines[:height-1]
+	}
+	lines = append(lines, footer)
 	return strings.Join(lines, "\n")
 }
 
@@ -100,20 +133,14 @@ func renderDashboard(snapshot Snapshot, selection int, now time.Time, width, hei
 	if itemsBudget < 0 {
 		itemsBudget = 0
 	}
-	perSection := 1
-	if itemsBudget >= 8 {
-		perSection = 2
-	}
-	if itemsBudget == 0 {
-		perSection = 0
-	}
+	rowLimits := dashboardRowLimits(snapshot, selection, itemsBudget)
 	var lines []string
 	lines = append(lines, fit("Sessions", width))
 	sessionSelection := selection
 	if sessionSelection < 0 || sessionSelection >= len(snapshot.Sessions) {
 		sessionSelection = -1
 	}
-	start, end := visibleRange(len(snapshot.Sessions), perSection, sessionSelection)
+	start, end := visibleRange(len(snapshot.Sessions), rowLimits[0], sessionSelection)
 	for i := start; i < end; i++ {
 		s := snapshot.Sessions[i]
 		prefix := marker(i, selection)
@@ -125,7 +152,7 @@ func renderDashboard(snapshot Snapshot, selection int, now time.Time, width, hei
 	if activeSelection < 0 || activeSelection >= len(snapshot.Active) {
 		activeSelection = -1
 	}
-	start, end = visibleRange(len(snapshot.Active), perSection, activeSelection)
+	start, end = visibleRange(len(snapshot.Active), rowLimits[1], activeSelection)
 	for i := start; i < end; i++ {
 		r := snapshot.Active[i]
 		lines = append(lines, fit(requestLine(marker(activeBase+i, selection), r, now), width))
@@ -136,7 +163,7 @@ func renderDashboard(snapshot Snapshot, selection int, now time.Time, width, hei
 	if recentSelection < 0 || recentSelection >= len(snapshot.Recent) {
 		recentSelection = -1
 	}
-	start, end = visibleRange(len(snapshot.Recent), perSection, recentSelection)
+	start, end = visibleRange(len(snapshot.Recent), rowLimits[2], recentSelection)
 	for i := start; i < end; i++ {
 		r := snapshot.Recent[i]
 		lines = append(lines, fit(requestLine(marker(recentBase+i, selection), r, now), width))
@@ -154,37 +181,12 @@ func renderDashboard(snapshot Snapshot, selection int, now time.Time, width, hei
 	if errorSelection < 0 || errorSelection >= len(snapshot.Errors) {
 		errorSelection = -1
 	}
-	start, end = visibleRange(len(snapshot.Errors), perSection, errorSelection)
+	start, end = visibleRange(len(snapshot.Errors), rowLimits[3], errorSelection)
 	for i := start; i < end; i++ {
 		r := snapshot.Errors[i]
 		lines = append(lines, fit(fmt.Sprintf("%s %s  HTTP %d  %s", marker(errorBase+i, selection), short(r.ID, 12), r.StatusCode, r.Error), width))
 	}
 	return lines
-}
-
-type selectedItem struct {
-	kind    string
-	session *Session
-	request *Request
-}
-
-func selected(snapshot Snapshot, target int) selectedItem {
-	index := 0
-	for i := range snapshot.Sessions {
-		if index == target {
-			return selectedItem{kind: "Session detail", session: &snapshot.Sessions[i]}
-		}
-		index++
-	}
-	for _, group := range [][]Request{snapshot.Active, snapshot.Recent, snapshot.Errors} {
-		for i := range group {
-			if index == target {
-				return selectedItem{kind: "Request detail", request: &group[i]}
-			}
-			index++
-		}
-	}
-	return selectedItem{kind: "Detail"}
 }
 
 func renderDetail(item selectedItem, now time.Time, width int) []string {
@@ -214,31 +216,6 @@ func renderDetail(item selectedItem, now time.Time, width int) []string {
 	}
 	lines = append(lines, fit("Esc/Backspace return", width))
 	return lines
-}
-
-func visibleRange(length, limit, selected int) (int, int) {
-	if length == 0 || limit <= 0 {
-		return 0, 0
-	}
-	start := 0
-	if selected >= limit {
-		start = selected - limit + 1
-	}
-	if start+limit > length {
-		start = length - limit
-		if start < 0 {
-			start = 0
-		}
-	}
-	end := start + limit
-	if end > length {
-		end = length
-	}
-	return start, end
-}
-
-func selectableCount(snapshot Snapshot) int {
-	return len(snapshot.Sessions) + len(snapshot.Active) + len(snapshot.Recent) + len(snapshot.Errors)
 }
 
 func marker(index, selected int) string {

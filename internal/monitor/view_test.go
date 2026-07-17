@@ -155,3 +155,22 @@ func TestProgramQuitRestoresTerminalAndCursor(t *testing.T) {
 		t.Fatalf("terminal cleanup sequence missing: %q", text)
 	}
 }
+
+func TestProgramUsesCarriageReturnsForRawTerminalLines(t *testing.T) {
+	terminal := &fakeTerminal{width: 60, height: 16}
+	var output bytes.Buffer
+	program := Program{
+		Dashboard: NewDashboard(),
+		Input:     strings.NewReader("q"),
+		Output:    &output,
+		Terminal:  terminal,
+		Refresh:   time.Hour,
+	}
+
+	if err := program.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "\r\nSessions") {
+		t.Fatalf("raw terminal output did not return to column zero: %q", output.String())
+	}
+}

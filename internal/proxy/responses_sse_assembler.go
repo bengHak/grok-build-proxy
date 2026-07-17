@@ -45,6 +45,7 @@ const (
 
 type responsesSSEAssembler struct {
 	mode              responsesCompatMode
+	logger            *slog.Logger
 	outputs           map[int]*responseOutputState
 	indexByItemID     map[string]int
 	indexByCallID     map[string]int
@@ -86,9 +87,10 @@ type responseOutputState struct {
 	customDoneItemInputPresent bool
 }
 
-func newResponsesSSEAssembler(mode responsesCompatMode) *responsesSSEAssembler {
+func newResponsesSSEAssembler(mode responsesCompatMode, logger *slog.Logger) *responsesSSEAssembler {
 	return &responsesSSEAssembler{
 		mode:          mode,
+		logger:        logger,
 		outputs:       make(map[int]*responseOutputState),
 		indexByItemID: make(map[string]int),
 		indexByCallID: make(map[string]int),
@@ -252,7 +254,7 @@ func (s *responsesSSEAssembler) synthesizeTerminal() []byte {
 }
 
 func (s *responsesSSEAssembler) encodeError(kind, message string) []byte {
-	slog.Warn(
+	s.logger.Warn(
 		"responses lite normalization failed",
 		"error_type", kind,
 		"error", message,
