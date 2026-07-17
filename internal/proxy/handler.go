@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bengHak/grok-build-proxy/internal/auth"
 	"github.com/bengHak/grok-build-proxy/internal/catalog"
@@ -35,6 +36,7 @@ type Config struct {
 	ModelMap     modelmap.Map
 	HTTPClient   *http.Client
 	Logger       *slog.Logger
+	Observer     Observer
 	ClientToken  string
 	Version      string
 	MaxBodyBytes int64
@@ -47,6 +49,7 @@ type Handler struct {
 	modelMap     modelmap.Map
 	httpClient   *http.Client
 	logger       *slog.Logger
+	observer     Observer
 	clientToken  string
 	version      string
 	maxBodyBytes int64
@@ -88,6 +91,7 @@ func New(cfg Config) (*Handler, error) {
 		modelMap:     cfg.ModelMap,
 		httpClient:   cfg.HTTPClient,
 		logger:       cfg.Logger,
+		observer:     cfg.Observer,
 		clientToken:  strings.TrimSpace(cfg.ClientToken),
 		version:      cfg.Version,
 		maxBodyBytes: cfg.MaxBodyBytes,
@@ -109,9 +113,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.handleModels(w, r)
 	case "/v1/responses", "/responses":
-		if !h.authorize(w, r) {
-			return
-		}
 		h.handleResponses(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "not_found_error", "endpoint not found")
@@ -279,42 +280,76 @@ func supportsFastModel(id string) bool {
 }
 
 func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
-		return
-	}
 	started := time.Now()
 	requestID := newRequestID()
 	w.Header().Set("X-Request-ID", requestID)
+	sessionID := firstValidHeader(r.Header.Get("x-grok-session-id"), r.Header.Get("x-grok-conv-id"), r.Header.Get("x-grok-req-id"), r.Header.Get("x-request-id"), requestID)
+	event := RequestEvent{
+		Type:      RequestStarted,
+		RequestID: requestID,
+		SessionID: sessionID,
+		StartedAt: started,
+	}
+	if h.observer != nil {
+		h.observer.Observe(event)
+		defer func() {
+			event.EndedAt = time.Now()
+			h.observer.Observe(event)
+		}()
+	}
+	event.Type = RequestFailed
+
+	if !h.authorize(w, r) {
+		event.StatusCode = http.StatusUnauthorized
+		event.Error = "invalid proxy bearer token"
+		return
+	}
+	if r.Method != http.MethodPost {
+		event.StatusCode = http.StatusMethodNotAllowed
+		event.Error = "method not allowed"
+		writeError(w, event.StatusCode, "invalid_request_error", event.Error)
+		return
+	}
 
 	limited := http.MaxBytesReader(w, r.Body, h.maxBodyBytes)
 	body, err := io.ReadAll(limited)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body exceeds proxy limit")
+			event.StatusCode = http.StatusRequestEntityTooLarge
+			event.Error = "request body exceeds proxy limit"
 		} else {
-			writeError(w, http.StatusBadRequest, "invalid_request_error", "failed to read request body")
+			event.StatusCode = http.StatusBadRequest
+			event.Error = "failed to read request body"
 		}
+		writeError(w, event.StatusCode, "invalid_request_error", event.Error)
 		return
 	}
 	transformed, err := transformRequest(body, h.catalog, h.modelMap)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		event.StatusCode = http.StatusBadRequest
+		event.Error = err.Error()
+		writeError(w, event.StatusCode, "invalid_request_error", event.Error)
 		return
 	}
+	event.RequestedModel = transformed.RequestedModel
+	event.Model = transformed.Model
 
-	resp, err := h.sendUpstream(r.Context(), r, transformed, requestID, false)
+	resp, err := h.sendUpstream(r.Context(), r, transformed, sessionID, false)
 	if err != nil {
+		event.StatusCode = http.StatusBadGateway
+		event.Error = err.Error()
 		h.logger.Error("upstream request failed", "request_id", requestID, "model", transformed.Model, "error", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 		return
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		resp, err = h.sendUpstream(r.Context(), r, transformed, requestID, true)
+		resp, err = h.sendUpstream(r.Context(), r, transformed, sessionID, true)
 		if err != nil {
+			event.StatusCode = http.StatusBadGateway
+			event.Error = err.Error()
 			h.logger.Error("upstream retry failed", "request_id", requestID, "model", transformed.Model, "error", err)
 			writeError(w, http.StatusBadGateway, "upstream_error", err.Error())
 			return
@@ -322,14 +357,26 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	event.StatusCode = resp.StatusCode
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.Header().Set("X-Grok-Build-Proxy-Version", h.version)
 	w.WriteHeader(resp.StatusCode)
-	copyErr := copyResponseBody(w, resp.Body, strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream"))
+	eventStream := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+	capture := newResponseObservationCapture(256<<10, eventStream)
+	copyErr := copyResponseBody(w, io.TeeReader(resp.Body, capture), eventStream)
+	capturedResponse := capture.Bytes()
+	event.OutputTokens = observedOutputTokens(capturedResponse)
+	event.Error = requestFailure(resp.StatusCode, copyErr, capturedResponse)
+	if event.Error == "" {
+		event.Error = capture.FailureHint()
+	}
+	if event.Error == "" {
+		event.Type = RequestCompleted
+	}
 	if copyErr != nil && !errors.Is(copyErr, context.Canceled) {
 		h.logger.Warn("response stream ended with error", "request_id", requestID, "model", transformed.Model, "error", copyErr)
 	}
-	h.logger.Info("request complete",
+	logArgs := []any{
 		"request_id", requestID,
 		"requested_model", transformed.RequestedModel,
 		"model", transformed.Model,
@@ -337,11 +384,17 @@ func (h *Handler) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"responses_lite", transformed.Lite,
 		"fast", transformed.Fast,
 		"status", resp.StatusCode,
+		"output_tokens", event.OutputTokens,
 		"duration_ms", time.Since(started).Milliseconds(),
-	)
+	}
+	if event.Type == RequestFailed {
+		h.logger.Warn("request failed", append(logArgs, "error", event.Error)...)
+	} else {
+		h.logger.Info("request complete", logArgs...)
+	}
 }
 
-func (h *Handler) sendUpstream(ctx context.Context, incoming *http.Request, transformed transformedRequest, requestID string, forceRefresh bool) (*http.Response, error) {
+func (h *Handler) sendUpstream(ctx context.Context, incoming *http.Request, transformed transformedRequest, sessionID string, forceRefresh bool) (*http.Response, error) {
 	creds, err := h.credentials.Get(ctx, forceRefresh)
 	if err != nil {
 		return nil, fmt.Errorf("load Codex credentials: %w", err)
@@ -374,12 +427,6 @@ func (h *Handler) sendUpstream(ctx context.Context, incoming *http.Request, tran
 	if value := incoming.Header.Get("tracestate"); validHeaderValue(value) {
 		req.Header.Set("tracestate", value)
 	}
-	sessionID := firstValidHeader(
-		incoming.Header.Get("x-grok-session-id"),
-		incoming.Header.Get("x-grok-conv-id"),
-		incoming.Header.Get("x-request-id"),
-		requestID,
-	)
 	if sessionID != "" {
 		req.Header.Set("session_id", sessionID)
 		req.Header.Set("x-client-request-id", sessionID)
@@ -480,7 +527,7 @@ func validHeaderValue(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if r < 0x20 || r == 0x7f {
+		if unicode.IsControl(r) {
 			return false
 		}
 	}

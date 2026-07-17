@@ -1,12 +1,87 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/bengHak/grok-build-proxy/internal/catalog"
 	"github.com/bengHak/grok-build-proxy/internal/modelmap"
 )
+
+type notifyingBuffer struct {
+	mu    sync.Mutex
+	once  sync.Once
+	ready chan struct{}
+	bytes.Buffer
+}
+
+func newNotifyingBuffer() *notifyingBuffer {
+	return &notifyingBuffer{ready: make(chan struct{})}
+}
+
+func (b *notifyingBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n, err := b.Buffer.Write(p)
+	if strings.Contains(b.Buffer.String(), "proxy listening") {
+		b.once.Do(func() { close(b.ready) })
+	}
+	return n, err
+}
+
+func (b *notifyingBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
+func TestRunServeUsesPlainLogsForNonTTYAndNoMonitor(t *testing.T) {
+	for _, extraArgs := range [][]string{nil, {"--no-monitor"}} {
+		t.Run(strings.Join(extraArgs, "_"), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var stdout bytes.Buffer
+			stderr := newNotifyingBuffer()
+			args := append([]string{"--listen", "127.0.0.1:0", "--auth-file", filepath.Join(t.TempDir(), "auth.json")}, extraArgs...)
+			done := make(chan error, 1)
+			go func() {
+				done <- runServe(ctx, args, commandIO{stdin: strings.NewReader(""), stdout: &stdout, stderr: stderr}, commandDefaults{})
+			}()
+			select {
+			case <-stderr.ready:
+			case <-time.After(time.Second):
+				t.Fatal("proxy did not report readiness")
+			}
+			cancel()
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+			logs := stdout.String() + stderr.String()
+			if !strings.Contains(logs, "proxy listening") || !strings.Contains(logs, "address=127.0.0.1:0") {
+				t.Fatalf("plain listening log missing:\n%s", logs)
+			}
+			if strings.Contains(logs, "\x1b[") || strings.Contains(logs, "Sessions") {
+				t.Fatalf("non-TTY path emitted monitor output: %q", logs)
+			}
+		})
+	}
+}
+
+func TestServeHelpDocumentsNoMonitor(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := runServe(context.Background(), []string{"--help"}, commandIO{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr}, commandDefaults{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "-no-monitor") {
+		t.Fatalf("serve help missing --no-monitor:\n%s", stderr.String())
+	}
+}
 
 func TestRenderGrokConfigIncludesModelMappings(t *testing.T) {
 	mappings, err := modelmap.Parse("grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol-fast")

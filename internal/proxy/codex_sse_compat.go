@@ -50,7 +50,7 @@ func newResponsesLiteSSEBodyWithOptions(source io.ReadCloser, options responsesL
 	return &responsesLiteSSEBody{
 		source:    source,
 		reader:    bufio.NewReader(source),
-		state:     newResponsesSSEAssembler(options.Mode),
+		state:     newResponsesSSEAssembler(options.Mode, options.Logger),
 		envelope:  newResponsesResponseNormalizer(options.Model, options.RequestID),
 		logger:    options.Logger,
 		trace:     options.Trace,

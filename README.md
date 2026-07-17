@@ -70,6 +70,27 @@ that can use the selected Codex model.
    grok -m codex-sol
    ```
 
+### Serve monitor
+
+When standard input and output are attached to a terminal, `grok-build-proxy
+serve` (and the default `grok-build-proxy` command) opens an interactive monitor
+instead of scrolling logs. It shows sessions, active and recent requests,
+observed output-token throughput, and error events from real proxy traffic.
+
+- `↑`/`k` and `↓`/`j`: move the selection
+- `Enter`: open session or request details
+- `?`: show or close help
+- `Esc`/`Backspace`: return to the dashboard
+- `q`/`Ctrl-C`: stop the proxy and restore the terminal
+
+Use plain logs for scripts, background services, or troubleshooting:
+
+```sh
+grok-build-proxy serve --no-monitor
+```
+
+Non-interactive output automatically keeps the existing plain-log behavior.
+
 ## Why v0.0.7 is required for Responses Lite, Plan, and Goal
 
 Grok Build displays streamed text immediately, but accepts a turn from the final
@@ -201,6 +222,7 @@ are rejected before the server starts.
 | — | `GROK_BUILD_PROXY_RESPONSES_COMPAT` | `full` (`full`, `text`, or `off`) |
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
+| `--no-monitor` | — | auto-enable monitor on an interactive terminal |
 
 A bearer token is mandatory when binding to a non-loopback address. Keep the
 default loopback binding whenever possible.
