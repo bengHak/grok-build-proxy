@@ -69,6 +69,55 @@ func TestFastLookupInheritsReasoningWithoutSharingMutableEfforts(t *testing.T) {
 	}
 }
 
+func TestModelsDoesNotExposeMutableReasoningEfforts(t *testing.T) {
+	catalog := New("")
+	models := catalog.Models()
+	var exposed *Model
+	for i := range models {
+		if models[i].ID == "gpt-5.6-sol" {
+			exposed = &models[i]
+			break
+		}
+	}
+	if exposed == nil || exposed.Reasoning == nil {
+		t.Fatalf("gpt-5.6-sol missing reasoning metadata from Models(): %#v", models)
+	}
+	exposed.Reasoning.DefaultEffort = "mutated"
+	exposed.Reasoning.Efforts[0].Value = "mutated"
+	exposed.Reasoning.Efforts[0].Default = false
+
+	assertUnchanged := func(source string, model Model) {
+		t.Helper()
+		if model.Reasoning == nil {
+			t.Fatalf("%s reasoning = nil", source)
+		}
+		if model.Reasoning.DefaultEffort != "low" {
+			t.Errorf("%s default effort = %q, want low", source, model.Reasoning.DefaultEffort)
+		}
+		gotValues := make([]string, 0, len(model.Reasoning.Efforts))
+		for _, effort := range model.Reasoning.Efforts {
+			gotValues = append(gotValues, effort.Value)
+		}
+		if want := []string{"low", "medium", "high", "xhigh"}; !reflect.DeepEqual(gotValues, want) {
+			t.Errorf("%s effort values = %#v, want %#v", source, gotValues, want)
+		}
+		if len(model.Reasoning.Efforts) == 0 || !model.Reasoning.Efforts[0].Default {
+			t.Errorf("%s low effort is not marked default: %#v", source, model.Reasoning.Efforts)
+		}
+	}
+
+	var fresh Model
+	for _, model := range catalog.Models() {
+		if model.ID == "gpt-5.6-sol" {
+			fresh = model
+			break
+		}
+	}
+	assertUnchanged("second Models() call", fresh)
+	lookedUp, _ := catalog.Lookup("gpt-5.6-sol")
+	assertUnchanged("Lookup()", lookedUp)
+}
+
 func TestCustomCatalogAcceptsUnknownModels(t *testing.T) {
 	catalog := New("future-model,gpt-5.6-orbit,future-model")
 	if got, want := catalog.IDs(), []string{"future-model", "gpt-5.6-orbit"}; !reflect.DeepEqual(got, want) {
