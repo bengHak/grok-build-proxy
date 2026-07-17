@@ -166,15 +166,18 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type modelResponse struct {
-		ID            string `json:"id"`
-		Object        string `json:"object"`
-		OwnedBy       string `json:"owned_by"`
-		DisplayName   string `json:"name,omitempty"`
-		Description   string `json:"description,omitempty"`
-		ContextWindow int    `json:"context_window,omitempty"`
-		APIBackend    string `json:"api_backend,omitempty"`
-		TargetModel   string `json:"target_model,omitempty"`
-		ServiceTier   string `json:"service_tier,omitempty"`
+		ID                      string                    `json:"id"`
+		Object                  string                    `json:"object"`
+		OwnedBy                 string                    `json:"owned_by"`
+		DisplayName             string                    `json:"name,omitempty"`
+		Description             string                    `json:"description,omitempty"`
+		ContextWindow           int                       `json:"context_window,omitempty"`
+		APIBackend              string                    `json:"api_backend,omitempty"`
+		TargetModel             string                    `json:"target_model,omitempty"`
+		ServiceTier             string                    `json:"service_tier,omitempty"`
+		SupportsReasoningEffort bool                      `json:"supports_reasoning_effort,omitempty"`
+		ReasoningEffort         string                    `json:"reasoning_effort,omitempty"`
+		ReasoningEfforts        []catalog.ReasoningEffort `json:"reasoning_efforts,omitempty"`
 	}
 
 	type route struct {
@@ -184,6 +187,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		description string
 		context     int
 		fast        bool
+		reasoning   *catalog.ReasoningCapability
 	}
 
 	routes := make([]route, 0, len(h.catalog.Models())+h.modelMap.Len())
@@ -216,6 +220,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 			description: fmt.Sprintf("Maps %s to %s through ChatGPT Codex.", entry.Source, effectiveTarget),
 			context:     model.ContextWindow,
 			fast:        resolved.Fast,
+			reasoning:   model.Reasoning,
 		})
 	}
 
@@ -226,6 +231,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 			displayName: model.DisplayName,
 			description: model.Description,
 			context:     model.ContextWindow,
+			reasoning:   model.Reasoning,
 		})
 	}
 
@@ -243,6 +249,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 			description: item.description,
 			context:     item.context,
 			fast:        true,
+			reasoning:   item.reasoning,
 		})
 	}
 
@@ -259,7 +266,7 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 		if item.fast {
 			serviceTier = "priority"
 		}
-		data = append(data, modelResponse{
+		model := modelResponse{
 			ID:            item.id,
 			Object:        "model",
 			OwnedBy:       "openai-codex",
@@ -269,7 +276,13 @@ func (h *Handler) handleModels(w http.ResponseWriter, r *http.Request) {
 			APIBackend:    "responses",
 			TargetModel:   target,
 			ServiceTier:   serviceTier,
-		})
+		}
+		if item.reasoning != nil {
+			model.SupportsReasoningEffort = true
+			model.ReasoningEffort = item.reasoning.DefaultEffort
+			model.ReasoningEfforts = item.reasoning.Efforts
+		}
+		data = append(data, model)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }

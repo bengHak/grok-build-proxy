@@ -5,14 +5,52 @@ import (
 	"strings"
 )
 
+// ReasoningEffort describes one reasoning level exposed to Grok Build.
+type ReasoningEffort struct {
+	Value       string `json:"value"`
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Default     bool   `json:"default"`
+}
+
+// ReasoningCapability describes the reasoning levels supported by a model.
+type ReasoningCapability struct {
+	DefaultEffort string
+	Efforts       []ReasoningEffort
+}
+
 // Model describes the small amount of model metadata the proxy needs for
 // request shaping and Grok Build's model picker.
 type Model struct {
-	ID            string `json:"id"`
-	DisplayName   string `json:"display_name,omitempty"`
-	Description   string `json:"description,omitempty"`
-	ContextWindow int    `json:"context_window,omitempty"`
-	ResponsesLite bool   `json:"-"`
+	ID            string               `json:"id"`
+	DisplayName   string               `json:"display_name,omitempty"`
+	Description   string               `json:"description,omitempty"`
+	ContextWindow int                  `json:"context_window,omitempty"`
+	ResponsesLite bool                 `json:"-"`
+	Reasoning     *ReasoningCapability `json:"-"`
+}
+
+func reasoningCapability(defaultEffort string) *ReasoningCapability {
+	efforts := []ReasoningEffort{
+		{Value: "low", Label: "Low", Description: "Faster responses with lighter reasoning."},
+		{Value: "medium", Label: "Medium", Description: "Balanced reasoning for most tasks."},
+		{Value: "high", Label: "High", Description: "Deeper reasoning for complex tasks."},
+		{Value: "xhigh", Label: "Extra high", Description: "Maximum supported reasoning depth."},
+	}
+	for i := range efforts {
+		efforts[i].Default = efforts[i].Value == defaultEffort
+	}
+	return &ReasoningCapability{DefaultEffort: defaultEffort, Efforts: efforts}
+}
+
+func cloneModel(model Model) Model {
+	if model.Reasoning == nil {
+		return model
+	}
+	capability := *model.Reasoning
+	capability.Efforts = append([]ReasoningEffort(nil), capability.Efforts...)
+	model.Reasoning = &capability
+	return model
 }
 
 var knownModels = map[string]Model{
@@ -22,6 +60,7 @@ var knownModels = map[string]Model{
 		Description:   "Latest frontier agentic coding model.",
 		ContextWindow: 372000,
 		ResponsesLite: true,
+		Reasoning:     reasoningCapability("low"),
 	},
 	"gpt-5.6-terra": {
 		ID:            "gpt-5.6-terra",
@@ -29,6 +68,7 @@ var knownModels = map[string]Model{
 		Description:   "Balanced agentic coding model for everyday work.",
 		ContextWindow: 372000,
 		ResponsesLite: true,
+		Reasoning:     reasoningCapability("medium"),
 	},
 	"gpt-5.6-luna": {
 		ID:            "gpt-5.6-luna",
@@ -36,12 +76,14 @@ var knownModels = map[string]Model{
 		Description:   "Fast agentic coding model.",
 		ContextWindow: 372000,
 		ResponsesLite: true,
+		Reasoning:     reasoningCapability("medium"),
 	},
 	"gpt-5.5": {
 		ID:            "gpt-5.5",
 		DisplayName:   "GPT-5.5",
 		Description:   "Frontier model for complex coding and real-world work.",
 		ContextWindow: 272000,
+		Reasoning:     reasoningCapability("medium"),
 	},
 	"gpt-5.2": {
 		ID:            "gpt-5.2",
@@ -89,7 +131,7 @@ func New(csv string) Catalog {
 				ResponsesLite: strings.HasPrefix(base, "gpt-5.6-"),
 			}
 		}
-		models[base] = model
+		models[base] = cloneModel(model)
 		order = append(order, base)
 	}
 	return Catalog{models: models, order: order}
@@ -128,12 +170,12 @@ func (c Catalog) Lookup(id string) (Model, bool) {
 	base, _ := NormalizeID(id)
 	model, ok := c.models[base]
 	if ok {
-		return model, true
+		return cloneModel(model), true
 	}
 	// A mapping target may be a built-in Codex model that the user chose not to
 	// advertise via --models. Keep its authoritative request-shape metadata.
 	if model, ok := knownModels[base]; ok {
-		return model, true
+		return cloneModel(model), true
 	}
 	// Unknown account-specific models are allowed through. Infer the only wire
 	// distinction currently needed by the proxy from the model family.
@@ -151,7 +193,7 @@ func (c Catalog) Lookup(id string) (Model, bool) {
 func (c Catalog) Models() []Model {
 	models := make([]Model, 0, len(c.order))
 	for _, id := range c.order {
-		models = append(models, c.models[id])
+		models = append(models, cloneModel(c.models[id]))
 	}
 	return models
 }

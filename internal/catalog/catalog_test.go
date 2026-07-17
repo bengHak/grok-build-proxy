@@ -16,17 +16,119 @@ func TestDefaultCatalog(t *testing.T) {
 	}
 }
 
+func TestKnownReasoningCapabilities(t *testing.T) {
+	catalog := New("")
+	cases := map[string]string{
+		"gpt-5.6-sol":   "low",
+		"gpt-5.6-terra": "medium",
+		"gpt-5.6-luna":  "medium",
+		"gpt-5.5":       "medium",
+	}
+	wantValues := []string{"low", "medium", "high", "xhigh"}
+	for id, wantDefault := range cases {
+		model, ok := catalog.Lookup(id)
+		if !ok || model.Reasoning == nil {
+			t.Fatalf("Lookup(%q) = %#v, %v; want reasoning capability", id, model, ok)
+		}
+		if model.Reasoning.DefaultEffort != wantDefault {
+			t.Errorf("Lookup(%q) default = %q, want %q", id, model.Reasoning.DefaultEffort, wantDefault)
+		}
+		gotValues := make([]string, 0, len(model.Reasoning.Efforts))
+		defaults := 0
+		for _, effort := range model.Reasoning.Efforts {
+			gotValues = append(gotValues, effort.Value)
+			if effort.Default {
+				defaults++
+				if effort.Value != wantDefault {
+					t.Errorf("Lookup(%q) marks %q as default, want %q", id, effort.Value, wantDefault)
+				}
+			}
+		}
+		if !reflect.DeepEqual(gotValues, wantValues) || defaults != 1 {
+			t.Errorf("Lookup(%q) efforts = %#v with %d defaults, want %#v with one default", id, gotValues, defaults, wantValues)
+		}
+	}
+
+	unsupported, _ := catalog.Lookup("gpt-5.2")
+	if unsupported.Reasoning != nil {
+		t.Fatalf("gpt-5.2 reasoning = %#v, want nil", unsupported.Reasoning)
+	}
+}
+
+func TestFastLookupInheritsReasoningWithoutSharingMutableEfforts(t *testing.T) {
+	catalog := New("")
+	fast, ok := catalog.Lookup("gpt-5.6-sol-fast")
+	if !ok || fast.Reasoning == nil || fast.Reasoning.DefaultEffort != "low" {
+		t.Fatalf("fast model = %#v, ok = %v", fast, ok)
+	}
+	fast.Reasoning.Efforts[0].Value = "mutated"
+
+	canonical, _ := catalog.Lookup("gpt-5.6-sol")
+	if got := canonical.Reasoning.Efforts[0].Value; got != "low" {
+		t.Fatalf("canonical effort mutated through lookup result: %q", got)
+	}
+}
+
+func TestModelsDoesNotExposeMutableReasoningEfforts(t *testing.T) {
+	catalog := New("")
+	models := catalog.Models()
+	var exposed *Model
+	for i := range models {
+		if models[i].ID == "gpt-5.6-sol" {
+			exposed = &models[i]
+			break
+		}
+	}
+	if exposed == nil || exposed.Reasoning == nil {
+		t.Fatalf("gpt-5.6-sol missing reasoning metadata from Models(): %#v", models)
+	}
+	exposed.Reasoning.DefaultEffort = "mutated"
+	exposed.Reasoning.Efforts[0].Value = "mutated"
+	exposed.Reasoning.Efforts[0].Default = false
+
+	assertUnchanged := func(source string, model Model) {
+		t.Helper()
+		if model.Reasoning == nil {
+			t.Fatalf("%s reasoning = nil", source)
+		}
+		if model.Reasoning.DefaultEffort != "low" {
+			t.Errorf("%s default effort = %q, want low", source, model.Reasoning.DefaultEffort)
+		}
+		gotValues := make([]string, 0, len(model.Reasoning.Efforts))
+		for _, effort := range model.Reasoning.Efforts {
+			gotValues = append(gotValues, effort.Value)
+		}
+		if want := []string{"low", "medium", "high", "xhigh"}; !reflect.DeepEqual(gotValues, want) {
+			t.Errorf("%s effort values = %#v, want %#v", source, gotValues, want)
+		}
+		if len(model.Reasoning.Efforts) == 0 || !model.Reasoning.Efforts[0].Default {
+			t.Errorf("%s low effort is not marked default: %#v", source, model.Reasoning.Efforts)
+		}
+	}
+
+	var fresh Model
+	for _, model := range catalog.Models() {
+		if model.ID == "gpt-5.6-sol" {
+			fresh = model
+			break
+		}
+	}
+	assertUnchanged("second Models() call", fresh)
+	lookedUp, _ := catalog.Lookup("gpt-5.6-sol")
+	assertUnchanged("Lookup()", lookedUp)
+}
+
 func TestCustomCatalogAcceptsUnknownModels(t *testing.T) {
 	catalog := New("future-model,gpt-5.6-orbit,future-model")
 	if got, want := catalog.IDs(), []string{"future-model", "gpt-5.6-orbit"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("IDs = %#v, want %#v", got, want)
 	}
 	future, ok := catalog.Lookup("future-model")
-	if !ok || future.ResponsesLite {
+	if !ok || future.ResponsesLite || future.Reasoning != nil {
 		t.Fatalf("future model = %#v, ok = %v", future, ok)
 	}
 	orbit, ok := catalog.Lookup("gpt-5.6-orbit-fast")
-	if !ok || !orbit.ResponsesLite {
+	if !ok || !orbit.ResponsesLite || orbit.Reasoning != nil {
 		t.Fatalf("orbit model = %#v, ok = %v", orbit, ok)
 	}
 }

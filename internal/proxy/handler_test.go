@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -232,34 +233,104 @@ func TestHandlerMapsGrokModelAliasAndAdvertisesIt(t *testing.T) {
 	if modelsResponse.Code != http.StatusOK {
 		t.Fatalf("models status = %d", modelsResponse.Code)
 	}
+	type listedModel struct {
+		ID                      string                    `json:"id"`
+		DisplayName             string                    `json:"name"`
+		ContextWindow           int                       `json:"context_window"`
+		TargetModel             string                    `json:"target_model"`
+		ServiceTier             string                    `json:"service_tier"`
+		SupportsReasoningEffort *bool                     `json:"supports_reasoning_effort"`
+		ReasoningEffort         string                    `json:"reasoning_effort"`
+		ReasoningEfforts        []catalog.ReasoningEffort `json:"reasoning_efforts"`
+	}
 	var listing struct {
-		Data []struct {
-			ID            string `json:"id"`
-			DisplayName   string `json:"name"`
-			ContextWindow int    `json:"context_window"`
-			TargetModel   string `json:"target_model"`
-			ServiceTier   string `json:"service_tier"`
-		} `json:"data"`
+		Data []listedModel `json:"data"`
 	}
 	if err := json.Unmarshal(modelsResponse.Body.Bytes(), &listing); err != nil {
 		t.Fatal(err)
 	}
-	found := false
+	assertReasoning := func(model listedModel, wantDefault string) {
+		t.Helper()
+		if model.SupportsReasoningEffort == nil || !*model.SupportsReasoningEffort {
+			t.Errorf("%s does not advertise reasoning support: %#v", model.ID, model)
+			return
+		}
+		if model.ReasoningEffort != wantDefault {
+			t.Errorf("%s reasoning_effort = %q, want %q", model.ID, model.ReasoningEffort, wantDefault)
+		}
+		gotValues := make([]string, 0, len(model.ReasoningEfforts))
+		for _, effort := range model.ReasoningEfforts {
+			gotValues = append(gotValues, effort.Value)
+		}
+		if want := []string{"low", "medium", "high", "xhigh"}; !reflect.DeepEqual(gotValues, want) {
+			t.Errorf("%s reasoning_efforts = %#v, want %#v", model.ID, gotValues, want)
+		}
+	}
+	found := map[string]bool{}
 	for _, model := range listing.Data {
-		if model.ID == "grok-4.5" {
-			found = true
+		switch model.ID {
+		case "grok-4.5":
+			found[model.ID] = true
 			if !strings.Contains(model.DisplayName, "GPT-5.6 Sol") || model.ContextWindow != 372000 || model.TargetModel != "gpt-5.6-sol" {
 				t.Fatalf("alias model = %#v", model)
 			}
-		}
-		if model.ID == "grok-4.5-fast" {
+			assertReasoning(model, "low")
+		case "grok-4.5-fast":
+			found[model.ID] = true
 			if model.TargetModel != "gpt-5.6-sol-fast" || model.ServiceTier != "priority" {
 				t.Fatalf("fast alias model = %#v", model)
 			}
+			assertReasoning(model, "low")
+		case "gpt-5.6-sol":
+			found[model.ID] = true
+			assertReasoning(model, "low")
+		case "gpt-5.6-sol-fast":
+			found[model.ID] = true
+			assertReasoning(model, "low")
+		case "gpt-5.2":
+			found[model.ID] = true
+			if model.SupportsReasoningEffort != nil || model.ReasoningEffort != "" || model.ReasoningEfforts != nil {
+				t.Errorf("unsupported model advertises reasoning fields: %#v", model)
+			}
 		}
 	}
-	if !found {
-		t.Fatalf("grok-4.5 alias missing from %#v", listing.Data)
+	for _, id := range []string{"grok-4.5", "grok-4.5-fast", "gpt-5.6-sol", "gpt-5.6-sol-fast", "gpt-5.2"} {
+		if !found[id] {
+			t.Errorf("%s missing from model listing", id)
+		}
+	}
+}
+
+func TestHandlerOmitsReasoningMetadataForUnknownModels(t *testing.T) {
+	handler, err := New(Config{
+		UpstreamURL: "http://example.test/responses",
+		Credentials: &fakeCredentials{tokens: []string{"token"}},
+		Catalog:     catalog.New("future-model"),
+		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Version:     "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var listing struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &listing); err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Data) != 1 || listing.Data[0]["id"] != "future-model" {
+		t.Fatalf("models = %#v", listing.Data)
+	}
+	for _, field := range []string{"supports_reasoning_effort", "reasoning_effort", "reasoning_efforts"} {
+		if _, exists := listing.Data[0][field]; exists {
+			t.Errorf("unknown model includes %s: %#v", field, listing.Data[0])
+		}
 	}
 }
 
