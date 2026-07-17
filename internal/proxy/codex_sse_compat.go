@@ -81,9 +81,6 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 	for len(b.pending) == 0 && !b.finished {
 		frame, err := readSSEFrame(b.reader)
 		if len(frame) > 0 {
-			rawFrame := append([]byte(nil), frame...)
-			captureVisibleSSEContent(rawFrame, &b.visibleText, &b.visibleRefusal)
-
 			if eventType, drop := codexPrivateSSEEventType(frame); drop {
 				b.eventIndex++
 				if b.trace {
@@ -91,7 +88,7 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 						b.logger,
 						b.requestID,
 						b.eventIndex,
-						rawFrame,
+						nil,
 						nil,
 						responsesResponseNormalizationReport{
 							EventType: eventType,
@@ -100,6 +97,9 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 					)
 				}
 			} else {
+				rawFrame := append([]byte(nil), frame...)
+				captureVisibleSSEContent(rawFrame, &b.visibleText, &b.visibleRefusal)
+
 				report := responsesResponseNormalizationReport{}
 				if b.envelope != nil {
 					frame, report = b.envelope.normalizeFrame(frame)
@@ -172,7 +172,7 @@ func (b *responsesLiteSSEBody) Read(p []byte) (int, error) {
 // before the following Plan/function-call event can be processed.
 func codexPrivateSSEEventType(frame []byte) (string, bool) {
 	eventName, data, ok := parseSSEFrame(frame)
-	if eventName == "response.metadata" && (!ok || strings.TrimSpace(data) == "") {
+	if eventName == "response.metadata" {
 		return eventName, true
 	}
 	if !ok || data == "[DONE]" {
@@ -185,9 +185,8 @@ func codexPrivateSSEEventType(frame []byte) (string, bool) {
 	if err := decoder.Decode(&event); err != nil {
 		return "", false
 	}
-	eventType := firstNonEmptyString(stringValue(event["type"]), eventName)
-	if eventType == "response.metadata" {
-		return eventType, true
+	if stringValue(event["type"]) == "response.metadata" {
+		return "response.metadata", true
 	}
 	return "", false
 }
