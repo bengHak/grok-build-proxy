@@ -19,6 +19,15 @@ Requirements: macOS and Grok Build. The Codex path additionally needs the
 official `codex` CLI and a ChatGPT account with model access; the Kimi path needs
 a Kimi Code membership and API key.
 
+| | Codex | Kimi K3 (recommended Kimi path) |
+|---|---|---|
+| Access | ChatGPT plan/workspace with the selected Codex model | Kimi Code Moderato or above |
+| Authenticate | `grok-build-proxy auth login` | Set `GROK_BUILD_PROXY_KIMI_API_KEY` from the Kimi Code Console |
+| Add model | `grok-build-proxy models add codex-sol --model gpt-5.6-sol` | `grok-build-proxy models add kimi-k3 --model k3` |
+| Start proxy | `grok-build-proxy serve` | `GROK_BUILD_PROXY_KIMI_API_KEY='…' grok-build-proxy serve` |
+| Start Grok Build | `grok -m codex-sol` | `grok -m kimi-k3` |
+| Context and effort | Model-dependent; `low`, `medium`, `high`, `xhigh` when supported | 256K; `low`, `high`, `xhigh` (`xhigh` maps to K3 `max`) |
+
 1. Install the latest release:
 
    ```sh
