@@ -427,10 +427,7 @@ mod tests {
         assert_eq!(format_token_count(1_234), "1.2k");
         assert_eq!(format_token_count(12_300), "12.3k");
         assert_eq!(format_token_count(2_500_000), "2.5M");
-        assert_eq!(
-            format_cache_read_value(12_300, Some(0.91)),
-            "12.3k · 91%"
-        );
+        assert_eq!(format_cache_read_value(12_300, Some(0.91)), "12.3k · 91%");
     }
 
     #[test]

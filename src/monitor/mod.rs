@@ -904,8 +904,8 @@ mod tests {
 
     #[test]
     fn metrics_and_session_detail_show_absolute_cache_reads() {
-        use crate::events::TokenUsage;
         use super::widgets::metrics::format_cache_read_value;
+        use crate::events::TokenUsage;
 
         let d = Dashboard::new();
         let mut started = base_event(RequestEventKind::Started);
@@ -941,8 +941,7 @@ mod tests {
         let snap = d.snapshot();
         assert_eq!(snap.cached_input_tokens, 900);
         // Fleet ratio is weighted across both sessions: 900 / (1010+500) ≈ 59.6%.
-        let fleet_cell =
-            format_cache_read_value(snap.cached_input_tokens, snap.cache_read_ratio());
+        let fleet_cell = format_cache_read_value(snap.cached_input_tokens, snap.cache_read_ratio());
         assert_eq!(fleet_cell, "900 · 60%");
 
         let mut app = App::new();
