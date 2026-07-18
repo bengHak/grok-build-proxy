@@ -37,11 +37,12 @@ use an isolated `GROK_HOME`, `--verbatim`, and disable memory, plan,
 subagents, and web search. Cache state is live rather than forced cold, so the
 fresh and cached token columns remain part of the comparison.
 
-`requests` includes one failed `grok-4.5` request emitted by Grok before every
-selected-model run. Thus proxy short runs contain one selected-model call plus
-one failed request, unbatched file runs contain nine plus one, and batched file
-runs contain three plus one. Dashes indicate data the native CLI did not expose
-or proxy phase logs that were not retained for the initial unbatched series.
+`requests` includes one failed `grok-4.5` request emitted when each new Grok
+session starts. Thus proxy short runs contain one selected-model call plus one
+failed request, unbatched file runs contain nine plus one, batched file runs
+contain three plus one, and growing-session runs contain ten plus one. Dashes
+indicate data the native CLI did not expose or proxy phase logs that were not
+retained for the initial unbatched series.
 
 | path | model | tier | effort | workload | run | wall_ms | requests | body_bytes | input_items | prepare_ms | credential_ms | headers_ms | first_chunk_ms | fresh_input | cached_input | outputs | retry_candidates |
 |---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -70,6 +71,16 @@ or proxy phase logs that were not retained for the initial unbatched series.
 | proxy+batching | gpt-5.6-sol | standard | low | eight-independent-files | 3 | 17650 | 4 | 175726 | 26 | 1 | 0 | 2289 | 2293 | 10405 | 29952 | 2 | 0 |
 | proxy+batching | gpt-5.6-sol | standard | low | eight-independent-files | 4 | 21510 | 4 | 176264 | 26 | 1 | 0 | 2093 | 2094 | 10553 | 29952 | 2 | 0 |
 | proxy+batching | gpt-5.6-sol | standard | low | eight-independent-files | 5 | 23300 | 4 | 176051 | 26 | 2 | 0 | 2132 | 2138 | 17408 | 23040 | 2 | 0 |
+| native-clean | gpt-5.6-sol | standard | low | ten-turn-growing-session | 1 | 39630 | 10 | — | — | — | — | — | — | 16778 | 127488 | 10 | 0 |
+| native-clean | gpt-5.6-sol | standard | low | ten-turn-growing-session | 2 | 40610 | 10 | — | — | — | — | — | — | — | — | 10 | 0 |
+| native-clean | gpt-5.6-sol | standard | low | ten-turn-growing-session | 3 | 29220 | 10 | — | — | — | — | — | — | — | — | 10 | 0 |
+| native-clean | gpt-5.6-sol | standard | low | ten-turn-growing-session | 4 | 31280 | 10 | — | — | — | — | — | — | — | — | 10 | 0 |
+| native-clean | gpt-5.6-sol | standard | low | ten-turn-growing-session | 5 | 39230 | 10 | — | — | — | — | — | — | — | — | 10 | 0 |
+| proxy+batching | gpt-5.6-sol | standard | low | ten-turn-growing-session | 1 | 33310 | 11 | 537411 | 152 | 0 | 0 | 7915 | 7937 | 40593 | 70912 | 0 | 0 |
+| proxy+batching | gpt-5.6-sol | standard | low | ten-turn-growing-session | 2 | 35060 | 11 | 537411 | 152 | 0 | 0 | 7283 | 7300 | 17553 | 93952 | 0 | 0 |
+| proxy+batching | gpt-5.6-sol | standard | low | ten-turn-growing-session | 3 | 30580 | 11 | 537411 | 152 | 0 | 0 | 8248 | 8270 | 8593 | 102912 | 0 | 0 |
+| proxy+batching | gpt-5.6-sol | standard | low | ten-turn-growing-session | 4 | 37560 | 11 | 537411 | 152 | 0 | 0 | 12350 | 12406 | 17553 | 93952 | 0 | 0 |
+| proxy+batching | gpt-5.6-sol | standard | low | ten-turn-growing-session | 5 | 30870 | 11 | 537411 | 152 | 0 | 0 | 6959 | 6997 | 27537 | 83968 | 0 | 0 |
 
 ## Median comparison
 
@@ -82,6 +93,7 @@ latencies across workloads with different request counts.
 | short-no-tools | 2770 | 2960 | 1.07x | No material transport-only gap | None |
 | eight-independent-files | 19120 | 28800 | 1.51x | Grok selected-model calls: 9; native diagnostic run batched reads into 3 shell calls | Tool-round-trip |
 | eight-independent-files + batching | 19120 | 21080 | 1.10x | Grok selected-model calls: 9 → 3; proxy wall: -26.8% | Gate passed |
+| ten-turn-growing-session | 39230 | 33310 | 0.85x | Proxy body: 43.6K → 63.3K bytes; cache reads became healthy and first-chunk latency had no rising trend | Continuation not selected |
 
 ## Decision gates
 
@@ -95,5 +107,14 @@ latencies across workloads with different request counts.
 The first selected gate is tool-round-trip batching. The opt-in instruction
 reduced the matched proxy workload median from 28.80 seconds to 21.08 seconds,
 with all five runs returning the requested eight summaries and no observed
-retry candidates. The next unmeasured gates remain the dependent ten-step
-loop, a ten-turn growing session, and Goal/subagent cache lineage.
+retry candidates.
+
+The continuation gate is not selected. Across five growing-session runs, the
+proxy median was 33.31 seconds versus 39.23 seconds for native headless resume.
+Although the proxy uploaded the full transcript and its request body grew by
+about 45%, `proxy_prepare_ms` stayed at zero, cache reads became healthy, and
+first-chunk latency showed no monotonic increase. The native comparison starts
+a new CLI process for every resumed turn, so these totals do not establish an
+interactive Codex transport advantage; they only show that WebSocket state is
+not the next measured proxy bottleneck. The remaining unmeasured gates are the
+dependent ten-step loop and Goal/subagent cache lineage.
