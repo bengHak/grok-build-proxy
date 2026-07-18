@@ -480,18 +480,17 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     .find(|v| valid_header(v))
     .unwrap_or(&request_id)
     .to_owned();
-    if transformed.provider == Provider::Kimi {
-        if let Err(error_message) = kimi::request::translate_request(&transformed.body, &session_id)
-        {
-            return with_request_id(
-                error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    error_message.to_string(),
-                ),
-                &request_id,
-            );
-        }
+    if transformed.provider == Provider::Kimi
+        && let Err(error_message) = kimi::request::translate_request(&transformed.body, &session_id)
+    {
+        return with_request_id(
+            error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                error_message.to_string(),
+            ),
+            &request_id,
+        );
     }
     let started = std::time::Instant::now();
     let mut base_event = RequestEvent {

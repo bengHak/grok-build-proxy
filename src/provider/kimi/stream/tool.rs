@@ -4,6 +4,9 @@ use super::{Output, Translator, frame::event_bytes};
 
 impl Translator {
     pub(super) fn tool_delta(&mut self, tool: &Value) -> Vec<u8> {
+        if self.terminal {
+            return Vec::new();
+        }
         let slot = tool.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         let index = if let Some(index) = self.tool_indexes.get(&slot) {
             *index
@@ -13,14 +16,20 @@ impl Translator {
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
             else {
-                return Vec::new();
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi returned a function call without an id"
+                }));
             };
             let Some(name) = tool
                 .pointer("/function/name")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
             else {
-                return Vec::new();
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi returned a function call without a name"
+                }));
             };
             let index = self.allocate(Output::Tool {
                 id: format!("fc_{call_id}"),
