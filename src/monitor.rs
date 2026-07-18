@@ -266,15 +266,15 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
     loop {
         let snapshot = dashboard.snapshot();
         render(&snapshot, address, version, &view)?;
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                let count = snapshot.sessions.len()
-                    + snapshot.active.len()
-                    + snapshot.recent.len()
-                    + snapshot.errors.len();
-                if view.handle(key, count) {
-                    return Ok(());
-                }
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            let count = snapshot.sessions.len()
+                + snapshot.active.len()
+                + snapshot.recent.len()
+                + snapshot.errors.len();
+            if view.handle(key, count) {
+                return Ok(());
             }
         }
         tokio::task::yield_now().await;

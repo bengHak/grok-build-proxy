@@ -205,14 +205,12 @@ impl CredentialProvider for Store {
             .and_then(Value::as_str)
             .unwrap_or("")
             .is_empty()
-        {
-            if let Some(id) = tokens
+            && let Some(id) = tokens
                 .get("id_token")
                 .and_then(Value::as_str)
                 .and_then(account_id_from_jwt)
-            {
-                tokens.insert("account_id".into(), id.into());
-            }
+        {
+            tokens.insert("account_id".into(), id.into());
         }
         doc.insert("tokens".into(), Value::Object(tokens.clone()));
         doc.insert(

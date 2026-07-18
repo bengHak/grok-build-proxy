@@ -169,20 +169,19 @@ impl Assembler {
         if matches!(
             typ.as_str(),
             "response.created" | "response.in_progress" | "response.queued"
-        ) {
-            if let Some(response) = event.get_mut("response") {
-                normalize_response(
-                    response,
-                    &self.response_id,
-                    &self.model,
-                    if typ == "response.created" {
-                        "in_progress"
-                    } else {
-                        typ.trim_start_matches("response.")
-                    },
-                );
-                self.snapshot = Some(response.clone());
-            }
+        ) && let Some(response) = event.get_mut("response")
+        {
+            normalize_response(
+                response,
+                &self.response_id,
+                &self.model,
+                if typ == "response.created" {
+                    "in_progress"
+                } else {
+                    typ.trim_start_matches("response.")
+                },
+            );
+            self.snapshot = Some(response.clone());
         }
 
         let compatible: &[&str] =
@@ -775,10 +774,10 @@ impl StreamNormalizer {
             let frame = std::mem::take(&mut self.pending);
             self.process_frame(&frame)
         };
-        if !self.assembler.terminal {
-            if let Some(terminal) = self.assembler.synthetic_terminal() {
-                output.extend(encode(&terminal).into_bytes());
-            }
+        if !self.assembler.terminal
+            && let Some(terminal) = self.assembler.synthetic_terminal()
+        {
+            output.extend(encode(&terminal).into_bytes());
         }
         output
     }

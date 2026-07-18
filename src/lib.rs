@@ -2,6 +2,7 @@ pub mod auth;
 pub mod catalog;
 pub mod codexcli;
 pub mod doctor;
+pub mod grokconfig;
 pub mod modelmap;
 pub mod monitor;
 pub mod proxy;

@@ -237,7 +237,7 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
     }
     let base = routes.clone();
     for r in base {
-        if !r.fast && !r.id.ends_with("-fast") && supports_fast(&r.target) {
+        if !r.fast && !r.id.ends_with("-fast") && crate::catalog::supports_fast(&r.target) {
             let route = Route {
                 id: format!("{}-fast", r.id),
                 target: r.target,
@@ -263,9 +263,6 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
         value
     }).collect();
     Json(json!({"object":"list","data":data})).into_response()
-}
-fn supports_fast(id: &str) -> bool {
-    id.starts_with("gpt-5.6-") || id == "gpt-5.5"
 }
 
 #[derive(Debug)]
@@ -362,15 +359,17 @@ fn apply_responses_lite(body: &mut Map<String, Value>) {
         Some(v) => vec![v],
     };
     let mut prefix = Vec::new();
-    if let Some(Value::Array(tools)) = body.remove("tools") {
-        if !tools.is_empty() {
-            prefix.push(json!({"type":"additional_tools","role":"developer","tools":tools}));
-        }
+    if let Some(Value::Array(tools)) = body.remove("tools")
+        && !tools.is_empty()
+    {
+        prefix.push(json!({"type":"additional_tools","role":"developer","tools":tools}));
     }
-    if let Some(Value::String(i)) = body.remove("instructions") {
-        if !i.trim().is_empty() {
-            prefix.push(json!({"type":"message","role":"developer","content":[{"type":"input_text","text":i}]}));
-        }
+    if let Some(Value::String(i)) = body.remove("instructions")
+        && !i.trim().is_empty()
+    {
+        prefix.push(
+            json!({"type":"message","role":"developer","content":[{"type":"input_text","text":i}]}),
+        );
     }
     prefix.append(&mut normalized);
     body.insert("input".into(), prefix.into());
@@ -815,13 +814,13 @@ fn copy_headers(dst: &mut HeaderMap, src: &reqwest::header::HeaderMap) {
         "set-cookie",
     ];
     for (k, v) in src {
-        if !skip.contains(&k.as_str()) {
-            if let (Ok(name), Ok(value)) = (
+        if !skip.contains(&k.as_str())
+            && let (Ok(name), Ok(value)) = (
                 HeaderName::from_bytes(k.as_str().as_bytes()),
                 HeaderValue::from_bytes(v.as_bytes()),
-            ) {
-                dst.append(name, value);
-            }
+            )
+        {
+            dst.append(name, value);
         }
     }
 }
@@ -913,10 +912,10 @@ fn normalize_sse_old(input: &[u8], mode: CompatMode, model: &str, request_id: &s
                 }
             }
             "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
-                if mode == CompatMode::Full {
-                    if let Some(d) = event.get("delta").and_then(Value::as_str) {
-                        args.entry(idx).or_default().push_str(d)
-                    }
+                if mode == CompatMode::Full
+                    && let Some(d) = event.get("delta").and_then(Value::as_str)
+                {
+                    args.entry(idx).or_default().push_str(d)
                 }
             }
             "response.completed" => {

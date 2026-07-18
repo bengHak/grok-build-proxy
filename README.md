@@ -35,35 +35,40 @@ that can use the selected Codex model.
    grok-build-proxy auth login
    ```
 
-4. Add this configuration to `~/.grok/config.toml`:
+4. Add a proxy-backed model to `~/.grok/config.toml`:
 
-   ```toml
-   [models]
-   default_reasoning_effort = "xhigh"
-
-   [model.codex-sol]
-   model = "gpt-5.6-sol"
-   name = "Codex GPT-5.6 Sol"
-   base_url = "http://127.0.0.1:18765/v1"
-   api_backend = "responses"
-   api_key = "unused"
-   context_window = 372000
-   supports_reasoning_effort = true
-   reasoning_efforts = ["low", "medium", "high", "xhigh"]
+   ```sh
+   grok-build-proxy models add codex-sol --model gpt-5.6-sol
    ```
 
-   When `[models]` already exists, add only the
-   `default_reasoning_effort = "xhigh"` key to that table. TOML does not allow
-   the same table to be declared twice. The shown `api_key = "unused"` assumes
-   client-token authentication is disabled. If it is enabled, set `api_key` in
-   each proxy-backed model entry to the configured local proxy token so Grok
-   sends it as the bearer credential.
+   The command shows a redacted change plan and asks before writing. It
+   preserves existing comments and unrelated settings, creates a backup, and
+   replaces the file atomically. For scripts, inspect with `--dry-run`, then
+   apply with `--yes`.
 
-5. Validate the local setup:
+   To install the complete built-in catalog, including supported priority-tier
+   variants, run:
+
+   ```sh
+   grok-build-proxy models sync --include-fast
+   ```
+
+   When client-token authentication is enabled, prefer the environment variable
+   so the token does not enter shell history:
+
+   ```sh
+   GROK_BUILD_PROXY_TOKEN='local-proxy-token' \
+     grok-build-proxy models add codex-sol --model gpt-5.6-sol
+   ```
+
+5. Validate the local configuration and authentication:
 
    ```sh
    grok-build-proxy doctor
    ```
+
+   After starting the proxy in the next step, `grok-build-proxy models status`
+   also checks health, readiness, advertised routes, and metadata.
 
 6. Start the proxy:
 
@@ -101,6 +106,42 @@ grok-build-proxy serve --no-monitor
 ```
 
 Non-interactive output automatically keeps the existing plain-log behavior.
+
+## Model configuration management
+
+```sh
+# Show configured proxy models or all available Codex targets.
+grok-build-proxy models list
+grok-build-proxy models list --available
+
+# Add, update, switch service tier, and remove one model.
+grok-build-proxy models add codex-sol --model gpt-5.6-sol
+grok-build-proxy models update codex-sol --model gpt-5.6-terra
+grok-build-proxy models update codex-sol --fast
+grok-build-proxy models update codex-sol --no-fast
+grok-build-proxy models remove codex-sol
+
+# Safely upsert the catalog. Deletion is opt-in and only affects entries
+# explicitly marked as managed by this proxy.
+grok-build-proxy models sync
+grok-build-proxy models sync --include-fast
+grok-build-proxy models sync --include-fast --prune
+
+# Check TOML fields, proxy health/readiness, and advertised model metadata.
+grok-build-proxy models status
+grok-build-proxy models status codex-sol --json
+```
+
+All mutating commands preview changes and default to No. Non-interactive use
+requires `--yes`; `--dry-run` never writes. Existing files receive a sibling
+backup before atomic replacement. Output and JSON never include the configured
+client token.
+
+`--fast` stores a `-fast` target. The proxy translates that route to Codex's
+`service_tier = "priority"`; support currently covers GPT-5.6 variants and
+GPT-5.5. Availability and usage impact still depend on the ChatGPT account and
+workspace policy. `models status` verifies the local advertised route, not an
+upstream paid inference request or account entitlement.
 
 ## Reasoning effort selection
 
@@ -253,8 +294,10 @@ export GROK_BUILD_PROXY_MODEL_MAP='grok-build=gpt-5.6-terra,grok-4.5=gpt-5.6-sol
 grok-build-proxy --print-grok-config > /tmp/grok-build-proxy-models.toml
 ```
 
-Review and merge the generated blocks into `~/.grok/config.toml`, then start the
-proxy with the same environment variable. The source must be the exact model ID
+`--print-grok-config` remains available for manual review and compatibility.
+For direct catalog installation, prefer `grok-build-proxy models sync`. Review
+and merge manually generated mapping blocks into `~/.grok/config.toml`, then
+start the proxy with the same environment variable. The source must be the exact model ID
 shown by `grok models`, not only its display name.
 
 Mappings can chain. A `-fast` suffix on a source or target selects the final base
