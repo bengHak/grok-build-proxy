@@ -657,6 +657,16 @@ mod tests {
     }
 
     #[test]
+    fn readme_documents_default_failure_ring_configuration() {
+        let readme = include_str!("../README.md");
+        let d = Dashboard::new();
+        assert_eq!(lock_state(&d.inner).failure_cap, DEFAULT_FAILURE_CAP);
+        assert!(readme.contains("`GROK_BUILD_PROXY_FAILURE_CAP`"));
+        assert!(readme.contains("keeps the latest 200 records by default"));
+        assert!(readme.contains("positive integer"));
+    }
+
+    #[test]
     fn failure_ring_respects_cap() {
         let d = Dashboard::with_failure_cap(5);
         for i in 0..12 {

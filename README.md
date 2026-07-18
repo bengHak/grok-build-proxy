@@ -15,9 +15,10 @@ subagents, context, and session state.
 
 ## Quick start
 
-Requirements: macOS and Grok Build. The Codex path additionally needs the
-official `codex` CLI and a ChatGPT account with model access; the Kimi path needs
-a Kimi Code membership and API key.
+Requirements: Grok Build and macOS on Apple Silicon or Intel. The Codex path
+additionally needs the official `codex` CLI and a ChatGPT account with model
+access. The preferred Kimi path needs a Kimi Code membership and API key;
+device-code OAuth remains available as a compatibility fallback.
 
 | | Codex | Kimi K3 (recommended Kimi path) |
 |---|---|---|
@@ -33,6 +34,11 @@ a Kimi Code membership and API key.
    ```sh
    curl -fsSL https://raw.githubusercontent.com/bengHak/grok-build-proxy/main/install.sh | sh
    ```
+
+   The installer requires `curl`, `tar`, and `shasum`. If a release asset is
+   unavailable, it falls back to a source build, which requires Rust/Cargo 1.88
+   or newer. Download `install.sh` and run `sh install.sh --help` for version,
+   install-directory, and source-build controls.
 
 2. Add the default install directory to `PATH` when necessary:
 
@@ -65,13 +71,16 @@ a Kimi Code membership and API key.
    grok-build-proxy models sync --include-fast
    ```
 
-   When client-token authentication is enabled, prefer the environment variable
-   so the token does not enter shell history:
+   When client-token authentication is enabled, pass the local proxy token
+   through the environment rather than a command-line flag or config file:
 
    ```sh
-   GROK_BUILD_PROXY_TOKEN='local-proxy-token' \
+   GROK_BUILD_PROXY_TOKEN="$LOCAL_PROXY_TOKEN" \
      grok-build-proxy models add codex-sol --model gpt-5.6-sol
    ```
+
+   Populate `LOCAL_PROXY_TOKEN` with a shell-history-safe mechanism; typing a
+   literal assignment can still record the token in shell history.
 
 5. Validate the local configuration and authentication:
 
@@ -123,13 +132,16 @@ supports_reasoning_effort = true
 reasoning_efforts = ["low", "high", "xhigh"]
 ```
 
-Pass the API key through the environment so it does not enter shell history,
-start the proxy, and select K3 in Grok Build:
+Pass the API key through the environment rather than a command-line flag or
+config file, start the proxy, and select K3 in Grok Build:
 
 ```sh
-GROK_BUILD_PROXY_KIMI_API_KEY='your-kimi-code-api-key' grok-build-proxy serve
+GROK_BUILD_PROXY_KIMI_API_KEY="$KIMI_CODE_API_KEY" grok-build-proxy serve
 grok -m kimi-k3
 ```
+
+Populate `KIMI_CODE_API_KEY` with a shell-history-safe mechanism; typing a
+literal assignment can still record the key in shell history.
 
 Grok's `xhigh` effort maps to K3's `max`; `medium` and `high` both map to K3's
 `high`. `kimi-for-coding` remains available as the 256K Kimi K2.7 Code fallback:
@@ -137,6 +149,14 @@ Grok's `xhigh` effort maps to K3's `max`; `medium` and `high` both map to K3's
 ```sh
 grok-build-proxy models add kimi-kimi-for-coding --model kimi-for-coding
 ```
+
+K2.7 advertises `low`, `medium`, and `high`; direct `xhigh` or `max` values map
+to `high`, while other unrecognized effort values currently fall back to
+`medium`. Legacy model IDs `kimi-k2.6` and `k2.6` also route to
+`kimi-for-coding`. Kimi requests default to and are capped at 32,000 output
+tokens. Both streaming and non-streaming Responses requests are supported;
+function tools are supported, but Responses custom tools are rejected rather
+than translated.
 
 For compatibility, the existing device-code OAuth flow remains available when
 `GROK_BUILD_PROXY_KIMI_API_KEY` is not set:
@@ -156,7 +176,9 @@ preview, plus that session's active and recent turns), a metrics strip (`tok/s` 
 1 Hz sparkline history; rolling `fail%` and completion-outcome sparklines —
 distinct from the header `err●N` failure-ring count), and a failures panel
 classified from real proxy traffic. Prompt/path previews are sanitized, capped at
-256 characters, and kept only in the in-memory monitor store.
+256 characters, and kept only in the in-memory monitor store. The failure ring
+keeps the latest 200 records by default; set `GROK_BUILD_PROXY_FAILURE_CAP` to a
+positive integer to change that in-memory limit.
 
 **Keybindings**
 
@@ -179,7 +201,8 @@ terminal is too short to keep the body panels usable.
 **Failure report export**
 
 - Path: `~/.grok/proxy-reports/failure-YYYYMMDD-HHMMSS.md` (or `.json` with
-  `W` / `Y`). The directory is created with mode `0700` and files with `0600`.
+  `W`; `Y` copies JSON to the clipboard). The directory is created with mode
+  `0700` and files with `0600`.
 - Contents: selected `FailureRecord` metadata only; diagnostic error messages,
   prompts, response bodies, and credentials are omitted. See
   [`SECURITY.md`](SECURITY.md).
@@ -211,12 +234,14 @@ Non-interactive output automatically keeps the existing plain-log behavior.
 ## Model configuration management
 
 ```sh
-# Show configured proxy models or all available Codex and Kimi targets.
+# Show configured proxy models or targets in the selected local catalog.
 grok-build-proxy models list
+grok-build-proxy models list --json
 grok-build-proxy models list --available
 
 # Add, update, switch service tier, and remove one model.
 grok-build-proxy models add codex-sol --model gpt-5.6-sol
+grok-build-proxy models add my-sol --model gpt-5.6-sol --name "My Codex" --fast
 grok-build-proxy models add kimi-kimi-for-coding --model kimi-for-coding
 grok-build-proxy models update codex-sol --model gpt-5.6-terra
 grok-build-proxy models update codex-sol --fast
@@ -231,13 +256,22 @@ grok-build-proxy models sync --include-fast --prune
 
 # Check TOML fields, proxy health/readiness, and advertised model metadata.
 grok-build-proxy models status
-grok-build-proxy models status codex-sol --json
+grok-build-proxy models status codex-sol --json --timeout 10
 ```
+
+`models list --available` reads the selected local catalog; it does not query
+upstream account entitlement. The built-in catalog is `gpt-5.6-sol`,
+`gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.5`, `gpt-5.2`, `k3`, and
+`kimi-for-coding`. A nonempty `--models` or `GROK_BUILD_PROXY_MODELS` value
+replaces that catalog. Unknown IDs use generic Codex metadata: 272K context and
+no reasoning-effort capability.
 
 All mutating commands preview changes and default to No. Non-interactive use
 requires `--yes`; `--dry-run` never writes. Existing files receive a sibling
 backup before atomic replacement. Output and JSON never include the configured
-client token.
+client token. `--grok-config`, `--listen`, `--client-token`, and `--models` are
+global options for the `models` command and can be placed before or after its
+subcommand.
 
 `--fast` stores a `-fast` target. The proxy translates that route to Codex's
 `service_tier = "priority"`; support currently covers GPT-5.6 variants and
@@ -252,10 +286,11 @@ that selection for the current session. The proxy preserves each request's
 `reasoning.effort` on both `POST /v1/responses` and `POST /responses`; it does
 not force a global effort value.
 
-Capable models advertise `low`, `medium`, `high`, and `xhigh`. Codex also has
-`max` and `ultra` levels, but they are not exposed because the current Grok Build
-wire contract cannot represent them as distinct values. The proxy does not
-silently map them to another level.
+Capable Codex models advertise `low`, `medium`, `high`, and `xhigh`; K3
+advertises `low`, `high`, and `xhigh`, while K2.7 advertises `low`, `medium`, and
+`high`. Codex also has `max` and `ultra` levels, but they are not exposed because
+the current Grok Build wire contract cannot represent them as distinct values.
+The proxy does not silently map them to another level.
 
 Capability metadata appears on both `GET /v1/models` and `GET /models`.
 Canonical catalog routes, configured model-map aliases, and eligible generated
@@ -272,20 +307,22 @@ key is available, the proxy omits both `prompt_cache_key` and
 `x-session-affinity` rather than manufacturing one.
 
 `session-id`, `thread-id`, and (when the client sends `client_metadata`)
-`client_metadata.session_id` and `client_metadata.thread_id` retain the stable
-`x-grok-session-id` thread identity, falling back to the conversation ID only
-when no session ID is present. `x-session-affinity` is deliberately allowed to
-carry the separate cache key because it is a routing hint;
-`x-client-request-id` preserves the incoming request ID. Public Grok Build does
-not send a cache-lineage header, so none is supported here.
+`client_metadata.session_id` and `client_metadata.thread_id` use
+`x-grok-session-id`, then `x-grok-conv-id`, then the incoming request ID, and
+finally the proxy-generated request ID. Only the stable session and conversation
+identities are eligible as fallback cache keys. `x-session-affinity` is
+deliberately allowed to carry the separate cache key because it is a routing
+hint; `x-client-request-id` preserves the incoming request ID. Public Grok Build
+does not send a cache-lineage header, so none is supported here.
 
-Client cache policy fields pass through only when they match current OpenAI
-semantics. `prompt_cache_key` must be a string of at most 64 characters.
-GPT-5.6 models accept `prompt_cache_options.mode` values `implicit`
+On Codex routes, client cache policy fields pass through only when they match
+current OpenAI semantics. `prompt_cache_key` must be a string of at most 64
+characters. GPT-5.6 models accept `prompt_cache_options.mode` values `implicit`
 or `explicit` and only the `30m` TTL. GPT-5.5 models accept only the `24h`
 `prompt_cache_retention`; older models may accept `in_memory` or `24h`. The
 proxy does not invent policy defaults, and returns `400 invalid_request_error`
-for malformed or model-incompatible combinations.
+for malformed or model-incompatible combinations. Kimi uses only the resolved
+prompt-cache key as session affinity.
 
 When terminal usage is available, plain logs include `input_tokens`,
 `cached_input_tokens`, `cache_write_tokens`, `fresh_input_tokens`, and
@@ -354,6 +391,7 @@ GROK_BUILD_PROXY_RESPONSES_COMPAT=text grok-build-proxy
 ## Authentication and diagnostics
 
 ```sh
+grok-build-proxy --version
 grok-build-proxy auth login
 grok-build-proxy auth device
 grok-build-proxy auth status
@@ -442,10 +480,13 @@ grok-build-proxy --print-grok-config > /tmp/grok-build-proxy-models.toml
 ```
 
 `--print-grok-config` remains available for manual review and compatibility.
-For direct catalog installation, prefer `grok-build-proxy models sync`. Review
-and merge manually generated mapping blocks into `~/.grok/config.toml`, then
-start the proxy with the same environment variable. The source must be the exact model ID
-shown by `grok models`, not only its display name.
+For direct catalog installation, prefer `grok-build-proxy models sync`. The
+legacy output always uses `api_key = "unused"`; when client-token authentication
+is enabled, replace it with the local proxy token, or use `models add`/`sync`,
+which populate it automatically. Review and merge manually generated mapping
+blocks into `~/.grok/config.toml`, then start the proxy with the same environment
+variable. The source must be the exact model ID shown by `grok models`, not only
+its display name.
 
 Mappings can chain. For eligible Codex targets, a `-fast` suffix on a source or
 target selects the final base model with `service_tier = "priority"`. Duplicate
@@ -465,12 +506,13 @@ sources, self-maps, and cycles are rejected before the server starts.
 | `--kimi-auth-file` | `GROK_BUILD_PROXY_KIMI_AUTH_FILE` | `~/.grok-build-proxy/kimi/auth.json` |
 | `--kimi-upstream` | `GROK_BUILD_PROXY_KIMI_UPSTREAM` | Kimi coding Chat Completions endpoint |
 | `--kimi-oauth-host` | `GROK_BUILD_PROXY_KIMI_OAUTH_HOST` | `https://auth.kimi.com` |
-| `--models` | `GROK_BUILD_PROXY_MODELS` | built-in catalog |
+| `--models` | `GROK_BUILD_PROXY_MODELS` | built-in catalog; a nonempty comma-separated value replaces it |
 | `--model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | empty |
 | `--codex-compat-version` | `GROK_BUILD_PROXY_CODEX_COMPAT_VERSION` | `0.144.0` |
 | — | `GROK_BUILD_PROXY_RESPONSES_COMPAT` | `full` (`full`, `text`, or `off`) |
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
+| — | `GROK_BUILD_PROXY_FAILURE_CAP` | `200`; positive integer limiting in-memory failure records |
 | `--no-monitor` | — | auto-enable monitor on an interactive terminal |
 | `--print-grok-config` | — | print model blocks and exit |
 
@@ -483,6 +525,8 @@ sources, self-maps, and cycles are rejected before the server starts.
 |---|---|---|
 | Dedicated Codex home | `--codex-home`, `GROK_BUILD_PROXY_CODEX_HOME`, or `CODEX_HOME` | `~/.codex-grok-build-proxy` |
 | Codex executable | `--codex-binary`, `GROK_BUILD_PROXY_CODEX_BINARY` | `codex` |
+| Kimi auth file | `--auth-file` (Kimi auth), `GROK_BUILD_PROXY_KIMI_AUTH_FILE` | `~/.grok-build-proxy/kimi/auth.json` |
+| Kimi OAuth host | `--oauth-host`, `GROK_BUILD_PROXY_KIMI_OAUTH_HOST` | `https://auth.kimi.com` |
 | Grok executable (doctor) | `--grok-binary`, `GROK_BUILD_PROXY_GROK_BINARY` | `grok` |
 | Grok config (doctor) | `--grok-config`, `GROK_BUILD_PROXY_GROK_CONFIG` | `~/.grok/config.toml` |
 | Doctor timeout | `--timeout` | 5 seconds |
@@ -528,6 +572,9 @@ default loopback binding whenever possible.
   `--listen` and the Grok `base_url`.
 
 ## Development and release
+
+Development requires Rust 1.88 or newer. `make dist` additionally requires
+`rustup` and the Apple Silicon and Intel macOS targets.
 
 ```sh
 git clone https://github.com/bengHak/grok-build-proxy.git

@@ -43,6 +43,52 @@ fn config_output_uses_real_catalog_and_requested_address() {
 }
 
 #[test]
+fn readme_core_cli_reference_matches_help() {
+    let readme = include_str!("../README.md");
+    let cases: &[(&[&str], &[&str])] = &[
+        (
+            &["--help"],
+            &["serve", "auth", "kimi", "doctor", "models", "version"],
+        ),
+        (
+            &["serve", "--help"],
+            &[
+                "--listen",
+                "--kimi-api-key",
+                "--client-token",
+                "--no-monitor",
+                "--print-grok-config",
+            ],
+        ),
+        (
+            &["models", "add", "--help"],
+            &["--model", "--name", "--fast", "--yes", "--dry-run"],
+        ),
+        (&["models", "list", "--help"], &["--available", "--json"]),
+        (&["models", "status", "--help"], &["--json", "--timeout"]),
+    ];
+
+    for (args, documented) in cases {
+        let output = binary().args(*args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "`grok-build-proxy {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let help = String::from_utf8(output.stdout).unwrap();
+        for item in *documented {
+            assert!(
+                help.contains(item),
+                "{item} missing from `{}`",
+                args.join(" ")
+            );
+            assert!(readme.contains(item), "{item} missing from README.md");
+        }
+    }
+}
+
+#[test]
 fn kimi_auth_status_reads_the_selected_auth_file() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("kimi-auth.json");
