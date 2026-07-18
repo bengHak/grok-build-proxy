@@ -241,19 +241,55 @@ pub async fn run_full(
     match client.get(format!("{base}/healthz")).send().await {
         Ok(response) => match response.json::<Value>().await {
             Ok(body) if body.get("service").and_then(Value::as_str) == Some("grok-build-proxy") => {
-                let mut request = client.get(format!("{base}/readyz"));
-                if !client_token.trim().is_empty() {
-                    request = request.bearer_auth(client_token.trim());
+                let mut providers = Vec::new();
+                if required_codex {
+                    providers.push("codex");
                 }
-                match request.send().await {
-                    Ok(response) if response.status().is_success() => {
-                        checks.push(Check::pass("Proxy readiness", format!("ready at {base}")))
+                if required_kimi {
+                    providers.push("kimi");
+                }
+                if providers.is_empty() {
+                    providers.push("");
+                }
+                let mut failures = Vec::new();
+                for provider in &providers {
+                    let url = if provider.is_empty() {
+                        format!("{base}/readyz")
+                    } else {
+                        format!("{base}/readyz?provider={provider}")
+                    };
+                    let mut request = client.get(url);
+                    if !client_token.trim().is_empty() {
+                        request = request.bearer_auth(client_token.trim());
                     }
-                    Ok(response) => checks.push(Check::fail(
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => {}
+                        Ok(response) => failures.push(format!(
+                            "{} readiness returned HTTP {}",
+                            if provider.is_empty() {
+                                "proxy"
+                            } else {
+                                provider
+                            },
+                            response.status()
+                        )),
+                        Err(error) => failures.push(format!(
+                            "{} readiness: {error}",
+                            if provider.is_empty() {
+                                "proxy"
+                            } else {
+                                provider
+                            }
+                        )),
+                    }
+                }
+                if failures.is_empty() {
+                    checks.push(Check::pass(
                         "Proxy readiness",
-                        format!("readiness returned HTTP {}", response.status()),
-                    )),
-                    Err(error) => checks.push(Check::fail("Proxy readiness", error.to_string())),
+                        format!("ready at {base} ({})", providers.join(", ")),
+                    ));
+                } else {
+                    checks.push(Check::fail("Proxy readiness", failures.join("; ")));
                 }
             }
             _ => checks.push(Check::fail(
@@ -412,5 +448,74 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "ChatGPT auth" && !check.ok)
         );
+    }
+
+    #[tokio::test]
+    async fn mapped_kimi_doctor_checks_live_kimi_readiness() {
+        use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+        use serde_json::json;
+        use std::collections::HashMap;
+
+        let app = Router::new()
+            .route(
+                "/healthz",
+                get(|| async { Json(json!({"service":"grok-build-proxy"})) }),
+            )
+            .route(
+                "/readyz",
+                get(|Query(query): Query<HashMap<String, String>>| async move {
+                    let status = if query.get("provider").map(String::as_str) == Some("kimi") {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    };
+                    (status, Json(json!({"ok":status.is_success()})))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let kimi_auth = directory.path().join("kimi-auth.json");
+        let grok_config = directory.path().join("grok.toml");
+        tokio::fs::write(
+            &kimi_auth,
+            br#"{"access":"token","refresh":"refresh","expires":4102444800000}"#,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&kimi_auth, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            &grok_config,
+            format!(
+                "[model.kimi]\nmodel = \"mapped-kimi\"\nname = \"Mapped Kimi\"\nbase_url = \"http://{address}/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let checks = run_full(
+            &directory.path().join("missing-codex.json"),
+            Some(&kimi_auth),
+            &grok_config,
+            directory.path(),
+            &address.to_string(),
+            "",
+            "missing-codex",
+            "missing-grok",
+            "mapped-kimi=kimi-for-coding",
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(checks.iter().any(|check| {
+            check.name == "Proxy readiness" && !check.ok && check.detail.contains("kimi readiness")
+        }));
     }
 }
