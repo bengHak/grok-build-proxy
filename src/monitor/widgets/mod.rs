@@ -4,7 +4,7 @@ mod failures;
 mod footer;
 mod header;
 mod help;
-mod metrics;
+pub(crate) mod metrics;
 mod session_detail;
 mod sessions;
 
@@ -13,7 +13,7 @@ pub use footer::Footer;
 pub use header::Header;
 pub use help::HelpOverlay;
 pub use metrics::{MetricsStrip, fleet_avg_tok_s, should_show_metrics};
-pub use session_detail::{SessionDetailPanel, TurnKind};
+pub use session_detail::{SessionDetailPanel, TurnKind, format_session_tokens_line};
 pub use sessions::{SessionsPanel, active_sessions};
 
 /// Truncate a display string to `max` chars, appending `…` when needed.
