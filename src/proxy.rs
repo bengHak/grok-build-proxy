@@ -50,6 +50,17 @@ pub struct ProxyConfig {
 pub struct KimiConfig {
     pub upstream_url: String,
     pub credentials: Arc<kimi::auth::Store>,
+    pub api_key: String,
+}
+
+impl KimiConfig {
+    async fn ready(&self) -> Result<()> {
+        if self.api_key.trim().is_empty() {
+            self.credentials.get(false).await.map(|_| ())
+        } else {
+            Ok(())
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompatMode {
@@ -290,7 +301,7 @@ async fn ready(
         let result = match provider {
             "codex" => s.0.credentials.get(false).await.map(|_| ()),
             "kimi" => match &s.0.kimi {
-                Some(config) => config.credentials.get(false).await.map(|_| ()),
+                Some(config) => config.ready().await,
                 None => Err(anyhow!("Kimi provider is not configured")),
             },
             _ => {
@@ -312,7 +323,7 @@ async fn ready(
     }
     if let Some(config) = &s.0.kimi {
         let codex = s.0.credentials.get(false);
-        let kimi = config.credentials.get(false);
+        let kimi = config.ready();
         tokio::pin!(codex, kimi);
         let (codex_error, kimi_error) = tokio::select! {
             result = &mut codex => match result {
@@ -891,9 +902,10 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         && status.is_success()
         && (is_sse || transformed.stream);
     let translate_kimi = transformed.provider == Provider::Kimi && status.is_success();
+    let kimi_model = kimi::canonical_model(&transformed.model).unwrap_or(kimi::WIRE_MODEL);
     let body = if translate_kimi && transformed.stream {
         let mut source = upstream.bytes_stream();
-        let mut translator = kimi::stream::Translator::new(&request_id, kimi::WIRE_MODEL);
+        let mut translator = kimi::stream::Translator::new(&request_id, kimi_model);
         let observer = observer.clone();
         let event = base_event.clone();
         Body::from_stream(async_stream::stream! {
@@ -953,7 +965,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
                 );
             }
         };
-        let mut translator = kimi::stream::Translator::new(&request_id, kimi::WIRE_MODEL);
+        let mut translator = kimi::stream::Translator::new(&request_id, kimi_model);
         let mut capture = translator.push(&upstream_body);
         capture.extend(translator.finish());
         let response = translator.terminal_response().cloned().unwrap_or_else(|| {
@@ -961,7 +973,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
                 "id": request_id,
                 "object": "response",
                 "status": "failed",
-                "model": kimi::WIRE_MODEL,
+                "model": kimi_model,
                 "output": [],
                 "error": {"type":"upstream_error","message":"Kimi stream ended without a response"}
             })
@@ -1319,6 +1331,7 @@ async fn send_upstream(
             kimi::client::send(
                 &config.upstream_url,
                 &config.credentials,
+                &config.api_key,
                 &t.body,
                 identity.cache_key.as_deref(),
                 force,

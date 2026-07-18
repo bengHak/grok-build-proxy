@@ -60,6 +60,8 @@ struct ServeArgs {
     refresh_url: String,
     #[arg(long, env = "GROK_BUILD_PROXY_KIMI_AUTH_FILE")]
     kimi_auth_file: Option<PathBuf>,
+    #[arg(long, env = "GROK_BUILD_PROXY_KIMI_API_KEY", default_value = "")]
+    kimi_api_key: String,
     #[arg(long,env="GROK_BUILD_PROXY_KIMI_UPSTREAM",default_value=DEFAULT_KIMI_UPSTREAM)]
     kimi_upstream: String,
     #[arg(long,env="GROK_BUILD_PROXY_KIMI_OAUTH_HOST",default_value=DEFAULT_KIMI_OAUTH_HOST)]
@@ -108,6 +110,8 @@ struct DoctorArgs {
     auth_file: Option<PathBuf>,
     #[arg(long, env = "GROK_BUILD_PROXY_KIMI_AUTH_FILE")]
     kimi_auth_file: Option<PathBuf>,
+    #[arg(long, env = "GROK_BUILD_PROXY_KIMI_API_KEY", default_value = "")]
+    kimi_api_key: String,
     #[arg(long, env = "GROK_BUILD_PROXY_GROK_CONFIG")]
     grok_config: Option<PathBuf>,
     #[arg(long, env = "GROK_BUILD_PROXY_CODEX_BINARY", default_value = "codex")]
@@ -374,6 +378,7 @@ async fn serve(a: ServeArgs) -> Result<()> {
         kimi: Some(proxy::KimiConfig {
             upstream_url: a.kimi_upstream,
             credentials: kimi_store,
+            api_key: a.kimi_api_key.trim().to_owned(),
         }),
         catalog,
         model_map: mappings,
@@ -473,6 +478,7 @@ async fn doctor_command(a: DoctorArgs) -> Result<()> {
     let checks = doctor::run_full(
         &auth,
         Some(&kimi_auth),
+        &a.kimi_api_key,
         &config,
         &codex_home_path,
         &a.listen,

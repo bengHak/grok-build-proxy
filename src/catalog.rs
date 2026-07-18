@@ -52,21 +52,29 @@ fn reasoning(default: &str) -> ReasoningCapability {
 }
 
 fn known(id: &str) -> Option<Model> {
-    if kimi::is_model(id) {
+    if let Some(upstream_id) = kimi::canonical_model(id) {
+        let k3 = upstream_id == kimi::K3_MODEL;
+        let default_effort = if k3 { "xhigh" } else { "medium" };
         return Some(Model {
             id: id.into(),
-            upstream_id: kimi::WIRE_MODEL.into(),
+            upstream_id: upstream_id.into(),
             provider: Provider::Kimi,
-            display_name: "Kimi K2.6".into(),
+            display_name: if k3 { "Kimi K3" } else { "Kimi K2.7 Code" }.into(),
             description: "Kimi Code model for agentic coding.".into(),
             context_window: 256_000,
             responses_lite: false,
             reasoning: Some(ReasoningCapability {
-                default_effort: "medium".into(),
-                efforts: reasoning("medium")
+                default_effort: default_effort.into(),
+                efforts: reasoning(default_effort)
                     .efforts
                     .into_iter()
-                    .filter(|effort| effort.value != "xhigh")
+                    .filter(|effort| {
+                        if k3 {
+                            effort.value != "medium"
+                        } else {
+                            effort.value != "xhigh"
+                        }
+                    })
                     .collect(),
             }),
         });
@@ -143,7 +151,7 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn new(csv: &str) -> Self {
-        let defaults = "gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.2,kimi-for-coding";
+        let defaults = "gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.2,k3,kimi-for-coding";
         let source = if csv.trim().is_empty() { defaults } else { csv };
         let mut seen = HashSet::new();
         let mut models = HashMap::new();

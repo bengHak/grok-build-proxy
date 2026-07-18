@@ -34,8 +34,10 @@ fn config_output_uses_real_catalog_and_requested_address() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("model = \"gpt-5.6-sol\""));
+    assert!(text.contains("model = \"k3\""));
+    assert!(text.contains("name = \"Kimi K3\""));
     assert!(text.contains("model = \"kimi-for-coding\""));
-    assert!(text.contains("name = \"Kimi K2.6\""));
+    assert!(text.contains("name = \"Kimi K2.7 Code\""));
     assert!(text.contains("base_url = \"http://127.0.0.1:28765/v1\""));
     assert!(text.contains("reasoning_efforts = [\"low\", \"medium\", \"high\", \"xhigh\"]"));
 }
@@ -225,8 +227,9 @@ fn model_sync_preview_and_fast_selection_are_safe() {
     let text = fs::read_to_string(&config).unwrap();
     assert!(text.contains("[model.codex-sol-fast]"));
     assert!(text.contains("model = \"gpt-5.6-sol-fast\""));
+    assert!(text.contains("[model.kimi-k3]"));
     assert!(text.contains("[model.kimi-kimi-for-coding]"));
-    assert!(text.contains("name = \"Kimi K2.6\""));
+    assert!(text.contains("name = \"Kimi K2.7 Code\""));
 
     let available = binary()
         .args([

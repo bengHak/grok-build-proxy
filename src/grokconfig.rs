@@ -796,6 +796,7 @@ fn canonical_alias(model: &str) -> String {
         "gpt-5.6-sol" => "codex-sol".into(),
         "gpt-5.6-terra" => "codex-terra".into(),
         "gpt-5.6-luna" => "codex-luna".into(),
+        "k3" => "kimi-k3".into(),
         "kimi-for-coding" => "kimi-kimi-for-coding".into(),
         _ => format!("codex-{}", model.replace(['.', '_', '/'], "-")),
     }
@@ -958,7 +959,20 @@ mod tests {
     #[test]
     fn kimi_model_specs_use_kimi_metadata_and_aliases() {
         let catalog = Catalog::default();
-        let spec = model_spec(
+        let k3 = model_spec(
+            &catalog,
+            "kimi-k3",
+            "k3",
+            false,
+            "127.0.0.1:18765",
+            "",
+            None,
+        )
+        .unwrap();
+        assert_eq!(k3.name, "Kimi K3");
+        assert_eq!(k3.context_window, 256_000);
+
+        let coding = model_spec(
             &catalog,
             "kimi",
             "kimi-for-coding",
@@ -968,14 +982,17 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(spec.name, "Kimi K2.6");
-        assert!(spec.description.contains("via Kimi Coding API"));
+        assert_eq!(coding.name, "Kimi K2.7 Code");
+        assert!(coding.description.contains("via Kimi Coding API"));
 
         let (specs, _) = sync_specs(&catalog, "127.0.0.1:18765", "", false).unwrap();
         assert!(specs.iter().any(|spec| {
+            spec.alias == "kimi-k3" && spec.effective_model == "k3" && spec.name == "Kimi K3"
+        }));
+        assert!(specs.iter().any(|spec| {
             spec.alias == "kimi-kimi-for-coding"
                 && spec.effective_model == "kimi-for-coding"
-                && spec.name == "Kimi K2.6"
+                && spec.name == "Kimi K2.7 Code"
         }));
     }
 

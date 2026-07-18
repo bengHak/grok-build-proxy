@@ -70,6 +70,7 @@ async fn unscoped_readiness_returns_when_kimi_is_ready() {
         kimi: Some(KimiConfig {
             upstream_url: "http://127.0.0.1:9/chat/completions".into(),
             credentials: Arc::new(KimiStore::new(&auth_path, "http://127.0.0.1:9").unwrap()),
+            api_key: String::new(),
         }),
         catalog: Catalog::default(),
         model_map: ModelMap::default(),
@@ -97,6 +98,87 @@ async fn unscoped_readiness_returns_when_kimi_is_ready() {
     .expect("ready Kimi credentials must not wait for Codex")
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn kimi_k3_uses_api_key_without_cli_identity_headers() {
+    let capture = Capture::default();
+    let upstream = Router::new()
+        .route("/chat/completions", post(kimi_upstream))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    let directory = tempfile::tempdir().unwrap();
+    let app = router(ProxyConfig {
+        upstream_url: "http://127.0.0.1:9/responses".into(),
+        credentials: Arc::new(CodexCredentials),
+        kimi: Some(KimiConfig {
+            upstream_url: format!("http://{address}/chat/completions"),
+            credentials: Arc::new(
+                KimiStore::new(
+                    directory.path().join("missing-auth.json"),
+                    "http://127.0.0.1:9",
+                )
+                .unwrap(),
+            ),
+            api_key: "kimi-api-key".into(),
+        }),
+        catalog: Catalog::default(),
+        model_map: ModelMap::default(),
+        client: reqwest::Client::new(),
+        client_token: String::new(),
+        version: "test".into(),
+        compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+        responses_compat: CompatMode::Full,
+        observer: None,
+        max_body_bytes: 4096,
+    })
+    .unwrap();
+
+    let ready = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/readyz?provider=kimi")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"k3","input":"hello","reasoning":{"effort":"xhigh"},"stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body["model"], "k3");
+
+    let requests = capture.0.lock().await;
+    let (headers, request) = &requests[0];
+    assert_eq!(headers[header::AUTHORIZATION], "Bearer kimi-api-key");
+    assert_eq!(
+        headers[header::USER_AGENT],
+        format!("grok-build-proxy/{}", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(headers.get("x-msh-platform").is_none());
+    assert!(headers.get("x-msh-device-id").is_none());
+    assert_eq!(request["model"], "k3");
+    assert_eq!(request["reasoning_effort"], "max");
 }
 
 #[tokio::test]
@@ -144,6 +226,7 @@ async fn kimi_model_routes_to_chat_completions_and_translates_stream() {
         kimi: Some(KimiConfig {
             upstream_url: format!("http://{address}/chat/completions"),
             credentials: Arc::new(KimiStore::new(&auth_path, "http://127.0.0.1:9").unwrap()),
+            api_key: String::new(),
         }),
         catalog: Catalog::default(),
         model_map: ModelMap::default(),
@@ -332,6 +415,7 @@ async fn kimi_non_success_is_mapped_to_responses_error_contract() {
         kimi: Some(KimiConfig {
             upstream_url: format!("http://{address}/chat/completions"),
             credentials: Arc::new(KimiStore::new(&auth_path, "http://127.0.0.1:9").unwrap()),
+            api_key: String::new(),
         }),
         catalog: Catalog::default(),
         model_map: ModelMap::default(),

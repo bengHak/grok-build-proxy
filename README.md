@@ -3,20 +3,21 @@
 [![CI](https://github.com/bengHak/grok-build-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/bengHak/grok-build-proxy/actions/workflows/ci.yml)
 
 A macOS-only local proxy that lets Grok Build use Codex models available through
-your ChatGPT account or Kimi K2.6 through a Kimi account. Grok Build remains the
+your ChatGPT account or Kimi K3/K2.7 through a Kimi account. Grok Build remains the
 agent harness and owns prompts, tools, permissions, Plan mode, Goal mode,
 subagents, context, and session state.
 
 > [!WARNING]
 > This is an unofficial community project and is not affiliated with OpenAI,
-> ChatGPT, Codex, Moonshot AI, Kimi, xAI, or Grok. The private ChatGPT Codex and
-> Kimi coding backends can change without notice. Model access depends on your
+> ChatGPT, Codex, Moonshot AI, Kimi, xAI, or Grok. Upstream APIs and private
+> ChatGPT Codex contracts can change without notice. Model access depends on your
 > plan and workspace policy.
 
 ## Quick start
 
-Requirements: macOS, the official `codex` CLI, Grok Build, and a ChatGPT account
-that can use the selected Codex model.
+Requirements: macOS and Grok Build. The Codex path additionally needs the
+official `codex` CLI and a ChatGPT account with model access; the Kimi path needs
+a Kimi Code membership and API key.
 
 1. Install the latest release:
 
@@ -88,33 +89,52 @@ that can use the selected Codex model.
    The model picker surfaces effort choices for models that advertise this
    capability.
 
-### Kimi K2.6
+### Kimi K3
 
-Kimi uses its own device-code login and does not require the Codex CLI:
+K3 requires a Kimi Code API key and a Moderato plan or above. The proxy exposes
+the 256K context available to Moderato members; it does not currently advertise
+the Allegretto-only 1M context. Create a key in the [Kimi Code
+Console](https://www.kimi.com/code/console), then add the K3 model:
 
 ```sh
-grok-build-proxy kimi auth login
+grok-build-proxy models add kimi-k3 --model k3
 ```
 
-Add the generated Kimi block from `grok-build-proxy serve
---print-grok-config`, or add it directly:
+The generated Grok configuration is equivalent to:
 
 ```toml
-[model.kimi-kimi-for-coding]
-model = "kimi-for-coding"
-name = "Kimi K2.6"
+[model.kimi-k3]
+model = "k3"
+name = "Kimi K3"
 base_url = "http://127.0.0.1:18765/v1"
 api_backend = "responses"
 api_key = "unused"
 context_window = 256000
 supports_reasoning_effort = true
-reasoning_efforts = ["low", "medium", "high"]
+reasoning_efforts = ["low", "high", "xhigh"]
 ```
 
-Start the same proxy and select `kimi-kimi-for-coding` in Grok Build. Requests
-using `kimi-for-coding`, `kimi-k2.6`, or `k2.6` are sent to Kimi's coding Chat
-Completions endpoint and translated to the Responses API contract, including
-streamed reasoning, text, function calls, and usage.
+Pass the API key through the environment so it does not enter shell history,
+start the proxy, and select K3 in Grok Build:
+
+```sh
+GROK_BUILD_PROXY_KIMI_API_KEY='your-kimi-code-api-key' grok-build-proxy serve
+grok -m kimi-k3
+```
+
+Grok's `xhigh` effort maps to K3's `max`; `medium` and `high` both map to K3's
+`high`. `kimi-for-coding` remains available as the 256K Kimi K2.7 Code fallback:
+
+```sh
+grok-build-proxy models add kimi-kimi-for-coding --model kimi-for-coding
+```
+
+For compatibility, the existing device-code OAuth flow remains available when
+`GROK_BUILD_PROXY_KIMI_API_KEY` is not set:
+
+```sh
+grok-build-proxy kimi auth login
+```
 
 ### Serve monitor
 
@@ -329,6 +349,7 @@ grok-build-proxy auth login
 grok-build-proxy auth device
 grok-build-proxy auth status
 grok-build-proxy auth logout
+# Compatibility fallback when no Kimi Code API key is configured.
 grok-build-proxy kimi auth login
 grok-build-proxy kimi auth status
 grok-build-proxy kimi auth logout
@@ -339,9 +360,12 @@ The default dedicated Codex home is `~/.codex-grok-build-proxy`. The wrapper
 uses the official Codex CLI and configures file-backed credentials; it does not
 implement its own OAuth login UI.
 
-Kimi device OAuth uses `auth.kimi.com`. Credentials are stored in
-`~/.grok-build-proxy/kimi/auth.json`; the stable, non-secret device identifier
-is stored beside it. Both files are written with user-only permissions.
+The preferred Kimi path reads `GROK_BUILD_PROXY_KIMI_API_KEY` at startup and
+does not persist it. When present, the API key takes precedence over device
+OAuth. The compatibility device OAuth flow uses `auth.kimi.com` and stores
+credentials in `~/.grok-build-proxy/kimi/auth.json`; the stable, non-secret
+device identifier is stored beside it. Both files are written with user-only
+permissions.
 
 Useful health checks (these examples assume no client token is configured):
 
@@ -428,6 +452,7 @@ sources, self-maps, and cycles are rejected before the server starts.
 | `--auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | dedicated Codex home `auth.json` |
 | `--upstream` | `GROK_BUILD_PROXY_UPSTREAM` | ChatGPT Codex Responses endpoint |
 | `--refresh-url` | `GROK_BUILD_PROXY_REFRESH_URL` | OpenAI OAuth token endpoint |
+| `--kimi-api-key` | `GROK_BUILD_PROXY_KIMI_API_KEY` | empty; falls back to device OAuth |
 | `--kimi-auth-file` | `GROK_BUILD_PROXY_KIMI_AUTH_FILE` | `~/.grok-build-proxy/kimi/auth.json` |
 | `--kimi-upstream` | `GROK_BUILD_PROXY_KIMI_UPSTREAM` | Kimi coding Chat Completions endpoint |
 | `--kimi-oauth-host` | `GROK_BUILD_PROXY_KIMI_OAUTH_HOST` | `https://auth.kimi.com` |
@@ -453,7 +478,7 @@ sources, self-maps, and cycles are rejected before the server starts.
 | Grok config (doctor) | `--grok-config`, `GROK_BUILD_PROXY_GROK_CONFIG` | `~/.grok/config.toml` |
 | Doctor timeout | `--timeout` | 5 seconds |
 
-`doctor` also accepts `--auth-file`, `--kimi-auth-file`, `--listen`,
+`doctor` also accepts `--auth-file`, `--kimi-api-key`, `--kimi-auth-file`, `--listen`,
 `--model-map`, and `--client-token`, with the same environment variables shown
 in the Serve table. Codex-specific checks become warnings when secure Kimi
 credentials are available, and vice versa; insecure credential files remain
@@ -468,7 +493,10 @@ default loopback binding whenever possible.
 
 - `command not found`: ensure `$HOME/.local/bin` is in `PATH`.
 - `auth.json` missing: run `grok-build-proxy auth login`.
-- Kimi credentials missing or expired: run `grok-build-proxy kimi auth login`.
+- Kimi API key rejected: confirm the key in the Kimi Code Console and that the
+  account plan includes the selected model. K3 requires Moderato or above.
+- Compatibility OAuth credentials missing or expired: run `grok-build-proxy
+  kimi auth login`.
 - The same text answer or a Plan/Goal tool call is repeated: upgrade to `0.0.7`
   or newer. Proxy-generated failures now log `error_type`, `response_id`, output
   state count, and buffered state byte count without logging model content.
@@ -483,8 +511,8 @@ default loopback binding whenever possible.
   confirm `grok-build-proxy --version` reports `0.0.7` or newer. Do not share
   credentials, `auth.json`, or unreviewed logs.
 - Codex 401: run `grok-build-proxy auth status`, then log in again if required.
-- Kimi 401: run `grok-build-proxy kimi auth status`, then log in again if
-  required.
+- Kimi 401 with an API key: check the key and model entitlement. Without an API
+  key, run `grok-build-proxy kimi auth status`, then log in again if required.
 - Mapping has no effect: confirm the selected Grok entry points to this local
   endpoint and its `model` value exactly matches the map source.
 - Port 18765 occupied: run `lsof -nP -iTCP:18765 -sTCP:LISTEN` or change both

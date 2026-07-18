@@ -46,11 +46,39 @@ fn events_without_created_at(stream: &[u8]) -> Vec<Value> {
 fn kimi_catalog_aliases_resolve_to_the_canonical_wire_model() {
     let catalog = Catalog::default();
 
+    let (k3, known) = catalog.lookup("k3");
+    assert!(known);
+    assert_eq!(k3.provider, Provider::Kimi);
+    assert_eq!(k3.upstream_id, "k3");
+    assert_eq!(k3.display_name, "Kimi K3");
+    assert_eq!(k3.context_window, 256_000);
+
     for alias in ["kimi-for-coding", "kimi-k2.6", "k2.6"] {
         let (model, known) = catalog.lookup(alias);
         assert!(known);
         assert_eq!(model.provider, Provider::Kimi);
         assert_eq!(model.upstream_id, "kimi-for-coding");
+    }
+}
+
+#[test]
+fn kimi_k3_request_preserves_model_and_maps_reasoning_effort() {
+    for (effort, expected) in [
+        (None, "max"),
+        (Some("low"), "low"),
+        (Some("medium"), "high"),
+        (Some("high"), "high"),
+        (Some("xhigh"), "max"),
+    ] {
+        let mut request = json!({"model":"k3","input":"hello"});
+        if let Some(effort) = effort {
+            request["reasoning"] = json!({"effort":effort});
+        }
+
+        let translated = translate_request(&serde_json::to_vec(&request).unwrap(), None).unwrap();
+        assert_eq!(translated["model"], "k3");
+        assert_eq!(translated["reasoning_effort"], expected);
+        assert_eq!(translated["thinking"]["type"], "enabled");
     }
 }
 

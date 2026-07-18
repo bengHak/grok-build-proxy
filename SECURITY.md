@@ -1,7 +1,7 @@
 # Security policy
 
-`grok-build-proxy` handles ChatGPT/Codex and Kimi access and refresh tokens on
-macOS. Treat both authentication files as passwords.
+`grok-build-proxy` handles ChatGPT/Codex credentials plus Kimi API keys or OAuth
+tokens on macOS. Treat every upstream credential as a password.
 
 ## Safe defaults
 
@@ -18,8 +18,10 @@ macOS. Treat both authentication files as passwords.
 - `grok-build-proxy auth` delegates login, device authorization, status, and
   logout to the official Codex CLI. It does not collect ChatGPT passwords or
   implement its own OAuth callback flow.
-- `grok-build-proxy kimi auth` uses Kimi's device-code OAuth endpoint. It never
-  collects a Kimi password and never prints access or refresh tokens.
+- Kimi Code API keys are read from `GROK_BUILD_PROXY_KIMI_API_KEY` or
+  `--kimi-api-key`, never logged, and sent with the proxy's own User-Agent.
+- `grok-build-proxy kimi auth` remains as a device-code OAuth compatibility
+  fallback. It never collects a Kimi password or prints access/refresh tokens.
 - `grok-build-proxy doctor` reports only redacted account metadata and never
   prints access or refresh token values.
 - Serve-monitor failure reports (`y`/`Y` clipboard, `w`/`W` under
@@ -30,6 +32,9 @@ macOS. Treat both authentication files as passwords.
 ## Credential handling
 
 - Do not commit, upload, back up to a public location, or share `auth.json`.
+- Prefer `GROK_BUILD_PROXY_KIMI_API_KEY` over `--kimi-api-key` so the key does
+  not enter shell history or the process argument list. The proxy does not
+  persist API keys.
 - The default proxy credential directory is `~/.codex-grok-build-proxy`.
 - Kimi credentials default to `~/.grok-build-proxy/kimi/auth.json`; the adjacent
   `device_id` is not a bearer credential but is still kept private.
@@ -42,7 +47,8 @@ macOS. Treat both authentication files as passwords.
 - Do not point multiple long-running proxy processes at the same credential
   file. A dedicated home reduces refresh-token races with normal Codex sessions.
 - Log out with `grok-build-proxy auth logout` or `grok-build-proxy kimi auth
-  logout` before deleting a dedicated credential directory.
+  logout` before deleting a dedicated credential directory. Remove the Kimi
+  API key from the environment separately.
 
 ## Network exposure
 

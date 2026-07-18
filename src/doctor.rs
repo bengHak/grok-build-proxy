@@ -49,6 +49,7 @@ impl Check {
 pub async fn run_full(
     auth_file: &Path,
     kimi_auth_file: Option<&Path>,
+    kimi_api_key: &str,
     grok_config: &Path,
     codex_home: &Path,
     listen: &str,
@@ -151,7 +152,9 @@ pub async fn run_full(
         Err(error) => checks.push(Check::fail("ChatGPT auth", error.to_string())),
     }
 
-    if let Some(path) = kimi_auth_file {
+    if !kimi_api_key.trim().is_empty() {
+        checks.push(Check::pass("Kimi auth", "API key configured"));
+    } else if let Some(path) = kimi_auth_file {
         match KimiStore::new(path, DEFAULT_KIMI_OAUTH_HOST) {
             Ok(store) => match store.inspect().await {
                 Ok(status) => {
@@ -338,6 +341,7 @@ pub async fn run(auth_file: &Path, grok_config: &Path, codex_home: &Path) -> Vec
     run_full(
         auth_file,
         None,
+        "",
         grok_config,
         codex_home,
         "127.0.0.1:18765",
@@ -394,6 +398,7 @@ mod tests {
             let checks = run_full(
                 &directory.path().join("missing-codex.json"),
                 Some(&directory.path().join("missing-kimi.json")),
+                "",
                 grok_config,
                 directory.path(),
                 "127.0.0.1:0",
@@ -410,6 +415,39 @@ mod tests {
                     .any(|check| { check.name == "Kimi auth" && !check.ok && !check.warning })
             );
         }
+    }
+
+    #[tokio::test]
+    async fn kimi_api_key_satisfies_auth_check_without_exposing_the_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let grok_config = directory.path().join("grok.toml");
+        tokio::fs::write(
+            &grok_config,
+            "[model.kimi]\nmodel = \"k3\"\nname = \"Kimi K3\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n",
+        )
+        .await
+        .unwrap();
+
+        let secret = "secret-kimi-api-key";
+        let checks = run_full(
+            &directory.path().join("missing-codex.json"),
+            Some(&directory.path().join("missing-kimi.json")),
+            secret,
+            &grok_config,
+            directory.path(),
+            "127.0.0.1:0",
+            "",
+            "missing-codex",
+            "missing-grok",
+            "",
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(checks.iter().any(|check| {
+            check.name == "Kimi auth" && check.ok && check.detail == "API key configured"
+        }));
+        assert!(!checks.iter().any(|check| check.detail.contains(secret)));
     }
 
     #[tokio::test]
@@ -440,6 +478,7 @@ mod tests {
         let checks = run_full(
             &directory.path().join("missing-codex-auth.json"),
             Some(&kimi_auth),
+            "",
             &grok_config,
             directory.path(),
             "127.0.0.1:0",
@@ -476,6 +515,7 @@ mod tests {
         let mixed_checks = run_full(
             &directory.path().join("missing-codex-auth.json"),
             Some(&kimi_auth),
+            "",
             &grok_config,
             directory.path(),
             "127.0.0.1:0",
@@ -521,6 +561,7 @@ mod tests {
         let checks = run_full(
             &directory.path().join("missing-codex.json"),
             Some(&kimi_auth),
+            "",
             &grok_config,
             directory.path(),
             "127.0.0.1:0",
@@ -593,6 +634,7 @@ mod tests {
         let checks = run_full(
             &directory.path().join("missing-codex.json"),
             Some(&kimi_auth),
+            "",
             &grok_config,
             directory.path(),
             &address.to_string(),

@@ -3,10 +3,19 @@ pub mod client;
 pub mod request;
 pub mod stream;
 
+pub const K3_MODEL: &str = "k3";
 pub const WIRE_MODEL: &str = "kimi-for-coding";
 
 pub fn is_model(id: &str) -> bool {
-    matches!(id, WIRE_MODEL | "kimi-k2.6" | "k2.6")
+    canonical_model(id).is_some()
+}
+
+pub fn canonical_model(id: &str) -> Option<&'static str> {
+    match id {
+        K3_MODEL => Some(K3_MODEL),
+        WIRE_MODEL | "kimi-k2.6" | "k2.6" => Some(WIRE_MODEL),
+        _ => None,
+    }
 }
 
 pub fn validate_upstream_url(value: &str) -> anyhow::Result<()> {

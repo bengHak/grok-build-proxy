@@ -1,4 +1,4 @@
-use super::{WIRE_MODEL, is_model};
+use super::{K3_MODEL, canonical_model};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
@@ -17,9 +17,8 @@ pub fn translate_request(raw: &[u8], prompt_cache_key: Option<&str>) -> Result<V
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("model is required"))?;
-    if !is_model(model) {
-        bail!("unsupported Kimi model {model:?}")
-    }
+    let wire_model =
+        canonical_model(model).ok_or_else(|| anyhow!("unsupported Kimi model {model:?}"))?;
 
     let mut messages = Vec::new();
     if let Some(instructions) = request
@@ -42,18 +41,27 @@ pub fn translate_request(raw: &[u8], prompt_cache_key: Option<&str>) -> Result<V
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MAX_TOKENS)
         .min(DEFAULT_MAX_TOKENS);
-    let effort = match request
+    let requested_effort = request
         .get("reasoning")
         .and_then(|reasoning| reasoning.get("effort"))
-        .and_then(Value::as_str)
-    {
-        Some("low") => "low",
-        Some("high" | "xhigh" | "max") => "high",
-        Some("medium") | None => "medium",
-        Some(_) => "medium",
+        .and_then(Value::as_str);
+    let effort = if wire_model == K3_MODEL {
+        match requested_effort {
+            None | Some("xhigh" | "max" | "ultra") => "max",
+            Some("medium" | "high") => "high",
+            Some("low" | "minimum" | "light") => "low",
+            Some(value) => bail!("unsupported K3 reasoning effort {value:?}"),
+        }
+    } else {
+        match requested_effort {
+            Some("low") => "low",
+            Some("high" | "xhigh" | "max") => "high",
+            Some("medium") | None => "medium",
+            Some(_) => "medium",
+        }
     };
     let mut translated = json!({
-        "model": WIRE_MODEL,
+        "model": wire_model,
         "messages": messages,
         "stream": true,
         "stream_options": {"include_usage":true},
