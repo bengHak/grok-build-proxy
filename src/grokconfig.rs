@@ -512,11 +512,23 @@ pub async fn status(
             let advertised = advertised_value.is_some();
             let (base, fast) = normalize_id(&record.model);
             let (catalog_model, _) = catalog.lookup(&base);
-            let ready = match catalog_model.provider {
+            let provider = advertised_value
+                .and_then(|value| value.get("owned_by"))
+                .and_then(JsonValue::as_str)
+                .and_then(|owned_by| match owned_by {
+                    "kimi" => Some(Provider::Kimi),
+                    "openai-codex" => Some(Provider::Codex),
+                    _ => None,
+                })
+                .unwrap_or(catalog_model.provider);
+            let ready = match provider {
                 Provider::Codex => endpoint.codex_ready,
                 Provider::Kimi => endpoint.kimi_ready,
             };
-            let expected_context = catalog_model.context_window;
+            let expected_context = advertised_value
+                .and_then(|value| value.get("context_window"))
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(catalog_model.context_window);
             let context_matches = model_item(&config.document, &record.alias)
                 .and_then(Item::as_table_like)
                 .and_then(|table| table.get("context_window"))
@@ -543,10 +555,7 @@ pub async fn status(
                 details.push(endpoint.detail.clone());
             }
             if !ready {
-                details.push(format!(
-                    "{} provider is not ready",
-                    catalog_model.provider.as_str()
-                ));
+                details.push(format!("{} provider is not ready", provider.as_str()));
             }
             ModelStatus {
                 alias: record.alias,
@@ -1000,7 +1009,8 @@ mod tests {
                             "service_tier": "priority",
                             "target_model": "gpt-5.6-sol-fast"
                         },
-                        {"id":"kimi-for-coding"}
+                        {"id":"kimi-for-coding"},
+                        {"id":"mapped-kimi","owned_by":"kimi","context_window":256000}
                     ]}))
                 }),
             );
@@ -1033,6 +1043,20 @@ mod tests {
         )
         .unwrap();
         config.add(&kimi).unwrap();
+        config
+            .add(&ModelSpec {
+                alias: "mapped-kimi".into(),
+                base_model: "mapped-kimi".into(),
+                effective_model: "mapped-kimi".into(),
+                fast: false,
+                name: "Mapped Kimi".into(),
+                description: "Mapped Kimi model".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: "unused".into(),
+                context_window: 256_000,
+                reasoning_efforts: Vec::new(),
+            })
+            .unwrap();
         let statuses = status(
             &config,
             None,
@@ -1042,7 +1066,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses.len(), 3);
         let status = statuses
             .iter()
             .find(|status| status.alias == "codex-sol-fast")
@@ -1062,6 +1086,14 @@ mod tests {
         assert!(kimi.advertised);
         assert!(kimi.metadata);
         assert!(kimi.detail.contains("kimi provider is not ready"));
+        let mapped = statuses
+            .iter()
+            .find(|status| status.alias == "mapped-kimi")
+            .unwrap();
+        assert!(!mapped.ready);
+        assert!(mapped.advertised);
+        assert!(mapped.metadata);
+        assert!(mapped.detail.contains("kimi provider is not ready"));
     }
 
     #[test]

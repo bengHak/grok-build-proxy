@@ -75,17 +75,23 @@ pub async fn run_full(
         ));
     }
 
-    match ModelMap::parse(model_map) {
-        Ok(map) => checks.push(Check::pass(
-            "Model substitutions",
-            if map.is_empty() {
-                "none".into()
-            } else {
-                map.stable_string()
-            },
-        )),
-        Err(error) => checks.push(Check::fail("Model substitutions", error.to_string())),
-    }
+    let mappings = match ModelMap::parse(model_map) {
+        Ok(map) => {
+            checks.push(Check::pass(
+                "Model substitutions",
+                if map.is_empty() {
+                    "none".into()
+                } else {
+                    map.stable_string()
+                },
+            ));
+            Some(map)
+        }
+        Err(error) => {
+            checks.push(Check::fail("Model substitutions", error.to_string()));
+            None
+        }
+    };
     for (name, binary) in [("Codex CLI", codex_binary), ("Grok Build CLI", grok_binary)] {
         match codexcli::find_binary(binary) {
             Some(path) => checks.push(Check::pass(name, path.display().to_string())),
@@ -178,7 +184,11 @@ pub async fn run_full(
                 required_codex = true;
             }
             for record in &records {
-                let (model, _) = normalize_id(&record.model);
+                let resolved = mappings
+                    .as_ref()
+                    .map(|map| map.resolve(&record.model).model)
+                    .unwrap_or_else(|| record.model.clone());
+                let (model, _) = normalize_id(&resolved);
                 match catalog.lookup(&model).0.provider {
                     Provider::Codex => required_codex = true,
                     Provider::Kimi => required_kimi = true,
@@ -343,7 +353,7 @@ mod tests {
         }
         tokio::fs::write(
             &grok_config,
-            "[model.kimi]\nmodel = \"kimi-for-coding\"\nname = \"Kimi K2.6\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n",
+            "[model.kimi]\nmodel = \"mapped-kimi\"\nname = \"Mapped Kimi\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n",
         )
         .await
         .unwrap();
@@ -357,7 +367,7 @@ mod tests {
             "",
             "missing-codex",
             "missing-grok",
-            "",
+            "mapped-kimi=kimi-for-coding",
             Duration::from_millis(50),
         )
         .await;
@@ -380,7 +390,7 @@ mod tests {
 
         tokio::fs::write(
             &grok_config,
-            "[model.kimi]\nmodel = \"kimi-for-coding\"\nname = \"Kimi K2.6\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n\n[model.codex]\nmodel = \"gpt-5.6-sol\"\nname = \"Codex Sol\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 372000\n",
+            "[model.kimi]\nmodel = \"mapped-kimi\"\nname = \"Mapped Kimi\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n\n[model.codex]\nmodel = \"gpt-5.6-sol\"\nname = \"Codex Sol\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 372000\n",
         )
         .await
         .unwrap();
@@ -393,7 +403,7 @@ mod tests {
             "",
             "missing-codex",
             "missing-grok",
-            "",
+            "mapped-kimi=kimi-for-coding",
             Duration::from_millis(50),
         )
         .await;
