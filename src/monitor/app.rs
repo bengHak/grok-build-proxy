@@ -271,7 +271,12 @@ impl App {
                 if self.mode == Mode::Dashboard {
                     let count =
                         Self::focus_count(self.focus, sessions_len, detail_len, failures_len);
-                    if count > 0 {
+                    // Session detail can open on the pinned session even when it has
+                    // no turns yet (summary-only inspector).
+                    let open = count > 0
+                        || (self.focus == Focus::SessionDetail
+                            && self.selected_session_key.is_some());
+                    if open {
                         self.mode = Mode::Detail;
                         // Caller pins the selected row's stable identity.
                         self.detail_turn_key = None;
@@ -516,6 +521,22 @@ mod tests {
         app.handle(key(KeyCode::Esc), 1, 0, 0);
         assert_eq!(app.mode, Mode::Dashboard);
         assert!(app.detail_request_id.is_none());
+    }
+
+    #[test]
+    fn enter_opens_session_detail_without_turns() {
+        let mut app = App::new();
+        app.focus = Focus::SessionDetail;
+        app.selected_session_key = Some("sess-x".into());
+        // No turn rows, but a pinned session should still open the inspector overlay.
+        app.handle(key(KeyCode::Enter), 0, 0, 0);
+        assert_eq!(app.mode, Mode::Detail);
+
+        let mut app = App::new();
+        app.focus = Focus::SessionDetail;
+        app.selected_session_key = None;
+        app.handle(key(KeyCode::Enter), 0, 0, 0);
+        assert_eq!(app.mode, Mode::Dashboard);
     }
 
     #[test]

@@ -389,25 +389,51 @@ fn detail_text(snapshot: &Snapshot, app: &App) -> String {
     match app.focus {
         Focus::Sessions => {
             let sessions = active_sessions(snapshot);
-            if let Some(s) = sessions.get(app.selected) {
-                let last = s.last_failure_kind.map(|k| k.as_str()).unwrap_or("-");
-                format!(
-                    "Session {}\n  model: {}\n  requests: {}  active: {}  errors: {}\n  tokens: {}  tok/s: {:.1}\n  last_failure: {last}",
-                    s.id,
-                    s.last_model,
-                    s.requests,
-                    s.active,
-                    s.errors,
-                    s.output_tokens,
-                    s.tokens_per_second(),
-                )
-            } else {
-                "No session selected".into()
+            match sessions.get(app.selected) {
+                Some(s) => session_detail_text(s, snapshot),
+                None => "No session selected".into(),
             }
         }
-        Focus::SessionDetail => turn_detail_text(snapshot, app),
+        Focus::SessionDetail => {
+            // Prefer a selected/pinned turn; fall back to the session summary when
+            // the inspector has no turn rows yet.
+            let turn_rows =
+                SessionDetailPanel::row_count(snapshot, app.selected_session_key.as_deref());
+            if app.detail_turn_key.is_some() || turn_rows > 0 {
+                turn_detail_text(snapshot, app)
+            } else {
+                match SessionDetailPanel::session(snapshot, app.selected_session_key.as_deref()) {
+                    Some(s) => session_detail_text(s, snapshot),
+                    None => "No session selected".into(),
+                }
+            }
+        }
         Focus::Failures => failure_detail_text(snapshot, app),
     }
+}
+
+fn session_detail_text(session: &Session, snapshot: &Snapshot) -> String {
+    let last = session.last_failure_kind.map(|k| k.as_str()).unwrap_or("-");
+    let updated = session
+        .updated_at
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "-".into());
+    let fail_n = SessionDetailPanel::session_failures(snapshot, Some(session.id.as_str())).len();
+    let turns = SessionDetailPanel::row_count(snapshot, Some(session.id.as_str()));
+    format!(
+        "Session {}\n  model: {}\n  requests: {}  active: {}  errors: {}\n  tokens: {}  tok/s: {:.1}\n  last_failure: {last}\n  fail_ring: {fail_n}  turns_visible: {turns}\n  updated: {updated}",
+        session.id,
+        if session.last_model.is_empty() {
+            "-"
+        } else {
+            session.last_model.as_str()
+        },
+        session.requests,
+        session.active,
+        session.errors,
+        session.output_tokens,
+        session.tokens_per_second(),
+    )
 }
 
 fn turn_detail_text(snapshot: &Snapshot, app: &App) -> String {
@@ -660,6 +686,14 @@ mod tests {
         assert!(
             text.contains("session detail"),
             "session detail panel title missing:\n{text}"
+        );
+        assert!(
+            text.contains("reqs") && text.contains("tokens") && text.contains("last"),
+            "session detail summary fields missing:\n{text}"
+        );
+        assert!(
+            text.contains("turns") && (text.contains("active") || text.contains("recent")),
+            "session detail turns subheader missing:\n{text}"
         );
         assert!(
             text.contains("failures"),
