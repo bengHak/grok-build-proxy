@@ -1,6 +1,6 @@
 [package]
 name = "grok-build-proxy"
-version = "0.0.16"
+version = "0.0.17"
 edition = "2024"
 rust-version = "1.88"
 description = "A local Grok Build proxy for ChatGPT Codex and Kimi on macOS"
