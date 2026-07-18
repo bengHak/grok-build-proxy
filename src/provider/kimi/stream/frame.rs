@@ -1,16 +1,19 @@
 use serde_json::Value;
 
 pub(super) fn frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    buffer
+    let lf = buffer
         .windows(2)
         .position(|window| window == b"\n\n")
-        .map(|end| (end, 2))
-        .or_else(|| {
-            buffer
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|end| (end, 4))
-        })
+        .map(|end| (end, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|end| (end, 4));
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+        (None, None) => None,
+    }
 }
 
 pub(super) fn event_bytes(

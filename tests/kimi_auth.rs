@@ -75,6 +75,13 @@ async fn kimi_device_login_polls_and_persists_credentials() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("auth.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .await
+            .unwrap();
+    }
     let store = Store::new(&path, format!("http://{address}")).unwrap();
     let authorization = store.begin_device_login().await.unwrap();
     assert_eq!(authorization.user_code, "ABCD-EFGH");
@@ -88,6 +95,18 @@ async fn kimi_device_login_polls_and_persists_credentials() {
     assert_eq!(saved.access, "device-access");
     assert_eq!(saved.refresh, "device-refresh");
     assert_eq!(*state.polls.lock().await, 2);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&path).await.unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(dir.path()).await.unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 }
 
 async fn refresh(

@@ -81,6 +81,39 @@ async fn kimi_model_routes_to_chat_completions_and_translates_stream() {
         .clone()
         .oneshot(
             Request::builder()
+                .method(Method::GET)
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let readiness: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(readiness, serde_json::json!({"ok":true,"auth":"ready"}));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"model":"kimi-k2.6","input":42}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let validation: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(validation["error"]["type"], "invalid_request_error");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
                 .method(Method::POST)
                 .uri("/v1/responses")
                 .header(header::CONTENT_TYPE, "application/json")

@@ -1,11 +1,15 @@
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+mod delta;
 mod finish;
 mod frame;
 mod tool;
 
-use frame::{event_bytes, frame_boundary};
+use frame::frame_boundary;
+
+const MAX_FRAME_BYTES: usize = 8 << 20;
+const MAX_STREAM_BYTES: usize = 64 << 20;
 
 #[derive(Clone, Debug)]
 enum Output {
@@ -22,6 +26,7 @@ enum Output {
         call_id: String,
         name: String,
         arguments: String,
+        started: bool,
     },
 }
 
@@ -29,7 +34,9 @@ enum Output {
 pub struct Translator {
     response_id: String,
     model: String,
+    created_at: u64,
     buffer: Vec<u8>,
+    received_bytes: usize,
     outputs: BTreeMap<usize, Output>,
     reasoning_index: Option<usize>,
     message_index: Option<usize>,
@@ -48,14 +55,22 @@ impl Translator {
         Self {
             response_id: response_id.into(),
             model: model.into(),
+            created_at: chrono::Utc::now().timestamp().max(0) as u64,
             buffer: Vec::new(),
+            received_bytes: 0,
             outputs: BTreeMap::new(),
             reasoning_index: None,
             message_index: None,
             tool_indexes: BTreeMap::new(),
             next_index: 0,
             sequence: 0,
-            usage: json!({"input_tokens":0,"output_tokens":0,"total_tokens":0}),
+            usage: json!({
+                "input_tokens":0,
+                "input_tokens_details":{"cached_tokens":0},
+                "output_tokens":0,
+                "output_tokens_details":{"reasoning_tokens":0},
+                "total_tokens":0
+            }),
             finish_reason: None,
             started: false,
             terminal: false,
@@ -64,6 +79,16 @@ impl Translator {
     }
 
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        if self.terminal {
+            return Vec::new();
+        }
+        self.received_bytes = self.received_bytes.saturating_add(chunk.len());
+        if self.received_bytes > MAX_STREAM_BYTES {
+            return self.fail(&json!({
+                "type":"upstream_error",
+                "message":"Kimi stream exceeded the 64 MiB safety limit"
+            }));
+        }
         self.buffer.extend_from_slice(chunk);
         let mut output = Vec::new();
         while let Some((end, delimiter)) = frame_boundary(&self.buffer) {
@@ -77,6 +102,13 @@ impl Translator {
                 .join("\n");
             output.extend(self.consume(&data));
         }
+        if self.buffer.len() > MAX_FRAME_BYTES {
+            output.extend(self.fail(&json!({
+                "type":"upstream_error",
+                "message":"Kimi SSE frame exceeded the 8 MiB safety limit"
+            })));
+            self.buffer.clear();
+        }
         output
     }
 
@@ -84,7 +116,7 @@ impl Translator {
         if self.terminal {
             Vec::new()
         } else {
-            self.complete()
+            self.terminal()
         }
     }
 
@@ -93,14 +125,20 @@ impl Translator {
     }
 
     fn consume(&mut self, data: &str) -> Vec<u8> {
+        if self.terminal {
+            return Vec::new();
+        }
         if data.is_empty() {
             return Vec::new();
         }
         if data == "[DONE]" {
-            return self.complete();
+            return self.terminal();
         }
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
-            return Vec::new();
+            return self.fail(&json!({
+                "type":"upstream_error",
+                "message":"Kimi returned malformed SSE JSON"
+            }));
         };
         if let Some(error) = chunk.get("error") {
             return self.fail(error);
@@ -109,7 +147,13 @@ impl Translator {
         if let Some(usage) = chunk.get("usage") {
             self.usage = json!({
                 "input_tokens":usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0),
+                "input_tokens_details":{
+                    "cached_tokens":usage.pointer("/prompt_tokens_details/cached_tokens").and_then(Value::as_u64).unwrap_or(0)
+                },
                 "output_tokens":usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0),
+                "output_tokens_details":{
+                    "reasoning_tokens":usage.pointer("/completion_tokens_details/reasoning_tokens").and_then(Value::as_u64).unwrap_or(0)
+                },
                 "total_tokens":usage.get("total_tokens").and_then(Value::as_u64).unwrap_or_else(|| {
                     usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0)
                         + usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0)
@@ -149,89 +193,5 @@ impl Translator {
             }
         }
         output
-    }
-
-    fn start(&mut self) -> Vec<u8> {
-        if self.started {
-            return Vec::new();
-        }
-        self.started = true;
-        self.event(
-            "response.created",
-            json!({"response":self.response("in_progress",Vec::new())}),
-        )
-    }
-
-    fn reasoning_delta(&mut self, delta: &str) -> Vec<u8> {
-        let index = match self.reasoning_index {
-            Some(index) => index,
-            None => {
-                let index = self.allocate(Output::Reasoning {
-                    id: format!("rs_{}", self.response_id),
-                    text: String::new(),
-                });
-                self.reasoning_index = Some(index);
-                index
-            }
-        };
-        let mut output = Vec::new();
-        let item_id = match self.outputs.get_mut(&index) {
-            Some(Output::Reasoning { id, text }) => {
-                if text.is_empty() {
-                    output.extend(event_bytes(&mut self.sequence, &self.response_id, "response.output_item.added", json!({"output_index":index,"item":{"id":id,"type":"reasoning","status":"in_progress","summary":[]}})));
-                    output.extend(event_bytes(&mut self.sequence, &self.response_id, "response.reasoning_summary_part.added", json!({"item_id":id,"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":""}})));
-                }
-                text.push_str(delta);
-                id.clone()
-            }
-            _ => return output,
-        };
-        output.extend(self.event(
-            "response.reasoning_summary_text.delta",
-            json!({"item_id":item_id,"output_index":index,"summary_index":0,"delta":delta}),
-        ));
-        output
-    }
-
-    fn text_delta(&mut self, delta: &str) -> Vec<u8> {
-        let index = match self.message_index {
-            Some(index) => index,
-            None => {
-                let index = self.allocate(Output::Message {
-                    id: format!("msg_{}", self.response_id),
-                    text: String::new(),
-                });
-                self.message_index = Some(index);
-                index
-            }
-        };
-        let mut output = Vec::new();
-        let item_id = match self.outputs.get_mut(&index) {
-            Some(Output::Message { id, text }) => {
-                if text.is_empty() {
-                    output.extend(event_bytes(&mut self.sequence, &self.response_id, "response.output_item.added", json!({"output_index":index,"item":{"id":id,"type":"message","status":"in_progress","role":"assistant","content":[]}})));
-                    output.extend(event_bytes(&mut self.sequence, &self.response_id, "response.content_part.added", json!({"item_id":id,"output_index":index,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}})));
-                }
-                text.push_str(delta);
-                id.clone()
-            }
-            _ => return output,
-        };
-        output.extend(self.event(
-            "response.output_text.delta",
-            json!({"item_id":item_id,"output_index":index,"content_index":0,"delta":delta}),
-        ));
-        output
-    }
-
-    fn allocate(&mut self, state: Output) -> usize {
-        let index = self.next_index;
-        self.next_index += 1;
-        self.outputs.insert(index, state);
-        index
-    }
-
-    fn event(&mut self, kind: &str, fields: Value) -> Vec<u8> {
-        event_bytes(&mut self.sequence, &self.response_id, kind, fields)
     }
 }

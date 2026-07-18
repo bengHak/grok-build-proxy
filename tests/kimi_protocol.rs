@@ -1,6 +1,11 @@
 use grok_build_proxy::{
     catalog::Catalog,
-    provider::{Provider, kimi::request::translate_request, kimi::stream::Translator},
+    provider::{
+        Provider,
+        kimi::{
+            auth::Store, request::translate_request, stream::Translator, validate_upstream_url,
+        },
+    },
 };
 use serde_json::{Value, json};
 
@@ -45,9 +50,16 @@ fn kimi_request_translates_responses_history_tools_and_reasoning() {
         "model": "kimi-k2.6",
         "instructions": "system context",
         "input": [
-            {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]},
+            {"type":"message","role":"user","content":[
+                {"type":"input_text","text":"hello"},
+                {"type":"input_image","image_url":"data:image/png;base64,AA=="}
+            ]},
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"prior thought"}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking"}]},
             {"type":"function_call","call_id":"call_1","name":"search","arguments":"{\"q\":\"rust\"}"},
-            {"type":"function_call_output","call_id":"call_1","output":"result"}
+            {"type":"function_call","call_id":"call_2","name":"search","arguments":"{\"q\":\"axum\"}"},
+            {"type":"function_call_output","call_id":"call_1","output":"result 1"},
+            {"type":"function_call_output","call_id":"call_2","output":"result 2"}
         ],
         "tools": [{
             "type": "function",
@@ -73,8 +85,19 @@ fn kimi_request_translates_responses_history_tools_and_reasoning() {
     assert_eq!(translated["prompt_cache_key"], "session-1");
     assert_eq!(translated["messages"][0]["role"], "system");
     assert_eq!(translated["messages"][1]["role"], "user");
+    assert_eq!(
+        translated["messages"][1]["content"][1]["image_url"]["url"],
+        "data:image/png;base64,AA=="
+    );
+    assert_eq!(
+        translated["messages"][2]["reasoning_content"],
+        "prior thought"
+    );
+    assert_eq!(translated["messages"][2]["content"], "checking");
     assert_eq!(translated["messages"][2]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(translated["messages"][2]["tool_calls"][1]["id"], "call_2");
     assert_eq!(translated["messages"][3]["tool_call_id"], "call_1");
+    assert_eq!(translated["messages"][4]["tool_call_id"], "call_2");
     assert_eq!(translated["tools"][0]["function"]["name"], "search");
     assert_eq!(translated["tool_choice"]["function"]["name"], "search");
     assert!(translated.get("input").is_none());
@@ -145,4 +168,81 @@ fn kimi_stream_translation_is_invariant_to_network_chunk_boundaries() {
     for chunk_size in 1..=upstream.len() {
         assert_eq!(translate_stream(upstream, chunk_size), expected);
     }
+}
+
+#[test]
+fn kimi_stream_fails_closed_on_truncated_or_invalid_tool_calls() {
+    for upstream in [
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n",
+        concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"not-json\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n"
+        ),
+    ] {
+        let parsed = events(&translate_stream(upstream.as_bytes(), upstream.len()));
+        let kinds: Vec<_> = parsed
+            .iter()
+            .filter_map(|event| event["type"].as_str())
+            .collect();
+        assert!(kinds.contains(&"response.failed"));
+        assert!(!kinds.contains(&"response.completed"));
+        assert!(!kinds.contains(&"response.output_item.done"));
+    }
+}
+
+#[test]
+fn kimi_stream_rejects_malformed_frames_and_reports_length_as_incomplete() {
+    for (upstream, terminal) in [
+        ("data: not-json\n\n", "response.failed"),
+        (
+            concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                "data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            "response.incomplete",
+        ),
+    ] {
+        let parsed = events(&translate_stream(upstream.as_bytes(), upstream.len()));
+        assert_eq!(parsed.last().unwrap()["type"], terminal);
+        assert!(
+            !parsed
+                .iter()
+                .any(|event| event["type"] == "response.completed")
+        );
+    }
+}
+
+#[test]
+fn kimi_tool_item_is_added_once_when_the_first_argument_fragment_is_empty() {
+    let upstream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let parsed = events(&translate_stream(upstream.as_bytes(), upstream.len()));
+    let additions = parsed
+        .iter()
+        .filter(|event| {
+            event["type"] == "response.output_item.added"
+                && event["item"]["type"] == "function_call"
+        })
+        .count();
+    assert_eq!(additions, 1);
+    assert_eq!(parsed.last().unwrap()["type"], "response.completed");
+}
+
+#[test]
+fn kimi_credential_endpoints_reject_untrusted_origins() {
+    assert!(Store::new("auth.json", "https://auth.kimi.com").is_ok());
+    assert!(Store::new("auth.json", "http://127.0.0.1:3000").is_ok());
+    assert!(Store::new("auth.json", "http://auth.kimi.com").is_err());
+    assert!(Store::new("auth.json", "https://example.com").is_err());
+
+    assert!(validate_upstream_url("https://api.kimi.com/coding/v1/chat/completions").is_ok());
+    assert!(validate_upstream_url("http://127.0.0.1:3000/chat/completions").is_ok());
+    assert!(validate_upstream_url("http://api.kimi.com/coding/v1/chat/completions").is_err());
+    assert!(validate_upstream_url("https://example.com/chat/completions").is_err());
 }

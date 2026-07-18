@@ -127,5 +127,9 @@ fn stored_auth(tokens: TokenResponse, current: Option<&StoredAuth>) -> Result<St
 fn user_id(token: &str) -> Option<String> {
     let payload = token.split('.').nth(1)?;
     let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
-    claims.get("sub")?.as_str().map(str::to_owned)
+    claims
+        .get("user_id")
+        .or_else(|| claims.get("sub"))?
+        .as_str()
+        .map(str::to_owned)
 }

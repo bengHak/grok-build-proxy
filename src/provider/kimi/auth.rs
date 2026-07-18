@@ -82,11 +82,13 @@ impl Store {
         if oauth_host.is_empty() {
             bail!("Kimi OAuth host is required")
         }
+        super::validate_oauth_host(&oauth_host)?;
         Ok(Self {
             path,
             oauth_host,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             lock: Arc::new(Mutex::new(())),
             device_id: Arc::new(OnceCell::new()),
@@ -95,6 +97,10 @@ impl Store {
 
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    pub(super) fn http_client(&self) -> &reqwest::Client {
+        &self.client
     }
 
     pub async fn inspect(&self) -> Result<AuthStatus> {

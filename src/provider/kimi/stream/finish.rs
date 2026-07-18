@@ -3,9 +3,33 @@ use serde_json::{Value, json};
 use super::{Output, Translator};
 
 impl Translator {
+    pub(super) fn terminal(&mut self) -> Vec<u8> {
+        match self.finish_reason.as_deref() {
+            Some("stop" | "tool_calls") => self.complete(),
+            Some("length") => self.incomplete(),
+            Some(reason) => self.fail(&json!({
+                "type": "upstream_error",
+                "message": format!("Kimi stopped with unsupported finish reason {reason:?}")
+            })),
+            None => self.fail(&json!({
+                "type": "upstream_error",
+                "message": "Kimi stream ended before finish_reason"
+            })),
+        }
+    }
+
     pub(super) fn complete(&mut self) -> Vec<u8> {
         if self.terminal {
             return Vec::new();
+        }
+        if self.outputs.values().any(|output| match output {
+            Output::Tool { arguments, .. } => serde_json::from_str::<Value>(arguments).is_err(),
+            Output::Reasoning { .. } | Output::Message { .. } => false,
+        }) {
+            return self.fail(&json!({
+                "type": "invalid_tool_arguments",
+                "message": "Kimi returned incomplete or invalid function arguments"
+            }));
         }
         let mut output = self.start();
         let mut completed = Vec::new();
@@ -42,6 +66,7 @@ impl Translator {
                     call_id,
                     name,
                     arguments,
+                    ..
                 } => {
                     output.extend(self.event(
                         "response.function_call_arguments.done",
@@ -64,10 +89,28 @@ impl Translator {
         output
     }
 
+    fn incomplete(&mut self) -> Vec<u8> {
+        let mut output = self.start();
+        self.terminal = true;
+        let mut response = self.response("incomplete", Vec::new());
+        response.as_object_mut().unwrap().insert(
+            "incomplete_details".into(),
+            json!({"reason":"max_output_tokens"}),
+        );
+        self.terminal_response = Some(response.clone());
+        output.extend(self.event("response.incomplete", json!({"response":response})));
+        output.extend_from_slice(b"data: [DONE]\n\n");
+        output
+    }
+
     pub(super) fn fail(&mut self, error: &Value) -> Vec<u8> {
         let mut output = self.start();
         self.terminal = true;
-        let response = json!({"id":self.response_id,"object":"response","status":"failed","model":self.model,"output":[],"error":error});
+        let mut response = self.response("failed", Vec::new());
+        response
+            .as_object_mut()
+            .unwrap()
+            .insert("error".into(), error.clone());
         self.terminal_response = Some(response.clone());
         output.extend(self.event("response.failed", json!({"response":response})));
         output.extend_from_slice(b"data: [DONE]\n\n");
@@ -75,6 +118,16 @@ impl Translator {
     }
 
     pub(super) fn response(&self, status: &str, output: Vec<Value>) -> Value {
-        json!({"id":self.response_id,"object":"response","status":status,"model":self.model,"output":output,"usage":self.usage})
+        json!({
+            "id":self.response_id,
+            "object":"response",
+            "created_at":self.created_at,
+            "status":status,
+            "model":self.model,
+            "output":output,
+            "usage":self.usage,
+            "error":null,
+            "incomplete_details":null
+        })
     }
 }

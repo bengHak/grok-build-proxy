@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 
-use super::{Output, Translator, event_bytes};
+use super::{Output, Translator, frame::event_bytes};
 
 impl Translator {
     pub(super) fn tool_delta(&mut self, tool: &Value) -> Vec<u8> {
@@ -27,6 +27,7 @@ impl Translator {
                 call_id: call_id.into(),
                 name: name.into(),
                 arguments: String::new(),
+                started: false,
             });
             self.tool_indexes.insert(slot, index);
             index
@@ -42,9 +43,11 @@ impl Translator {
                 call_id,
                 name,
                 arguments: accumulated,
+                started,
             }) => {
-                if accumulated.is_empty() {
+                if !*started {
                     output.extend(event_bytes(&mut self.sequence, &self.response_id, "response.output_item.added", json!({"output_index":index,"item":{"id":id,"type":"function_call","status":"in_progress","call_id":call_id,"name":name,"arguments":""}})));
+                    *started = true;
                 }
                 accumulated.push_str(arguments);
                 id.clone()

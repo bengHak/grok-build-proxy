@@ -2,6 +2,10 @@ use super::{WIRE_MODEL, is_model};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+mod history;
+
+use history::translate_input;
+
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 
 pub fn translate_request(raw: &[u8], session_id: &str) -> Result<Value> {
@@ -27,11 +31,7 @@ pub fn translate_request(raw: &[u8], session_id: &str) -> Result<Value> {
     }
     match request.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role":"user","content":text})),
-        Some(Value::Array(items)) => {
-            for item in items {
-                translate_input_item(item, &mut messages)?;
-            }
-        }
+        Some(Value::Array(items)) => translate_input(items, &mut messages)?,
         Some(Value::Null) | None => {}
         Some(_) => bail!("input must be a string or array"),
     }
@@ -72,75 +72,11 @@ pub fn translate_request(raw: &[u8], session_id: &str) -> Result<Value> {
     Ok(translated)
 }
 
-fn translate_input_item(item: &Value, messages: &mut Vec<Value>) -> Result<()> {
-    let kind = item
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("message");
-    match kind {
-        "message" => {
-            let role = item
-                .get("role")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("message role is required"))?;
-            let role = match role {
-                "developer" | "system" => "system",
-                "user" => "user",
-                "assistant" => "assistant",
-                other => bail!("unsupported message role {other:?}"),
-            };
-            messages.push(json!({"role":role,"content":text_content(item.get("content"))}));
-        }
-        "function_call" => {
-            let call_id = required_string(item, "call_id")?;
-            let name = required_string(item, "name")?;
-            let arguments = item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            messages.push(json!({
-                "role":"assistant",
-                "content":"",
-                "tool_calls":[{"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}}]
-            }));
-        }
-        "function_call_output" => {
-            messages.push(json!({
-                "role":"tool",
-                "tool_call_id":required_string(item,"call_id")?,
-                "content":tool_output(item.get("output")),
-            }));
-        }
-        "reasoning" => {}
-        other => bail!("unsupported Responses input item {other:?}"),
-    }
-    Ok(())
-}
-
 fn required_string<'a>(item: &'a Value, key: &str) -> Result<&'a str> {
     item.get(key)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("{key} is required"))
-}
-
-fn text_content(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect(),
-        _ => String::new(),
-    }
-}
-
-fn tool_output(output: Option<&Value>) -> Value {
-    match output {
-        Some(Value::String(text)) => text.clone().into(),
-        Some(value) => serde_json::to_string(value).unwrap_or_default().into(),
-        None => "".into(),
-    }
 }
 
 fn translate_tools(tools: Option<&Value>) -> Result<Option<Value>> {

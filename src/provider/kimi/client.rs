@@ -6,7 +6,6 @@ use crate::auth::CredentialProvider;
 use super::{auth::Store, request::translate_request};
 
 pub async fn send(
-    client: &reqwest::Client,
     upstream_url: &str,
     store: &Store,
     raw: &[u8],
@@ -18,7 +17,8 @@ pub async fn send(
         .await
         .context("load Kimi credentials")?;
     let body = translate_request(raw, session_id)?;
-    let response = client
+    let response = store
+        .http_client()
         .post(upstream_url)
         .headers(store.headers().await?)
         .bearer_auth(credentials.access_token)

@@ -6,6 +6,14 @@ use tokio::{fs, io::AsyncWriteExt};
 use super::StoredAuth;
 
 pub(super) async fn load_auth(path: &Path) -> Result<StoredAuth> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to read Kimi credentials through a symbolic link")
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect Kimi auth file"),
+    }
     let data = fs::read(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             anyhow!(
@@ -59,26 +67,35 @@ fn device_id_path(auth_path: &Path) -> PathBuf {
 
 async fn save_private(path: &Path, data: &[u8]) -> Result<()> {
     let directory = path.parent().unwrap_or(Path::new("."));
+    let directory_existed = fs::metadata(directory).await.is_ok();
     fs::create_dir_all(directory).await?;
     #[cfg(unix)]
-    {
+    if !directory_existed {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).await?;
     }
     let temporary = directory.join(format!(".kimi-auth-{}", uuid::Uuid::new_v4()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)
-        .await?;
-    file.write_all(data).await?;
-    file.sync_all().await?;
-    drop(file);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).await?;
+    let result = async {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary).await?;
+        file.write_all(data).await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&temporary, path).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+        fs::File::open(directory).await?.sync_all().await?;
+        Ok::<(), anyhow::Error>(())
     }
-    fs::rename(&temporary, path).await?;
-    Ok(())
+    .await;
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary).await;
+    }
+    result
 }

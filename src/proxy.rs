@@ -75,7 +75,7 @@ struct AppState(Arc<ProxyConfig>);
 pub fn router(config: ProxyConfig) -> Result<Router> {
     url::Url::parse(&config.upstream_url).context("invalid upstream URL")?;
     if let Some(kimi) = &config.kimi {
-        url::Url::parse(&kimi.upstream_url).context("invalid Kimi upstream URL")?;
+        kimi::validate_upstream_url(&kimi.upstream_url)?;
     }
     let limit = config.max_body_bytes;
     let state = AppState(Arc::new(config));
@@ -135,32 +135,27 @@ async fn ready(State(s): State<AppState>, method: Method, headers: HeaderMap) ->
             "method not allowed",
         );
     };
-    let codex = s.0.credentials.get(false).await;
-    let kimi = match &s.0.kimi {
-        Some(config) => Some(config.credentials.get(false).await),
-        None => None,
+    let codex_error = match s.0.credentials.get(false).await {
+        Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
+        Err(error) => error,
     };
-    if codex.is_ok() || kimi.as_ref().is_some_and(Result::is_ok) {
-        Json(json!({
-            "ok": true,
-            "auth": {
-                "codex": codex.is_ok(),
-                "kimi": kimi.as_ref().is_some_and(Result::is_ok)
+    if let Some(config) = &s.0.kimi {
+        match config.credentials.get(false).await {
+            Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
+            Err(kimi_error) => {
+                return error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication_error",
+                    format!("Codex: {codex_error}; Kimi: {kimi_error}"),
+                );
             }
-        }))
-        .into_response()
-    } else {
-        let message = codex
-            .err()
-            .map(|error| error.to_string())
-            .or_else(|| kimi.and_then(Result::err).map(|error| error.to_string()))
-            .unwrap_or_else(|| "no provider credentials configured".into());
-        error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "authentication_error",
-            message,
-        )
+        }
     }
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "authentication_error",
+        codex_error.to_string(),
+    )
 }
 fn unauthorized() -> Response {
     let mut r = error(
@@ -451,6 +446,19 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     .find(|v| valid_header(v))
     .unwrap_or(&request_id)
     .to_owned();
+    if transformed.provider == Provider::Kimi {
+        if let Err(error_message) = kimi::request::translate_request(&transformed.body, &session_id)
+        {
+            return with_request_id(
+                error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    error_message.to_string(),
+                ),
+                &request_id,
+            );
+        }
+    }
     let started = std::time::Instant::now();
     let mut base_event = RequestEvent {
         kind: RequestEventKind::Started,
@@ -894,7 +902,6 @@ async fn send_upstream(
                 .as_ref()
                 .context("Kimi provider is not configured")?;
             kimi::client::send(
-                &cfg.client,
                 &config.upstream_url,
                 &config.credentials,
                 &t.body,
