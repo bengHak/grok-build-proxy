@@ -28,6 +28,7 @@ use widgets::{
     ActivePanel, FailuresPanel, Footer, Header, HelpOverlay, SessionsPanel, TurnKind, truncate,
 };
 
+use crate::report::{self, ReportMeta};
 pub use crate::store::{Dashboard, FailureRecord, Request, Session, Snapshot};
 
 /// Max chars shown for `error_message` in the failure detail modal (full value stays in store).
@@ -68,6 +69,7 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
         let sessions_len = snapshot.sessions.len();
         let active_len = ActivePanel::row_count(&snapshot);
         let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
+        app.tick_toast();
         app.clamp_selection(sessions_len, active_len, failures_len);
 
         terminal.draw(|frame| {
@@ -92,13 +94,17 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
                 if app.handle(key, sessions_len, active_len, failures_len) {
                     return Ok(());
                 }
+                // Report export: filtered failures → clipboard (y/Y) or file (w/W).
+                if let Some(outcome) = try_export(key.code, &snapshot, &app, address, version) {
+                    app.set_toast(outcome.toast());
+                }
                 // After Enter on Failures, pin stable request_id so live push_front
                 // does not swap the overlay to a different row.
                 if app.mode == Mode::Detail
                     && app.focus == Focus::Failures
                     && app.detail_request_id.is_none()
                 {
-                    let rows = FailuresPanel::filtered(&snapshot, app.failure_filter);
+                    let rows = FailuresPanel::ordered(&snapshot, app.failure_filter);
                     if let Some(f) = rows.get(app.selected) {
                         app.pin_failure_detail(f.request_id.clone());
                     }
@@ -110,6 +116,34 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
         }
         tokio::task::yield_now().await;
     }
+}
+
+/// Handle y/Y (copy) and w/W (write). Returns `None` for unrelated keys.
+fn try_export(
+    code: event::KeyCode,
+    snapshot: &Snapshot,
+    app: &App,
+    address: &str,
+    version: &str,
+) -> Option<report::ExportOutcome> {
+    use event::KeyCode;
+    let json = match code {
+        KeyCode::Char('y' | 'w') => false,
+        KeyCode::Char('Y' | 'W') => true,
+        _ => return None,
+    };
+    let copy = matches!(code, KeyCode::Char('y' | 'Y'));
+    // Export the currently filtered set (group display order for readability).
+    let records: Vec<FailureRecord> = FailuresPanel::ordered(snapshot, app.failure_filter)
+        .into_iter()
+        .cloned()
+        .collect();
+    let meta = ReportMeta::new(version, address, app.failure_filter.as_str());
+    Some(if copy {
+        report::export_copy(&records, &meta, json)
+    } else {
+        report::export_write(&records, &meta, json)
+    })
 }
 
 fn draw(
@@ -184,7 +218,11 @@ fn draw(
     }
     .render(body[1], buf);
 
-    Footer { theme }.render(chunks[2], buf);
+    Footer {
+        theme,
+        toast: app.toast_message(),
+    }
+    .render(chunks[2], buf);
 
     match app.mode {
         Mode::Help => HelpOverlay { theme }.render(area, buf),
@@ -286,8 +324,8 @@ fn failure_detail_text(snapshot: &Snapshot, app: &App) -> String {
             None => return format!("Failure {id}\n  (failure no longer in ring)"),
         }
     } else {
-        // Fallback for tests / before pin: index into filtered list.
-        match FailuresPanel::filtered(snapshot, app.failure_filter).get(app.selected) {
+        // Fallback for tests / before pin: index into group-ordered list.
+        match FailuresPanel::ordered(snapshot, app.failure_filter).get(app.selected) {
             Some(f) => *f,
             None => return "No failure selected".into(),
         }
@@ -499,6 +537,22 @@ mod tests {
             text.contains("j/k") || text.contains("quit") || text.contains("filter"),
             "footer bindings missing:\n{text}"
         );
+        assert!(
+            text.contains(" y ") || text.contains("copy") || text.contains(" w "),
+            "footer missing export bindings:\n{text}"
+        );
+    }
+
+    #[test]
+    fn footer_shows_toast() {
+        let snap = Snapshot::default();
+        let mut app = App::new();
+        app.set_toast("wrote 2 failures (md) → /tmp/x.md");
+        let text = render_test(100, 20, &snap, "127.0.0.1:1", "0.0.12", &app);
+        assert!(
+            text.contains("wrote 2 failures") || text.contains("status"),
+            "toast missing from footer:\n{text}"
+        );
     }
 
     #[test]
@@ -648,7 +702,7 @@ mod tests {
         let snap = Snapshot::default();
         let mut app = App::new();
         app.mode = Mode::Help;
-        let text = render_test(80, 22, &snap, "127.0.0.1:1", "0.0.12", &app);
+        let text = render_test(80, 24, &snap, "127.0.0.1:1", "0.0.12", &app);
         assert!(text.contains("Monitor help"), "help text missing:\n{text}");
         assert!(
             text.contains("Shift-Tab") || text.contains("Tab"),
@@ -658,5 +712,101 @@ mod tests {
             text.contains("filter") || text.contains(" f "),
             "help missing filter key:\n{text}"
         );
+        assert!(
+            text.contains("copy") || text.contains(" y "),
+            "help missing copy report key:\n{text}"
+        );
+        assert!(
+            text.contains("write") || text.contains(" w "),
+            "help missing write report key:\n{text}"
+        );
+    }
+
+    #[test]
+    fn estimated_retry_group_label_in_panel() {
+        use chrono::{Duration, TimeZone, Utc};
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+        // Newest-first ring order.
+        let snap = Snapshot {
+            failures: vec![
+                FailureRecord {
+                    ts: t0 + Duration::seconds(10),
+                    request_id: "r2".into(),
+                    session_id: "sess-retry".into(),
+                    requested_model: "a".into(),
+                    model: "m".into(),
+                    status_code: 200,
+                    duration_ms: 100,
+                    kind: FailureKind::ProxyAssemble,
+                    error_type: "proxy_incomplete_output".into(),
+                    error_message: "x".into(),
+                    response_id: String::new(),
+                    mapped: true,
+                    lite: false,
+                    fast: false,
+                    auth_retried: false,
+                    attempt: 1,
+                    output_count: 0,
+                    capture_bytes: 0,
+                    session_failure_index: 2,
+                },
+                FailureRecord {
+                    ts: t0,
+                    request_id: "r1".into(),
+                    session_id: "sess-retry".into(),
+                    requested_model: "a".into(),
+                    model: "m".into(),
+                    status_code: 200,
+                    duration_ms: 100,
+                    kind: FailureKind::ProxyAssemble,
+                    error_type: "proxy_incomplete_output".into(),
+                    error_message: "x".into(),
+                    response_id: String::new(),
+                    mapped: true,
+                    lite: false,
+                    fast: false,
+                    auth_retried: false,
+                    attempt: 1,
+                    output_count: 0,
+                    capture_bytes: 0,
+                    session_failure_index: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        let app = App::new();
+        let text = render_test(120, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        assert!(
+            text.contains("estimated"),
+            "retry group should show estimated label:\n{text}"
+        );
+        assert!(
+            text.contains("×2") || text.contains("x2") || text.contains("2 estimated"),
+            "retry group size missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn try_export_keys_and_empty() {
+        use crossterm::event::KeyCode;
+        let snap = fixture_dashboard().snapshot();
+        let app = App::new();
+        let out = try_export(KeyCode::Char('w'), &snap, &app, "127.0.0.1:1", "0.0.12")
+            .expect("w is export");
+        match out {
+            report::ExportOutcome::Written { count, json, .. } => {
+                assert_eq!(count, 2);
+                assert!(!json);
+            }
+            report::ExportOutcome::Copied { .. } => panic!("w should write"),
+            report::ExportOutcome::Empty => panic!("expected failures"),
+            report::ExportOutcome::Error(e) => panic!("write failed: {e}"),
+        }
+        assert!(try_export(KeyCode::Char('j'), &snap, &app, "a", "v").is_none());
+
+        let empty = Snapshot::default();
+        let empty_out =
+            try_export(KeyCode::Char('y'), &empty, &app, "a", "v").expect("y is export");
+        assert!(matches!(empty_out, report::ExportOutcome::Empty));
     }
 }

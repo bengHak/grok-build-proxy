@@ -71,6 +71,9 @@ impl FailureFilter {
     }
 }
 
+/// Footer toast lifetime for export feedback.
+const TOAST_SECS: u64 = 5;
+
 #[derive(Clone, Debug, Default)]
 pub struct App {
     pub mode: Mode,
@@ -81,6 +84,9 @@ pub struct App {
     pub detail_request_id: Option<String>,
     /// Wall-clock start of the monitor loop (for uptime).
     pub started_at: Option<std::time::Instant>,
+    /// Transient footer status (export path / clipboard result).
+    pub toast: Option<String>,
+    toast_set_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -93,6 +99,33 @@ impl App {
 
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
+    }
+
+    /// Set a footer toast (auto-clears after a few seconds).
+    pub fn set_toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some(msg.into());
+        self.toast_set_at = Some(std::time::Instant::now());
+    }
+
+    /// Active toast text, or `None` if expired / unset.
+    pub fn toast_message(&self) -> Option<&str> {
+        let set_at = self.toast_set_at?;
+        if set_at.elapsed().as_secs() >= TOAST_SECS {
+            return None;
+        }
+        self.toast.as_deref()
+    }
+
+    /// Drop expired toast so it does not linger in state forever.
+    pub fn tick_toast(&mut self) {
+        if self.toast.is_some()
+            && self
+                .toast_set_at
+                .is_some_and(|t| t.elapsed().as_secs() >= TOAST_SECS)
+        {
+            self.toast = None;
+            self.toast_set_at = None;
+        }
     }
 
     /// Clamp selection into the focused panel's row count.
@@ -354,5 +387,15 @@ mod tests {
         app.focus = Focus::Failures;
         app.handle(key(KeyCode::Enter), 0, 0, 0);
         assert_eq!(app.mode, Mode::Dashboard);
+    }
+
+    #[test]
+    fn toast_set_and_read() {
+        let mut app = App::new();
+        assert!(app.toast_message().is_none());
+        app.set_toast("copied 1 failure");
+        assert_eq!(app.toast_message(), Some("copied 1 failure"));
+        app.tick_toast();
+        assert_eq!(app.toast_message(), Some("copied 1 failure"));
     }
 }
