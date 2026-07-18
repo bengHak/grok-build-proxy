@@ -5,6 +5,7 @@ mod failures;
 mod footer;
 mod header;
 mod help;
+mod metrics;
 mod sessions;
 
 pub use active::{ActivePanel, TurnKind};
@@ -12,6 +13,7 @@ pub use failures::FailuresPanel;
 pub use footer::Footer;
 pub use header::Header;
 pub use help::HelpOverlay;
+pub use metrics::{MetricsStrip, should_show_metrics};
 pub use sessions::SessionsPanel;
 
 /// Truncate a display string to `max` chars, appending `…` when needed.
