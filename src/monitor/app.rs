@@ -200,12 +200,7 @@ impl App {
     }
 
     /// Clamp selection into the focused panel's row count.
-    pub fn clamp_selection(
-        &mut self,
-        sessions_len: usize,
-        detail_len: usize,
-        failures_len: usize,
-    ) {
+    pub fn clamp_selection(&mut self, sessions_len: usize, detail_len: usize, failures_len: usize) {
         let count = match self.focus {
             Focus::Sessions => sessions_len,
             Focus::SessionDetail => detail_len,

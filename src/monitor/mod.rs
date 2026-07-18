@@ -396,8 +396,7 @@ fn detail_text(snapshot: &Snapshot, app: &App) -> String {
             }
         }
         Focus::SessionDetail => {
-            let rows =
-                SessionDetailPanel::rows(snapshot, app.selected_session_id.as_deref());
+            let rows = SessionDetailPanel::rows(snapshot, app.selected_session_id.as_deref());
             if let Some((kind, r)) = rows.get(app.selected) {
                 let kind_label = match kind {
                     TurnKind::Active => "active",
@@ -748,7 +747,10 @@ mod tests {
         );
         // tok/s spark ring is 1 Hz fleet avg (not per-completion); push one sample.
         let avg = fleet_avg_tok_s(&snap);
-        assert!(avg > 0.0, "fixture sessions should have a positive fleet avg");
+        assert!(
+            avg > 0.0,
+            "fixture sessions should have a positive fleet avg"
+        );
         d.push_tok_s_sample(avg);
         let snap = d.snapshot();
         assert!(
