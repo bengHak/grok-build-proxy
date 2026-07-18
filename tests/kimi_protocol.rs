@@ -32,6 +32,16 @@ fn events(stream: &[u8]) -> Vec<Value> {
         .collect()
 }
 
+fn events_without_created_at(stream: &[u8]) -> Vec<Value> {
+    let mut parsed = events(stream);
+    for event in &mut parsed {
+        if let Some(response) = event.get_mut("response").and_then(Value::as_object_mut) {
+            response.remove("created_at");
+        }
+    }
+    parsed
+}
+
 #[test]
 fn kimi_catalog_aliases_resolve_to_the_canonical_wire_model() {
     let catalog = Catalog::default();
@@ -163,10 +173,13 @@ fn kimi_stream_translation_is_invariant_to_network_chunk_boundaries() {
         "data: [DONE]\n\n"
     )
     .as_bytes();
-    let expected = translate_stream(upstream, upstream.len());
+    let expected = events_without_created_at(&translate_stream(upstream, upstream.len()));
 
     for chunk_size in 1..=upstream.len() {
-        assert_eq!(translate_stream(upstream, chunk_size), expected);
+        assert_eq!(
+            events_without_created_at(&translate_stream(upstream, chunk_size)),
+            expected
+        );
     }
 }
 
