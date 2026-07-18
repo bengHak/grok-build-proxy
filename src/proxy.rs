@@ -19,9 +19,10 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::RandomState},
+    hash::{BuildHasher, Hash, Hasher},
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tracing::info;
 
@@ -29,6 +30,8 @@ pub use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind};
 
 pub const DEFAULT_CODEX_COMPATIBILITY_VERSION: &str = "0.144.0";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
+
+static REQUEST_FINGERPRINT_STATE: OnceLock<RandomState> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -600,7 +603,7 @@ fn cwd_tag(text: &str) -> Option<String> {
 
 #[derive(Debug)]
 pub struct TransformedRequest {
-    pub body: Vec<u8>,
+    pub body: Bytes,
     pub requested_model: String,
     pub model: String,
     pub mapped: bool,
@@ -608,6 +611,8 @@ pub struct TransformedRequest {
     pub fast: bool,
     pub stream: bool,
     pub provider: Provider,
+    pub input_item_count: u32,
+    pub request_fingerprint: String,
 }
 pub fn transform_request(
     raw: &[u8],
@@ -657,8 +662,13 @@ pub fn transform_request(
     } else {
         object.entry("parallel_tool_calls").or_insert(true.into());
     }
+    let input_item_count = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map_or(0, |items| items.len().min(u32::MAX as usize) as u32);
+    let request_fingerprint = request_fingerprint(&body);
     Ok(TransformedRequest {
-        body: serde_json::to_vec(&body)?,
+        body: Bytes::from(serde_json::to_vec(&body)?),
         requested_model: requested,
         model: resolution.model,
         mapped: resolution.mapped,
@@ -666,6 +676,8 @@ pub fn transform_request(
         fast,
         stream,
         provider: model.provider,
+        input_item_count,
+        request_fingerprint,
     })
 }
 fn apply_responses_lite(body: &mut Map<String, Value>) {
@@ -748,7 +760,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         }
     };
     let session_context = extract_session_context(&body, &incoming_headers);
-    let transformed = match transform_request(&body, &s.0.catalog, &s.0.model_map) {
+    let mut transformed = match transform_request(&body, &s.0.catalog, &s.0.model_map) {
         Ok(v) => v,
         Err(e) => {
             return with_request_id(
@@ -764,6 +776,24 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     let identity =
         UpstreamIdentity::from_request(&incoming_headers, &transformed.body, &request_id);
     let session_id = identity.thread_id.clone();
+    if transformed.provider == Provider::Codex {
+        let prepared = match prepare_codex_request(&transformed.body, &identity, transformed.lite) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                return with_request_id(
+                    error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        e.to_string(),
+                    ),
+                    &request_id,
+                );
+            }
+        };
+        transformed.body = prepared.body;
+        transformed.input_item_count = prepared.input_item_count;
+        transformed.request_fingerprint = prepared.request_fingerprint;
+    }
     if transformed.provider == Provider::Kimi
         && let Err(error_message) =
             kimi::request::translate_request(&transformed.body, identity.cache_key.as_deref())
@@ -1353,7 +1383,6 @@ async fn send_codex_upstream(
         .get(force)
         .await
         .context("load Codex credentials")?;
-    let compatible_body = codex_compat_body_for_identity(&t.body, identity, t.lite)?;
     let mut req = cfg
         .client
         .post(&cfg.upstream_url)
@@ -1410,7 +1439,7 @@ async fn send_codex_upstream(
             req = req.header(key, v);
         }
     }
-    Ok(req.body(compatible_body).send().await?)
+    Ok(req.body(t.body.clone()).send().await?)
 }
 
 pub fn codex_compat_body(raw: &[u8], session: &str, lite: bool) -> Result<Vec<u8>> {
@@ -1427,6 +1456,66 @@ fn codex_compat_body_for_identity(
     identity: &UpstreamIdentity,
     lite: bool,
 ) -> Result<Vec<u8>> {
+    Ok(prepare_codex_request(raw, identity, lite)?.body.to_vec())
+}
+
+#[derive(Debug)]
+struct PreparedCodexRequest {
+    body: Bytes,
+    input_item_count: u32,
+    request_fingerprint: String,
+}
+
+fn request_fingerprint(value: &Value) -> String {
+    let state = REQUEST_FINGERPRINT_STATE.get_or_init(RandomState::new);
+    let mut hasher = state.build_hasher();
+    hash_request_value(value, &mut hasher, true);
+    format!("{:016x}", hasher.finish())
+}
+
+fn hash_request_value<H: Hasher>(value: &Value, hasher: &mut H, root: bool) {
+    match value {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(value) => {
+            1u8.hash(hasher);
+            value.hash(hasher);
+        }
+        Value::Number(value) => {
+            2u8.hash(hasher);
+            value.to_string().hash(hasher);
+        }
+        Value::String(value) => {
+            3u8.hash(hasher);
+            value.hash(hasher);
+        }
+        Value::Array(values) => {
+            4u8.hash(hasher);
+            values.len().hash(hasher);
+            for value in values {
+                hash_request_value(value, hasher, false);
+            }
+        }
+        Value::Object(values) => {
+            5u8.hash(hasher);
+            let mut entries: Vec<_> = values
+                .iter()
+                .filter(|(key, _)| !(root && key.as_str() == "client_metadata"))
+                .collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            entries.len().hash(hasher);
+            for (key, value) in entries {
+                key.hash(hasher);
+                hash_request_value(value, hasher, false);
+            }
+        }
+    }
+}
+
+fn prepare_codex_request(
+    raw: &[u8],
+    identity: &UpstreamIdentity,
+    lite: bool,
+) -> Result<PreparedCodexRequest> {
     let mut value: Value = serde_json::from_slice(raw).context("decode Codex request body")?;
     let body = value
         .as_object_mut()
@@ -1550,7 +1639,16 @@ fn codex_compat_body_for_identity(
         );
         body.entry("instructions").or_insert("".into());
     }
-    Ok(serde_json::to_vec(&value)?)
+    let input_item_count = value
+        .get("input")
+        .and_then(Value::as_array)
+        .map_or(0, |items| items.len().min(u32::MAX as usize) as u32);
+    let request_fingerprint = request_fingerprint(&value);
+    Ok(PreparedCodexRequest {
+        body: Bytes::from(serde_json::to_vec(&value)?),
+        input_item_count,
+        request_fingerprint,
+    })
 }
 
 fn normalize_input_item(value: &mut Value) {
@@ -1771,6 +1869,56 @@ fn repair_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_fingerprint_ignores_dynamic_metadata_and_key_order() {
+        let a = br#"{
+            "model":"gpt-5.6-sol",
+            "input":[{"id":"msg-a","type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}]}],
+            "client_metadata":{"turn_id":"turn-a"}
+        }"#;
+        let b = br#"{
+            "client_metadata":{"turn_id":"turn-b"},
+            "input":[{"content":[{"text":"inspect","type":"input_text"}],"role":"user","type":"message","id":"msg-b"}],
+            "model":"gpt-5.6-sol"
+        }"#;
+        let identity = UpstreamIdentity {
+            thread_id: "session".into(),
+            request_id: "request".into(),
+            cache_key: Some("conversation".into()),
+        };
+
+        let a = prepare_codex_request(a, &identity, true).unwrap();
+        let b = prepare_codex_request(b, &identity, true).unwrap();
+
+        assert!(!a.request_fingerprint.is_empty());
+        assert_eq!(a.request_fingerprint, b.request_fingerprint);
+        assert_eq!(a.input_item_count, b.input_item_count);
+    }
+
+    #[test]
+    fn request_fingerprint_changes_with_model_visible_input() {
+        let identity = UpstreamIdentity {
+            thread_id: "session".into(),
+            request_id: "request".into(),
+            cache_key: Some("conversation".into()),
+        };
+        let a = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"inspect A"}"#,
+            &identity,
+            true,
+        )
+        .unwrap();
+        let b = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"inspect B"}"#,
+            &identity,
+            true,
+        )
+        .unwrap();
+
+        assert_ne!(a.request_fingerprint, b.request_fingerprint);
+    }
+
     #[test]
     fn transforms_lite() {
         let c = Catalog::default();
