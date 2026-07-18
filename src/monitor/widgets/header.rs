@@ -1,6 +1,7 @@
 //! Top status bar: version, listen address, uptime, active, errors, tok/s.
 
 use crate::monitor::theme::Theme;
+use crate::monitor::widgets::metrics::fleet_avg_tok_s;
 use crate::store::Snapshot;
 use ratatui::{
     buffer::Buffer,
@@ -23,7 +24,7 @@ impl Widget for Header<'_> {
         let active = self.snapshot.active.len();
         // Canonical failure ring (cap 200); prefer over legacy `errors` (cap 50).
         let errors = self.snapshot.failures.len();
-        let tok_s = average_tok_s(self.snapshot);
+        let tok_s = fleet_avg_tok_s(self.snapshot);
         let uptime = format_uptime(self.uptime_secs);
 
         let line = Line::from(vec![
@@ -49,23 +50,6 @@ impl Widget for Header<'_> {
             .block(block)
             .render(area, buf);
     }
-}
-
-fn average_tok_s(snapshot: &Snapshot) -> f64 {
-    if !snapshot.metrics_tok_per_s.is_empty() {
-        let sum: f64 = snapshot.metrics_tok_per_s.iter().sum();
-        return sum / snapshot.metrics_tok_per_s.len() as f64;
-    }
-    let mut total = 0.0;
-    let mut n = 0usize;
-    for s in &snapshot.sessions {
-        let t = s.tokens_per_second();
-        if t > 0.0 {
-            total += t;
-            n += 1;
-        }
-    }
-    if n == 0 { 0.0 } else { total / n as f64 }
 }
 
 fn format_uptime(secs: u64) -> String {

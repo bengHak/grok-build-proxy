@@ -90,17 +90,19 @@ that can use the selected Codex model.
 
 When standard input and output are attached to a terminal, `grok-build-proxy
 serve` (and the default `grok-build-proxy` command) opens an interactive monitor
-instead of scrolling logs. It shows sessions, active and recent requests, a
-metrics strip (tok/s, rolling `fail%`, and recent completion-outcome sparklines
-from store samples — distinct from the header `err●N` failure-ring count), and a failures
-panel classified from real proxy traffic.
+instead of scrolling logs. It shows **active sessions** only (in-flight
+requests), a **session detail** panel for the selected session's active and
+recent turns, a metrics strip (`tok/s` = mean of per-session lifetime rates with
+a 1 Hz sparkline history; rolling `fail%` and completion-outcome sparklines —
+distinct from the header `err●N` failure-ring count), and a failures panel
+classified from real proxy traffic.
 
 **Keybindings**
 
 | Key | Action |
 |---|---|
 | `j` / `k` or `↓` / `↑` | Move selection within the focused panel |
-| `Tab` / `Shift-Tab` | Cycle panel focus: sessions → active → failures |
+| `Tab` / `Shift-Tab` | Cycle panel focus: sessions → session detail → failures |
 | `f` | Cycle failure filter: All → ProxyAssemble → Upstream → Auth → Stream |
 | `y` / `Y` | Copy filtered failure report (markdown / JSON) to the clipboard |
 | `w` / `W` | Write filtered failure report to disk (markdown / JSON) |
