@@ -64,6 +64,63 @@ impl CompatMode {
 #[derive(Clone)]
 struct AppState(Arc<ProxyConfig>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UpstreamIdentity {
+    /// Current Grok Build conversation/thread identity.
+    thread_id: String,
+    /// Stable namespace used to route matching prompt prefixes to the same cache shard.
+    cache_key: String,
+}
+
+impl UpstreamIdentity {
+    fn from_request(headers: &HeaderMap, body: &[u8], fallback: &str) -> Self {
+        let thread_id = first_valid_header(
+            headers,
+            &[
+                "x-grok-session-id",
+                "x-grok-conv-id",
+                "x-grok-req-id",
+                "x-request-id",
+            ],
+        )
+        .unwrap_or(fallback)
+        .to_owned();
+
+        // A standard Responses API prompt_cache_key is authoritative when supplied.
+        // The lineage header lets fork/subagent clients share the parent's cache namespace
+        // while keeping an independent thread identity.
+        let explicit_cache_key = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("prompt_cache_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|value| valid_cache_key(value));
+        let lineage_cache_key =
+            first_valid_header(headers, &["x-grok-cache-lineage-id"]).map(str::to_owned);
+        let cache_key = explicit_cache_key
+            .or(lineage_cache_key)
+            .unwrap_or_else(|| thread_id.clone());
+
+        Self {
+            thread_id,
+            cache_key,
+        }
+    }
+}
+
+fn first_valid_header<'a>(headers: &'a HeaderMap, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| headers.get(*key)?.to_str().ok())
+        .find(|value| valid_header(value))
+}
+
+fn valid_cache_key(value: &str) -> bool {
+    valid_header(value)
+}
+
 pub fn router(config: ProxyConfig) -> Result<Router> {
     url::Url::parse(&config.upstream_url).context("invalid upstream URL")?;
     let limit = config.max_body_bytes;
@@ -398,17 +455,9 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             );
         }
     };
-    let session_id = [
-        "x-grok-session-id",
-        "x-grok-conv-id",
-        "x-grok-req-id",
-        "x-request-id",
-    ]
-    .iter()
-    .filter_map(|k| incoming_headers.get(*k)?.to_str().ok())
-    .find(|v| valid_header(v))
-    .unwrap_or(&request_id)
-    .to_owned();
+    let identity =
+        UpstreamIdentity::from_request(&incoming_headers, &transformed.body, &request_id);
+    let session_id = identity.thread_id.clone();
     let started = std::time::Instant::now();
     let mut base_event = RequestEvent {
         kind: RequestEventKind::Started,
@@ -436,7 +485,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         observer.observe(base_event.clone());
     }
     let mut upstream =
-        match send_upstream(&s.0, &transformed, &incoming_headers, &session_id, false).await {
+        match send_upstream(&s.0, &transformed, &incoming_headers, &identity, false).await {
             Ok(r) => r,
             Err(e) => {
                 observe_failure(
@@ -461,24 +510,24 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         if let Some(observer) = &s.0.observer {
             observer.observe(base_event.clone());
         }
-        upstream =
-            match send_upstream(&s.0, &transformed, &incoming_headers, &session_id, true).await {
-                Ok(r) => r,
-                Err(e) => {
-                    observe_failure(
-                        &s.0,
-                        &base_event,
-                        FailureKind::AuthRetryFailed,
-                        "auth_retry_failed",
-                        e.to_string(),
-                        StatusCode::BAD_GATEWAY,
-                    );
-                    return with_request_id(
-                        error(StatusCode::BAD_GATEWAY, "upstream_error", e.to_string()),
-                        &request_id,
-                    );
-                }
-            };
+        upstream = match send_upstream(&s.0, &transformed, &incoming_headers, &identity, true).await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                observe_failure(
+                    &s.0,
+                    &base_event,
+                    FailureKind::AuthRetryFailed,
+                    "auth_retry_failed",
+                    e.to_string(),
+                    StatusCode::BAD_GATEWAY,
+                );
+                return with_request_id(
+                    error(StatusCode::BAD_GATEWAY, "upstream_error", e.to_string()),
+                    &request_id,
+                );
+            }
+        };
         // Still-401 classification is handled in observe_stream_end (auth_retried + 401).
     }
     let status =
@@ -595,18 +644,83 @@ fn capture_tail(buffer: &mut Vec<u8>, chunk: &[u8]) {
         buffer.extend_from_slice(chunk);
     }
 }
-fn observed_output_tokens(bytes: &[u8]) -> u64 {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ObservedUsage {
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_tokens: u64,
+    output_tokens: u64,
+}
+
+fn observed_usage(bytes: &[u8]) -> ObservedUsage {
     let text = String::from_utf8_lossy(bytes);
-    let marker = "\"output_tokens\"";
-    text.match_indices(marker)
-        .filter_map(|(index, _)| {
-            let rest = &text[index + marker.len()..];
-            let rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ':');
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse().ok()
-        })
-        .last()
-        .unwrap_or(0)
+    let mut observed = ObservedUsage::default();
+    let mut found = false;
+
+    for frame in text.split("\n\n") {
+        let data_lines: Vec<&str> = frame
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|value| value.strip_prefix(' ').unwrap_or(value))
+            .collect();
+        if data_lines.is_empty() {
+            continue;
+        }
+        let joined;
+        let data = if data_lines.len() == 1 {
+            data_lines[0]
+        } else {
+            joined = data_lines.join("\n");
+            joined.as_str()
+        };
+        if data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(data)
+            && let Some(usage) = usage_from_value(&value)
+        {
+            observed = usage;
+            found = true;
+        }
+    }
+
+    if !found
+        && let Ok(value) = serde_json::from_str::<Value>(text.trim())
+        && let Some(usage) = usage_from_value(&value)
+    {
+        observed = usage;
+    }
+
+    observed
+}
+
+fn usage_from_value(value: &Value) -> Option<ObservedUsage> {
+    let usage = value
+        .pointer("/response/usage")
+        .or_else(|| value.get("usage"))?;
+    let details = usage.get("input_tokens_details");
+    Some(ObservedUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cached_input_tokens: details
+            .and_then(|value| value.get("cached_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_write_tokens: details
+            .and_then(|value| {
+                value
+                    .get("cache_write_tokens")
+                    .or_else(|| value.get("cache_creation_tokens"))
+            })
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
 }
 
 /// Ensures observe_stream_end runs even when the client disconnects and the body stream is dropped.
@@ -678,7 +792,31 @@ fn observe_stream_end(
     event.status_code = status.as_u16();
     event.duration_ms = event.started_at.elapsed().as_millis() as u64;
     event.capture_bytes = capture.len() as u32;
-    event.output_tokens = observed_output_tokens(capture);
+    let usage = observed_usage(capture);
+    event.output_tokens = usage.output_tokens;
+    if usage.input_tokens > 0
+        || usage.cached_input_tokens > 0
+        || usage.cache_write_tokens > 0
+        || usage.output_tokens > 0
+    {
+        let uncached_input_tokens = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
+        let cache_read_percent = if usage.input_tokens == 0 {
+            0
+        } else {
+            usage.cached_input_tokens.saturating_mul(100) / usage.input_tokens
+        };
+        info!(
+            request_id = event.request_id,
+            session_id = event.session_id,
+            input_tokens = usage.input_tokens,
+            cached_input_tokens = usage.cached_input_tokens,
+            cache_write_tokens = usage.cache_write_tokens,
+            uncached_input_tokens,
+            output_tokens = usage.output_tokens,
+            cache_read_percent,
+            "prompt cache usage"
+        );
+    }
 
     let diag = parse_capture_diagnostics(capture);
     if !diag.response_id.is_empty() {
@@ -768,7 +906,7 @@ async fn send_upstream(
     cfg: &ProxyConfig,
     t: &TransformedRequest,
     incoming: &HeaderMap,
-    session: &str,
+    identity: &UpstreamIdentity,
     force: bool,
 ) -> Result<reqwest::Response> {
     let creds = cfg
@@ -776,7 +914,7 @@ async fn send_upstream(
         .get(force)
         .await
         .context("load Codex credentials")?;
-    let compatible_body = codex_compat_body(&t.body, session, t.lite)?;
+    let compatible_body = codex_compat_body_for_identity(&t.body, identity, t.lite)?;
     let mut req = cfg
         .client
         .post(&cfg.upstream_url)
@@ -802,11 +940,11 @@ async fn send_upstream(
                 "grok-build-proxy"
             },
         )
-        .header("session-id", session)
-        .header("thread-id", session)
-        .header("x-session-affinity", session)
-        .header("x-client-request-id", session)
-        .header("x-codex-window-id", format!("{session}:0"))
+        .header("session-id", &identity.cache_key)
+        .header("thread-id", &identity.thread_id)
+        .header("x-session-affinity", &identity.cache_key)
+        .header("x-client-request-id", &identity.thread_id)
+        .header("x-codex-window-id", format!("{}:0", identity.thread_id))
         .header("version", &cfg.compatibility_version);
     if t.lite {
         req = req
@@ -829,6 +967,18 @@ async fn send_upstream(
 }
 
 pub fn codex_compat_body(raw: &[u8], session: &str, lite: bool) -> Result<Vec<u8>> {
+    let identity = UpstreamIdentity {
+        thread_id: session.to_owned(),
+        cache_key: session.to_owned(),
+    };
+    codex_compat_body_for_identity(raw, &identity, lite)
+}
+
+fn codex_compat_body_for_identity(
+    raw: &[u8],
+    identity: &UpstreamIdentity,
+    lite: bool,
+) -> Result<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(raw).context("decode Codex request body")?;
     let body = value
         .as_object_mut()
@@ -841,6 +991,8 @@ pub fn codex_compat_body(raw: &[u8], session: &str, lite: bool) -> Result<Vec<u8
         "model",
         "parallel_tool_calls",
         "prompt_cache_key",
+        "prompt_cache_options",
+        "prompt_cache_retention",
         "reasoning",
         "service_tier",
         "store",
@@ -852,7 +1004,13 @@ pub fn codex_compat_body(raw: &[u8], session: &str, lite: bool) -> Result<Vec<u8
     ];
     body.retain(|key, value| ALLOWED.contains(&key.as_str()) && !value.is_null());
     body.insert("store".into(), false.into());
-    body.insert("prompt_cache_key".into(), session.into());
+    let prompt_cache_key = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|value| valid_cache_key(value))
+        .map(str::to_owned)
+        .unwrap_or_else(|| identity.cache_key.clone());
+    body.insert("prompt_cache_key".into(), prompt_cache_key.into());
     match body.get("tool_choice") {
         None | Some(Value::Null) => {
             body.insert("tool_choice".into(), "auto".into());
@@ -895,9 +1053,12 @@ pub fn codex_compat_body(raw: &[u8], session: &str, lite: bool) -> Result<Vec<u8
             .ok_or_else(|| anyhow!("client_metadata must be an object"))?;
         object.retain(|_, v| v.is_string());
         object.remove("ws_request_header_x_openai_internal_codex_responses_lite");
-        object.insert("session_id".into(), session.into());
-        object.insert("thread_id".into(), session.into());
-        object.insert("window_id".into(), format!("{session}:0").into());
+        object.insert("session_id".into(), identity.cache_key.clone().into());
+        object.insert("thread_id".into(), identity.thread_id.clone().into());
+        object.insert(
+            "window_id".into(),
+            format!("{}:0", identity.thread_id).into(),
+        );
     }
     if lite {
         body.insert("parallel_tool_calls".into(), false.into());
@@ -1217,6 +1378,54 @@ mod tests {
         assert_eq!(value["prompt_cache_key"], "session");
         assert_eq!(value["tool_choice"], "required");
     }
+
+    #[test]
+    fn preserves_explicit_prompt_cache_fields() {
+        let identity = UpstreamIdentity {
+            thread_id: "child-thread".into(),
+            cache_key: "lineage-default".into(),
+        };
+        let raw = br#"{"model":"gpt-5.6-sol","input":"hello","prompt_cache_key":"root-cache","prompt_cache_options":{"mode":"auto"},"prompt_cache_retention":"24h","client_metadata":{}}"#;
+        let value: Value =
+            serde_json::from_slice(&codex_compat_body_for_identity(raw, &identity, false).unwrap())
+                .unwrap();
+        assert_eq!(value["prompt_cache_key"], "root-cache");
+        assert_eq!(value["prompt_cache_options"]["mode"], "auto");
+        assert_eq!(value["prompt_cache_retention"], "24h");
+        assert_eq!(value["client_metadata"]["session_id"], "lineage-default");
+        assert_eq!(value["client_metadata"]["thread_id"], "child-thread");
+        assert_eq!(value["client_metadata"]["window_id"], "child-thread:0");
+    }
+
+    #[test]
+    fn invalid_prompt_cache_key_falls_back_to_lineage() {
+        let identity = UpstreamIdentity {
+            thread_id: "child-thread".into(),
+            cache_key: "root-cache".into(),
+        };
+        let raw = br#"{"model":"gpt-5.6-sol","input":"hello","prompt_cache_key":"bad\nkey"}"#;
+        let value: Value =
+            serde_json::from_slice(&codex_compat_body_for_identity(raw, &identity, false).unwrap())
+                .unwrap();
+        assert_eq!(value["prompt_cache_key"], "root-cache");
+    }
+
+    #[test]
+    fn parses_prompt_cache_usage_from_terminal_sse() {
+        let capture = br#"event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":12000,"input_tokens_details":{"cached_tokens":9000,"cache_write_tokens":1500},"output_tokens":321}}}
+
+"#;
+        assert_eq!(
+            observed_usage(capture),
+            ObservedUsage {
+                input_tokens: 12_000,
+                cached_input_tokens: 9_000,
+                cache_write_tokens: 1_500,
+                output_tokens: 321,
+            }
+        );
+    }
     #[tokio::test]
     async fn bearer_protects_models_but_not_health() {
         use crate::auth::Credentials;
@@ -1333,6 +1542,86 @@ mod tests {
         let stream = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(stream.contains("live"));
         assert!(stream.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn cache_lineage_separates_upstream_session_and_thread() {
+        use crate::auth::Credentials;
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+
+        struct Creds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for Creds {
+            async fn get(&self, _: bool) -> Result<Credentials> {
+                Ok(Credentials {
+                    access_token: "upstream-secret".into(),
+                    account_id: String::new(),
+                    expires_at: None,
+                })
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(None::<(HeaderMap, Value)>));
+        let captured_upstream = captured.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new().route(
+            "/responses",
+            axum::routing::post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured_upstream.clone();
+                async move {
+                    *captured.lock().unwrap() = Some((headers, body));
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cache\",\"output\":[]}}\n\n",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let app = router(ProxyConfig {
+            upstream_url: format!("http://{address}/responses"),
+            credentials: Arc::new(Creds),
+            catalog: Catalog::default(),
+            model_map: ModelMap::default(),
+            client: reqwest::Client::new(),
+            client_token: String::new(),
+            version: "test".into(),
+            compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+            responses_compat: CompatMode::Full,
+            observer: None,
+            max_body_bytes: 4096,
+        })
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-grok-session-id", "child-thread")
+                    .header("x-grok-cache-lineage-id", "root-cache")
+                    .body(Body::from(r#"{"model":"gpt-5.6-sol","input":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+
+        let guard = captured.lock().unwrap();
+        let (headers, body) = guard.as_ref().expect("upstream request captured");
+        assert_eq!(headers["session-id"], "root-cache");
+        assert_eq!(headers["x-session-affinity"], "root-cache");
+        assert_eq!(headers["thread-id"], "child-thread");
+        assert_eq!(headers["x-client-request-id"], "child-thread");
+        assert_eq!(headers["x-codex-window-id"], "child-thread:0");
+        assert_eq!(body["prompt_cache_key"], "root-cache");
     }
 
     struct RecordingObserver {

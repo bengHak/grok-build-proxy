@@ -198,6 +198,23 @@ Canonical catalog routes, configured model-map aliases, and eligible generated
 `-fast` routes inherit their target's capability. Unknown or unsupported models
 omit the capability fields.
 
+## Prompt cache efficiency
+
+The proxy assigns a stable Codex prompt-cache namespace to each Grok Build
+session. It also preserves a valid client-supplied `prompt_cache_key` instead of
+overwriting it, and passes through `prompt_cache_options` and
+`prompt_cache_retention` for clients and upstreams that support those fields.
+
+Fork and subagent clients can send `x-grok-cache-lineage-id` to reuse a parent
+session's cache routing while retaining their own `x-grok-session-id` as the
+Codex thread identity. The upstream request then uses the lineage for
+`prompt_cache_key`, `session-id`, and `x-session-affinity`, while `thread-id`,
+`x-client-request-id`, and `x-codex-window-id` remain scoped to the child.
+
+When terminal usage is available, plain logs include `input_tokens`,
+`cached_input_tokens`, `cache_write_tokens`, `uncached_input_tokens`, and
+`cache_read_percent`. These metrics do not include prompt or response content.
+
 ## Responses Lite, Plan, and Goal compatibility
 
 The required compatibility layer was introduced in v0.0.7 and remains enabled
