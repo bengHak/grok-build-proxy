@@ -90,14 +90,52 @@ that can use the selected Codex model.
 
 When standard input and output are attached to a terminal, `grok-build-proxy
 serve` (and the default `grok-build-proxy` command) opens an interactive monitor
-instead of scrolling logs. It shows sessions, active and recent requests,
-observed output-token throughput, and error events from real proxy traffic.
+instead of scrolling logs. It shows sessions, active and recent requests, a
+metrics strip (tok/s, rolling `fail%`, and recent completion-outcome sparklines
+from store samples — distinct from the header `err●N` failure-ring count), and a failures
+panel classified from real proxy traffic.
 
-- `↑`/`k` and `↓`/`j`: move the selection
-- `Enter`: open session or request details
-- `?`: show or close help
-- `Esc`/`Backspace`: return to the dashboard
-- `q`/`Ctrl-C`: stop the proxy and restore the terminal
+**Keybindings**
+
+| Key | Action |
+|---|---|
+| `j` / `k` or `↓` / `↑` | Move selection within the focused panel |
+| `Tab` / `Shift-Tab` | Cycle panel focus: sessions → active → failures |
+| `f` | Cycle failure filter: All → ProxyAssemble → Upstream → Auth → Stream |
+| `y` / `Y` | Copy filtered failure report (markdown / JSON) to the clipboard |
+| `w` / `W` | Write filtered failure report to disk (markdown / JSON) |
+| `Enter` | Open detail overlay for the selected session, turn, or failure |
+| `Esc` / `Backspace` | Close help or detail overlay |
+| `?` | Toggle help overlay |
+| `q` / `Q` / `Ctrl-C` | Stop the proxy and restore the terminal |
+
+On a narrow terminal (width &lt; 80), only the focused panel is shown; `Tab`
+still switches panels. The metrics strip is hidden below 64 columns or when the
+terminal is too short to keep the body panels usable.
+
+**Failure report export**
+
+- Path: `~/.grok/proxy-reports/failure-YYYYMMDD-HHMMSS.md` (or `.json` with
+  `W` / `Y`). The directory is created with mode `0700` and files with `0600`.
+- Contents: selected `FailureRecord` metadata only; diagnostic error messages,
+  prompts, response bodies, and credentials are omitted. See
+  [`SECURITY.md`](SECURITY.md).
+
+**Failure kinds** (filter groups in parentheses)
+
+| Kind | Meaning |
+|---|---|
+| `UpstreamHttp` | Non-2xx status from Codex upstream (Upstream) |
+| `UpstreamConnect` | Network / connect error before a response status (Upstream) |
+| `AuthRetryFailed` | 401 after force-refresh re-auth still failed (Auth) |
+| `StreamIo` | Chunk error mid-stream (Stream) |
+| `StreamTerminalFailed` | Terminal SSE `response.failed` / `incomplete` / `error` (Stream) |
+| `ProxyAssemble` | Proxy assembly failure such as `proxy_incomplete_output` (ProxyAssemble) |
+| `ClientRejected` | Proxy rejected the client before upstream (All only) |
+| `Unknown` | Unclassified (All only) |
+
+Same-session failures within 30s are grouped in the failures panel with an
+**estimated** retry label (heuristic, not a confirmed Grok turn id).
 
 Use plain logs for scripts, background services, or troubleshooting:
 

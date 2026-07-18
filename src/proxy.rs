@@ -1,6 +1,7 @@
 use crate::{
     auth::CredentialProvider,
     catalog::{Catalog, ReasoningCapability},
+    events::{classify_stream_end, parse_capture_diagnostics, sanitize},
     modelmap::ModelMap,
 };
 use anyhow::{Context, Result, anyhow, bail};
@@ -21,30 +22,10 @@ use std::{
 };
 use tracing::info;
 
+pub use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind};
+
 pub const DEFAULT_CODEX_COMPATIBILITY_VERSION: &str = "0.144.0";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RequestEventKind {
-    Started,
-    Completed,
-    Failed,
-}
-#[derive(Clone, Debug)]
-pub struct RequestEvent {
-    pub kind: RequestEventKind,
-    pub request_id: String,
-    pub session_id: String,
-    pub requested_model: String,
-    pub model: String,
-    pub status_code: u16,
-    pub output_tokens: u64,
-    pub error: String,
-    pub started_at: std::time::Instant,
-}
-pub trait Observer: Send + Sync {
-    fn observe(&self, event: RequestEvent);
-}
 
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -429,7 +410,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     .unwrap_or(&request_id)
     .to_owned();
     let started = std::time::Instant::now();
-    let base_event = RequestEvent {
+    let mut base_event = RequestEvent {
         kind: RequestEventKind::Started,
         request_id: request_id.clone(),
         session_id: session_id.clone(),
@@ -439,6 +420,17 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         output_tokens: 0,
         error: String::new(),
         started_at: started,
+        duration_ms: 0,
+        failure_kind: None,
+        error_type: String::new(),
+        response_id: String::new(),
+        mapped: transformed.mapped,
+        lite: transformed.lite,
+        fast: transformed.fast,
+        auth_retried: false,
+        attempt: 1,
+        output_count: 0,
+        capture_bytes: 0,
     };
     if let Some(observer) = &s.0.observer {
         observer.observe(base_event.clone());
@@ -447,7 +439,14 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         match send_upstream(&s.0, &transformed, &incoming_headers, &session_id, false).await {
             Ok(r) => r,
             Err(e) => {
-                observe_failure(&s.0, &base_event, e.to_string());
+                observe_failure(
+                    &s.0,
+                    &base_event,
+                    FailureKind::UpstreamConnect,
+                    "upstream_connect",
+                    e.to_string(),
+                    StatusCode::BAD_GATEWAY,
+                );
                 return with_request_id(
                     error(StatusCode::BAD_GATEWAY, "upstream_error", e.to_string()),
                     &request_id,
@@ -456,17 +455,31 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         };
     if upstream.status() == reqwest::StatusCode::UNAUTHORIZED {
         let _ = upstream.bytes().await;
+        base_event.auth_retried = true;
+        base_event.attempt = 2;
+        // Refresh active turn in the monitor so TUI shows attempt=2 while force-refresh runs.
+        if let Some(observer) = &s.0.observer {
+            observer.observe(base_event.clone());
+        }
         upstream =
             match send_upstream(&s.0, &transformed, &incoming_headers, &session_id, true).await {
                 Ok(r) => r,
                 Err(e) => {
-                    observe_failure(&s.0, &base_event, e.to_string());
+                    observe_failure(
+                        &s.0,
+                        &base_event,
+                        FailureKind::AuthRetryFailed,
+                        "auth_retry_failed",
+                        e.to_string(),
+                        StatusCode::BAD_GATEWAY,
+                    );
                     return with_request_id(
                         error(StatusCode::BAD_GATEWAY, "upstream_error", e.to_string()),
                         &request_id,
                     );
                 }
-            }
+            };
+        // Still-401 classification is handled in observe_stream_end (auth_retried + 401).
     }
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -490,16 +503,53 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         let observer = observer.clone();
         let event = base_event.clone();
         Body::from_stream(async_stream::stream! {
-            let mut capture=Vec::new();
-            while let Some(chunk)=source.next().await {match chunk{Ok(chunk)=>{let output=normalizer.push(&chunk);capture_tail(&mut capture,&output);if !output.is_empty(){yield Ok::<Bytes,std::io::Error>(Bytes::from(output));}},Err(error)=>{let message=error.to_string();observe_stream_end(&observer,event.clone(),status,Some(message.clone()));yield Err(std::io::Error::other(message));return;}}}
-            let output=normalizer.finish();capture_tail(&mut capture,&output);if !output.is_empty(){yield Ok::<Bytes,std::io::Error>(Bytes::from(output));}let mut event=event;event.output_tokens=observed_output_tokens(&capture);observe_stream_end(&observer,event,status,None);
+            let mut guard = StreamObserveGuard::new(observer, event, status);
+            while let Some(chunk) = source.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        let output = normalizer.push(&chunk);
+                        capture_tail(&mut guard.capture, &output);
+                        if !output.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(output));
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        guard.finish(Some(message.clone()));
+                        yield Err(std::io::Error::other(message));
+                        return;
+                    }
+                }
+            }
+            // Observe before final yield so client drop at the last chunk cannot force StreamIo.
+            let output = normalizer.finish();
+            capture_tail(&mut guard.capture, &output);
+            guard.finish(None);
+            if !output.is_empty() {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(output));
+            }
         })
     } else {
         let mut source = upstream.bytes_stream();
         let event = base_event.clone();
         Body::from_stream(async_stream::stream! {
-            let mut capture=Vec::new();
-            while let Some(chunk)=source.next().await{match chunk{Ok(chunk)=>{capture_tail(&mut capture,&chunk);yield Ok::<Bytes,std::io::Error>(chunk)},Err(error)=>{let message=error.to_string();observe_stream_end(&observer,event.clone(),status,Some(message.clone()));yield Err(std::io::Error::other(message));return;}}}let mut event=event;event.output_tokens=observed_output_tokens(&capture);observe_stream_end(&observer,event,status,None);
+            let mut guard = StreamObserveGuard::new(observer, event, status);
+            while let Some(chunk) = source.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        capture_tail(&mut guard.capture, &chunk);
+                        yield Ok::<Bytes, std::io::Error>(chunk);
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        guard.finish(Some(message.clone()));
+                        yield Err(std::io::Error::other(message));
+                        return;
+                    }
+                }
+            }
+            // Upstream EOF: observe immediately (no trailing yield after this).
+            guard.finish(None);
         })
     };
     let mut response = Response::builder().status(status).body(body).unwrap();
@@ -559,36 +609,151 @@ fn observed_output_tokens(bytes: &[u8]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Ensures observe_stream_end runs even when the client disconnects and the body stream is dropped.
+struct StreamObserveGuard {
+    observer: Option<Arc<dyn Observer>>,
+    event: RequestEvent,
+    status: StatusCode,
+    capture: Vec<u8>,
+    finished: bool,
+}
+
+impl StreamObserveGuard {
+    fn new(observer: Option<Arc<dyn Observer>>, event: RequestEvent, status: StatusCode) -> Self {
+        Self {
+            observer,
+            event,
+            status,
+            capture: Vec::new(),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, stream_io_error: Option<String>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        observe_stream_end(
+            &self.observer,
+            self.event.clone(),
+            self.status,
+            &self.capture,
+            stream_io_error,
+        );
+    }
+}
+
+impl Drop for StreamObserveGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // If capture already has a terminal frame, classify from diagnostics — client often
+        // disconnects after the last SSE chunk without polling the generator to completion.
+        let diag = parse_capture_diagnostics(&self.capture);
+        let stream_io = if diag.has_terminal_end() {
+            None
+        } else {
+            Some("client disconnected".into())
+        };
+        observe_stream_end(
+            &self.observer,
+            self.event.clone(),
+            self.status,
+            &self.capture,
+            stream_io,
+        );
+    }
+}
+
 fn observe_stream_end(
     observer: &Option<Arc<dyn Observer>>,
     mut event: RequestEvent,
     status: StatusCode,
-    error: Option<String>,
+    capture: &[u8],
+    stream_io_error: Option<String>,
 ) {
     event.status_code = status.as_u16();
-    event.kind = if error.is_some() || !status.is_success() {
-        RequestEventKind::Failed
-    } else {
-        RequestEventKind::Completed
-    };
-    event.error = error.unwrap_or_else(|| {
-        if status.is_success() {
-            String::new()
+    event.duration_ms = event.started_at.elapsed().as_millis() as u64;
+    event.capture_bytes = capture.len() as u32;
+    event.output_tokens = observed_output_tokens(capture);
+
+    let diag = parse_capture_diagnostics(capture);
+    if !diag.response_id.is_empty() {
+        event.response_id = sanitize(&diag.response_id);
+    }
+    if diag.output_count > 0 {
+        event.output_count = diag.output_count;
+    }
+
+    // 401 after force-refresh re-auth is AuthRetryFailed.
+    if event.auth_retried
+        && stream_io_error.is_none()
+        && status.as_u16() == StatusCode::UNAUTHORIZED.as_u16()
+    {
+        event.kind = RequestEventKind::Failed;
+        event.failure_kind = Some(FailureKind::AuthRetryFailed);
+        event.error_type = sanitize(if !diag.error_type.is_empty() {
+            diag.error_type.as_str()
+        } else if !event.error_type.is_empty() {
+            event.error_type.as_str()
         } else {
-            format!("upstream HTTP {}", status.as_u16())
+            "auth_retry_failed"
+        });
+        event.error = if !diag.error_message.is_empty() {
+            sanitize(&diag.error_message)
+        } else {
+            sanitize(&format!("upstream HTTP {}", status.as_u16()))
+        };
+        if let Some(observer) = observer {
+            observer.observe(event);
         }
+        return;
+    }
+
+    let (kind, failure_kind, error_type, error_message) =
+        classify_stream_end(status.is_success(), stream_io_error.as_deref(), &diag);
+
+    event.kind = kind;
+    event.failure_kind = failure_kind.or(event.failure_kind.take());
+    event.error_type = sanitize(if !error_type.is_empty() {
+        error_type.as_str()
+    } else if kind == RequestEventKind::Failed {
+        event.failure_kind.unwrap_or(FailureKind::Unknown).as_str()
+    } else {
+        ""
     });
+    event.error = if !error_message.is_empty() {
+        sanitize(&error_message)
+    } else if kind == RequestEventKind::Failed && !status.is_success() {
+        sanitize(&format!("upstream HTTP {}", status.as_u16()))
+    } else {
+        String::new()
+    };
+
     if let Some(observer) = observer {
         observer.observe(event);
     }
 }
 
-fn observe_failure(config: &ProxyConfig, base: &RequestEvent, message: String) {
+fn observe_failure(
+    config: &ProxyConfig,
+    base: &RequestEvent,
+    kind: FailureKind,
+    error_type: &str,
+    message: String,
+    status: StatusCode,
+) {
     if let Some(observer) = &config.observer {
         let mut event = base.clone();
         event.kind = RequestEventKind::Failed;
-        event.status_code = StatusCode::BAD_GATEWAY.as_u16();
-        event.error = message;
+        event.status_code = status.as_u16();
+        event.duration_ms = event.started_at.elapsed().as_millis() as u64;
+        event.failure_kind = Some(kind);
+        event.error_type = sanitize(error_type);
+        event.error = sanitize(&message);
         observer.observe(event);
     }
 }
@@ -1168,5 +1333,224 @@ mod tests {
         let stream = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(stream.contains("live"));
         assert!(stream.contains("response.completed"));
+    }
+
+    struct RecordingObserver {
+        events: std::sync::Mutex<Vec<RequestEvent>>,
+    }
+    impl Observer for RecordingObserver {
+        fn observe(&self, event: RequestEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    fn sample_event() -> RequestEvent {
+        RequestEvent {
+            kind: RequestEventKind::Started,
+            request_id: "req-1".into(),
+            session_id: "sess".into(),
+            requested_model: "alias".into(),
+            model: "gpt-5.6-sol".into(),
+            status_code: 0,
+            output_tokens: 0,
+            error: String::new(),
+            started_at: std::time::Instant::now() - std::time::Duration::from_millis(50),
+            duration_ms: 0,
+            failure_kind: None,
+            error_type: String::new(),
+            response_id: String::new(),
+            mapped: true,
+            lite: true,
+            fast: false,
+            auth_retried: false,
+            attempt: 1,
+            output_count: 0,
+            capture_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn observe_stream_end_marks_2xx_proxy_incomplete_as_failed() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let observer: Option<Arc<dyn Observer>> = Some(obs.clone());
+        let capture = br#"event: error
+data: {"type":"error","sequence_number":3,"response_id":"resp_x","error":{"type":"proxy_incomplete_output","message":"The proxy could not safely assemble a complete Responses stream."}}
+
+"#;
+        observe_stream_end(&observer, sample_event(), StatusCode::OK, capture, None);
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.kind, RequestEventKind::Failed);
+        assert_eq!(e.failure_kind, Some(FailureKind::ProxyAssemble));
+        assert_eq!(e.error_type, "proxy_incomplete_output");
+        assert_eq!(e.status_code, 200);
+        assert_eq!(e.response_id, "resp_x");
+        assert!(e.duration_ms >= 50);
+        assert!(e.capture_bytes > 0);
+    }
+
+    #[test]
+    fn observe_stream_end_auth_retry_attempt() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let observer: Option<Arc<dyn Observer>> = Some(obs.clone());
+        let mut event = sample_event();
+        event.auth_retried = true;
+        event.attempt = 2;
+        observe_stream_end(
+            &observer,
+            event,
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":{"type":"invalid_request_error","message":"unauthorized"}}"#,
+            None,
+        );
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events[0].kind, RequestEventKind::Failed);
+        assert_eq!(events[0].failure_kind, Some(FailureKind::AuthRetryFailed));
+        assert_eq!(events[0].attempt, 2);
+        assert!(events[0].auth_retried);
+    }
+
+    #[test]
+    fn observe_stream_end_stream_io() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let observer: Option<Arc<dyn Observer>> = Some(obs.clone());
+        observe_stream_end(
+            &observer,
+            sample_event(),
+            StatusCode::OK,
+            b"",
+            Some("connection reset".into()),
+        );
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events[0].failure_kind, Some(FailureKind::StreamIo));
+        assert_eq!(events[0].kind, RequestEventKind::Failed);
+    }
+
+    #[test]
+    fn observe_stream_end_proxy_mode_in_content_stays_completed() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let observer: Option<Arc<dyn Observer>> = Some(obs.clone());
+        let capture = br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":"message","content":[{"type":"output_text","text":"configure proxy_mode now"}]}]}}
+
+"#;
+        observe_stream_end(&observer, sample_event(), StatusCode::OK, capture, None);
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events[0].kind, RequestEventKind::Completed);
+        assert_eq!(events[0].failure_kind, None);
+    }
+
+    #[test]
+    fn observe_failure_sanitizes_and_auth_retry_kind() {
+        use crate::auth::Credentials;
+        struct Creds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for Creds {
+            async fn get(&self, _: bool) -> Result<Credentials> {
+                unreachable!()
+            }
+        }
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let config = ProxyConfig {
+            upstream_url: "http://127.0.0.1:9/responses".into(),
+            credentials: Arc::new(Creds),
+            catalog: Catalog::default(),
+            model_map: ModelMap::default(),
+            client: reqwest::Client::new(),
+            client_token: String::new(),
+            version: "test".into(),
+            compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+            responses_compat: CompatMode::Full,
+            observer: Some(obs.clone()),
+            max_body_bytes: 1024,
+        };
+        let mut base = sample_event();
+        base.auth_retried = true;
+        base.attempt = 2;
+        observe_failure(
+            &config,
+            &base,
+            FailureKind::AuthRetryFailed,
+            "auth_retry_failed",
+            format!("connect error\n{}", "x".repeat(300)),
+            StatusCode::BAD_GATEWAY,
+        );
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events[0].failure_kind, Some(FailureKind::AuthRetryFailed));
+        assert_eq!(events[0].attempt, 2);
+        assert!(!events[0].error.contains('\n'));
+        assert!(events[0].error.chars().count() <= 256);
+        assert_eq!(events[0].error_type, "auth_retry_failed");
+    }
+
+    #[test]
+    fn stream_observe_guard_emits_on_drop() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        {
+            let mut guard =
+                StreamObserveGuard::new(Some(obs.clone()), sample_event(), StatusCode::OK);
+            capture_tail(&mut guard.capture, b"partial");
+            // drop without finish and without terminal → client disconnect path
+        }
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, RequestEventKind::Failed);
+        assert_eq!(events[0].failure_kind, Some(FailureKind::StreamIo));
+        assert!(events[0].error.contains("client disconnected"));
+    }
+
+    #[test]
+    fn stream_observe_guard_drop_with_completed_capture_stays_completed() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let completed = br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":"message"}]}}
+
+"#;
+        {
+            let mut guard =
+                StreamObserveGuard::new(Some(obs.clone()), sample_event(), StatusCode::OK);
+            capture_tail(&mut guard.capture, completed);
+            // Client drop after last chunk without finish() — must not force StreamIo.
+        }
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, RequestEventKind::Completed);
+        assert_eq!(events[0].failure_kind, None);
+        assert_eq!(events[0].response_id, "resp_ok");
+    }
+
+    #[test]
+    fn stream_observe_guard_drop_with_proxy_error_keeps_assemble() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = br#"event: error
+data: {"type":"error","error":{"type":"proxy_incomplete_output","message":"incomplete"}}
+
+"#;
+        {
+            let mut guard =
+                StreamObserveGuard::new(Some(obs.clone()), sample_event(), StatusCode::OK);
+            capture_tail(&mut guard.capture, err);
+        }
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events[0].kind, RequestEventKind::Failed);
+        assert_eq!(events[0].failure_kind, Some(FailureKind::ProxyAssemble));
+        assert_eq!(events[0].error_type, "proxy_incomplete_output");
     }
 }

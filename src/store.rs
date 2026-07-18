@@ -1,0 +1,562 @@
+//! Structured monitor store: sessions, active/recent turns, failure ring, metrics samples.
+
+use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind, sanitize};
+use chrono::{DateTime, Utc};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    env,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+const DEFAULT_FAILURE_CAP: usize = 200;
+const RECENT_CAP: usize = 50;
+const METRICS_CAP: usize = 120;
+
+#[derive(Clone, Debug)]
+pub struct Request {
+    pub id: String,
+    pub session_id: String,
+    pub requested_model: String,
+    pub model: String,
+    pub status: u16,
+    pub error: String,
+    pub error_type: String,
+    pub failure_kind: Option<FailureKind>,
+    pub output_tokens: u64,
+    pub started_at: Instant,
+    pub ended_at: Option<Instant>,
+    pub duration_ms: u64,
+    pub response_id: String,
+    pub mapped: bool,
+    pub lite: bool,
+    pub fast: bool,
+    pub auth_retried: bool,
+    pub attempt: u32,
+    pub output_count: u32,
+    pub capture_bytes: u32,
+}
+
+impl Request {
+    pub fn duration(&self) -> Duration {
+        self.ended_at
+            .unwrap_or_else(Instant::now)
+            .saturating_duration_since(self.started_at)
+    }
+    pub fn tokens_per_second(&self) -> f64 {
+        let seconds = self.duration().as_secs_f64();
+        if seconds > 0.0 {
+            self.output_tokens as f64 / seconds
+        } else {
+            0.0
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Session {
+    pub id: String,
+    pub requests: u64,
+    pub active: u64,
+    pub output_tokens: u64,
+    pub last_model: String,
+    pub errors: u64,
+    pub last_failure_kind: Option<FailureKind>,
+    pub updated_at: Option<DateTime<Utc>>,
+    sample_seconds: f64,
+}
+
+impl Session {
+    pub fn tokens_per_second(&self) -> f64 {
+        if self.sample_seconds > 0.0 {
+            self.output_tokens as f64 / self.sample_seconds
+        } else {
+            0.0
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FailureRecord {
+    pub ts: DateTime<Utc>,
+    pub request_id: String,
+    pub session_id: String,
+    pub requested_model: String,
+    pub model: String,
+    pub status_code: u16,
+    pub duration_ms: u64,
+    pub kind: FailureKind,
+    pub error_type: String,
+    pub error_message: String,
+    pub response_id: String,
+    pub mapped: bool,
+    pub lite: bool,
+    pub fast: bool,
+    pub auth_retried: bool,
+    pub attempt: u32,
+    pub output_count: u32,
+    pub capture_bytes: u32,
+    pub session_failure_index: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Snapshot {
+    pub sessions: Vec<Session>,
+    pub active: Vec<Request>,
+    pub recent: Vec<Request>,
+    /// Legacy alias for failures (monitor UI).
+    pub errors: Vec<Request>,
+    pub failures: Vec<FailureRecord>,
+    pub metrics_tok_per_s: Vec<f64>,
+    pub metrics_completed: Vec<f64>,
+}
+
+struct State {
+    sessions: HashMap<String, Session>,
+    active: HashMap<String, Request>,
+    recent: VecDeque<Request>,
+    errors: VecDeque<Request>,
+    failures: VecDeque<FailureRecord>,
+    completed: HashSet<String>,
+    session_failure_counts: HashMap<String, u32>,
+    failure_cap: usize,
+    metrics_tok_per_s: VecDeque<f64>,
+    metrics_completed: VecDeque<f64>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            sessions: HashMap::new(),
+            active: HashMap::new(),
+            recent: VecDeque::new(),
+            errors: VecDeque::new(),
+            failures: VecDeque::new(),
+            completed: HashSet::new(),
+            session_failure_counts: HashMap::new(),
+            failure_cap: failure_cap_from_env(),
+            metrics_tok_per_s: VecDeque::new(),
+            metrics_completed: VecDeque::new(),
+        }
+    }
+}
+
+fn failure_cap_from_env() -> usize {
+    env::var("GROK_BUILD_PROXY_FAILURE_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(DEFAULT_FAILURE_CAP)
+}
+
+#[derive(Clone, Default)]
+pub struct Dashboard {
+    inner: Arc<Mutex<State>>,
+}
+
+fn lock_state(inner: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
+    // Recover from poison so a prior panic during apply cannot permanently kill the monitor.
+    inner.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Dashboard {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_failure_cap(cap: usize) -> Self {
+        let d = Self::new();
+        lock_state(&d.inner).failure_cap = cap.max(1);
+        d
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        let state = lock_state(&self.inner);
+        let mut sessions: Vec<_> = state.sessions.values().cloned().collect();
+        sessions.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut active: Vec<_> = state.active.values().cloned().collect();
+        active.sort_by_key(|r| r.started_at);
+        Snapshot {
+            sessions,
+            active,
+            recent: state.recent.iter().cloned().collect(),
+            errors: state.errors.iter().cloned().collect(),
+            failures: state.failures.iter().cloned().collect(),
+            metrics_tok_per_s: state.metrics_tok_per_s.iter().copied().collect(),
+            metrics_completed: state.metrics_completed.iter().copied().collect(),
+        }
+    }
+
+    /// Failures for later report export (newest first). Optional kind filter.
+    pub fn failures_for_report(&self, kind: Option<FailureKind>) -> Vec<FailureRecord> {
+        let state = lock_state(&self.inner);
+        state
+            .failures
+            .iter()
+            .filter(|f| kind.is_none_or(|k| f.kind == k))
+            .cloned()
+            .collect()
+    }
+
+    fn apply(&self, event: RequestEvent) {
+        let mut state = lock_state(&self.inner);
+        let request_id = sanitize(&event.request_id);
+        let session_id = sanitize(&event.session_id);
+        match event.kind {
+            RequestEventKind::Started => {
+                if state.completed.contains(&event.request_id) {
+                    return;
+                }
+                // Re-observe Started after auth retry: refresh in-flight attempt flags only.
+                if let Some(active) = state.active.get_mut(&event.request_id) {
+                    active.auth_retried = event.auth_retried;
+                    active.attempt = event.attempt.max(1);
+                    active.mapped = event.mapped;
+                    active.lite = event.lite;
+                    active.fast = event.fast;
+                    if let Some(session) = state.sessions.get_mut(&event.session_id) {
+                        session.updated_at = Some(Utc::now());
+                    }
+                    return;
+                }
+                state.active.insert(
+                    event.request_id.clone(),
+                    Request {
+                        id: request_id,
+                        session_id: session_id.clone(),
+                        requested_model: sanitize(&event.requested_model),
+                        model: sanitize(&event.model),
+                        status: 0,
+                        error: String::new(),
+                        error_type: String::new(),
+                        failure_kind: None,
+                        output_tokens: 0,
+                        started_at: event.started_at,
+                        ended_at: None,
+                        duration_ms: 0,
+                        response_id: String::new(),
+                        mapped: event.mapped,
+                        lite: event.lite,
+                        fast: event.fast,
+                        auth_retried: event.auth_retried,
+                        attempt: event.attempt.max(1),
+                        output_count: 0,
+                        capture_bytes: 0,
+                    },
+                );
+                let session = state
+                    .sessions
+                    .entry(event.session_id.clone())
+                    .or_insert_with(|| Session {
+                        id: session_id,
+                        ..Default::default()
+                    });
+                session.requests += 1;
+                session.active += 1;
+                session.last_model = sanitize(&event.model);
+                session.updated_at = Some(Utc::now());
+            }
+            RequestEventKind::Completed | RequestEventKind::Failed => {
+                if !state.completed.insert(event.request_id.clone()) {
+                    return;
+                }
+                let mut request = state.active.remove(&event.request_id).unwrap_or(Request {
+                    id: request_id,
+                    session_id: session_id.clone(),
+                    requested_model: sanitize(&event.requested_model),
+                    model: sanitize(&event.model),
+                    status: 0,
+                    error: String::new(),
+                    error_type: String::new(),
+                    failure_kind: None,
+                    output_tokens: 0,
+                    started_at: event.started_at,
+                    ended_at: None,
+                    duration_ms: 0,
+                    response_id: String::new(),
+                    mapped: event.mapped,
+                    lite: event.lite,
+                    fast: event.fast,
+                    auth_retried: event.auth_retried,
+                    attempt: event.attempt.max(1),
+                    output_count: 0,
+                    capture_bytes: 0,
+                });
+                request.status = event.status_code;
+                request.error = sanitize(&event.error);
+                request.error_type = sanitize(&event.error_type);
+                request.failure_kind = event.failure_kind;
+                request.output_tokens = event.output_tokens;
+                request.ended_at = Some(Instant::now());
+                request.duration_ms = if event.duration_ms > 0 {
+                    event.duration_ms
+                } else {
+                    request.duration().as_millis() as u64
+                };
+                request.response_id = sanitize(&event.response_id);
+                request.mapped = event.mapped;
+                request.lite = event.lite;
+                request.fast = event.fast;
+                request.auth_retried = event.auth_retried;
+                request.attempt = event.attempt.max(1);
+                request.output_count = event.output_count;
+                request.capture_bytes = event.capture_bytes;
+
+                let duration_secs = request.duration().as_secs_f64();
+                let failed = event.kind == RequestEventKind::Failed;
+                let tok_s = request.tokens_per_second();
+
+                state.recent.push_front(request.clone());
+                state.recent.truncate(RECENT_CAP);
+
+                if failed {
+                    state.errors.push_front(request.clone());
+                    state.errors.truncate(RECENT_CAP);
+
+                    let session_key = event.session_id.clone();
+                    let idx = {
+                        let c = state.session_failure_counts.entry(session_key).or_insert(0);
+                        *c = c.saturating_add(1);
+                        *c
+                    };
+                    let kind = event.failure_kind.unwrap_or(FailureKind::Unknown);
+                    let record = FailureRecord {
+                        ts: Utc::now(),
+                        request_id: request.id.clone(),
+                        session_id: request.session_id.clone(),
+                        requested_model: request.requested_model.clone(),
+                        model: request.model.clone(),
+                        status_code: request.status,
+                        duration_ms: request.duration_ms,
+                        kind,
+                        error_type: if request.error_type.is_empty() {
+                            kind.as_str().to_owned()
+                        } else {
+                            request.error_type.clone()
+                        },
+                        error_message: request.error.clone(),
+                        response_id: request.response_id.clone(),
+                        mapped: request.mapped,
+                        lite: request.lite,
+                        fast: request.fast,
+                        auth_retried: request.auth_retried,
+                        attempt: request.attempt,
+                        output_count: request.output_count,
+                        capture_bytes: request.capture_bytes,
+                        session_failure_index: idx,
+                    };
+                    state.failures.push_front(record);
+                    let cap = state.failure_cap;
+                    state.failures.truncate(cap);
+                }
+
+                // Rolling metrics samples
+                state
+                    .metrics_completed
+                    .push_back(if failed { 0.0 } else { 1.0 });
+                state.metrics_completed.truncate(METRICS_CAP);
+                if event.output_tokens > 0 {
+                    state.metrics_tok_per_s.push_back(tok_s);
+                    state.metrics_tok_per_s.truncate(METRICS_CAP);
+                }
+
+                let session = state
+                    .sessions
+                    .entry(event.session_id)
+                    .or_insert_with(|| Session {
+                        id: session_id,
+                        ..Default::default()
+                    });
+                session.active = session.active.saturating_sub(1);
+                session.output_tokens += event.output_tokens;
+                if event.output_tokens > 0 {
+                    session.sample_seconds += duration_secs;
+                }
+                if failed {
+                    session.errors += 1;
+                    session.last_failure_kind = event.failure_kind.or(Some(FailureKind::Unknown));
+                }
+                session.updated_at = Some(Utc::now());
+                if state.completed.len() > 200 {
+                    state.completed.clear();
+                }
+            }
+        }
+    }
+}
+
+impl Observer for Dashboard {
+    fn observe(&self, event: RequestEvent) {
+        self.apply(event)
+    }
+}
+
+// Re-export Observer trait usage from events via proxy for main compatibility is handled in proxy/monitor.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::FailureKind;
+    use std::time::Duration;
+
+    fn base_event(kind: RequestEventKind) -> RequestEvent {
+        RequestEvent {
+            kind,
+            request_id: "req\n1".into(),
+            session_id: "session".into(),
+            requested_model: "alias".into(),
+            model: "gpt".into(),
+            status_code: 200,
+            output_tokens: 20,
+            error: String::new(),
+            started_at: Instant::now() - Duration::from_secs(2),
+            duration_ms: 2000,
+            failure_kind: None,
+            error_type: String::new(),
+            response_id: String::new(),
+            mapped: true,
+            lite: true,
+            fast: false,
+            auth_retried: false,
+            attempt: 1,
+            output_count: 0,
+            capture_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn lifecycle_updates_bounded_state() {
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        assert_eq!(d.snapshot().active.len(), 1);
+        d.observe(base_event(RequestEventKind::Completed));
+        let s = d.snapshot();
+        assert!(s.active.is_empty());
+        assert_eq!(s.recent.len(), 1);
+        assert_eq!(s.sessions[0].active, 0);
+        assert_eq!(s.sessions[0].output_tokens, 20);
+        assert!(!s.recent[0].id.contains('\n'));
+        assert!(s.recent[0].mapped);
+        assert!(s.recent[0].lite);
+    }
+
+    #[test]
+    fn failure_ring_respects_cap() {
+        let d = Dashboard::with_failure_cap(5);
+        for i in 0..12 {
+            let mut start = base_event(RequestEventKind::Started);
+            start.request_id = format!("req-{i}");
+            d.observe(start);
+            let mut fail = base_event(RequestEventKind::Failed);
+            fail.request_id = format!("req-{i}");
+            fail.failure_kind = Some(FailureKind::UpstreamHttp);
+            fail.error_type = "upstream_http".into();
+            fail.error = format!("err {i}");
+            fail.status_code = 502;
+            d.observe(fail);
+        }
+        let s = d.snapshot();
+        assert_eq!(s.failures.len(), 5);
+        assert_eq!(s.errors.len(), 12); // recent-errors ring uses RECENT_CAP (50)
+        assert_eq!(s.failures[0].request_id, "req-11");
+        assert_eq!(s.failures[4].request_id, "req-7");
+    }
+
+    #[test]
+    fn classifies_proxy_assemble_failure_record() {
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        let mut fail = base_event(RequestEventKind::Failed);
+        fail.failure_kind = Some(FailureKind::ProxyAssemble);
+        fail.error_type = "proxy_incomplete_output".into();
+        fail.error = "could not assemble".into();
+        fail.status_code = 200;
+        fail.response_id = "resp_x".into();
+        fail.output_count = 1;
+        fail.capture_bytes = 4096;
+        d.observe(fail);
+        let s = d.snapshot();
+        assert_eq!(s.failures.len(), 1);
+        let f = &s.failures[0];
+        assert_eq!(f.kind, FailureKind::ProxyAssemble);
+        assert_eq!(f.error_type, "proxy_incomplete_output");
+        assert_eq!(f.status_code, 200);
+        assert_eq!(f.session_failure_index, 1);
+        assert_eq!(f.response_id, "resp_x");
+        assert_eq!(
+            s.sessions[0].last_failure_kind,
+            Some(FailureKind::ProxyAssemble)
+        );
+        assert_eq!(s.sessions[0].errors, 1);
+    }
+
+    #[test]
+    fn auth_retry_attempt_field_recorded() {
+        let d = Dashboard::new();
+        let mut start = base_event(RequestEventKind::Started);
+        start.auth_retried = true;
+        start.attempt = 2;
+        d.observe(start);
+        let mut fail = base_event(RequestEventKind::Failed);
+        fail.auth_retried = true;
+        fail.attempt = 2;
+        fail.failure_kind = Some(FailureKind::AuthRetryFailed);
+        fail.error_type = "auth_retry_failed".into();
+        fail.status_code = 401;
+        d.observe(fail);
+        let s = d.snapshot();
+        assert_eq!(s.failures[0].attempt, 2);
+        assert!(s.failures[0].auth_retried);
+        assert_eq!(s.failures[0].kind, FailureKind::AuthRetryFailed);
+        assert_eq!(s.recent[0].attempt, 2);
+    }
+
+    #[test]
+    fn started_reobserve_updates_active_attempt() {
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        assert_eq!(d.snapshot().active[0].attempt, 1);
+        assert!(!d.snapshot().active[0].auth_retried);
+        let mut retry = base_event(RequestEventKind::Started);
+        retry.auth_retried = true;
+        retry.attempt = 2;
+        d.observe(retry);
+        let s = d.snapshot();
+        assert_eq!(s.active.len(), 1);
+        assert_eq!(s.active[0].attempt, 2);
+        assert!(s.active[0].auth_retried);
+        assert_eq!(s.sessions[0].requests, 1); // not double-counted
+        assert_eq!(s.sessions[0].active, 1);
+    }
+
+    #[test]
+    fn failures_for_report_filters_kind() {
+        let d = Dashboard::new();
+        for (i, kind) in [
+            FailureKind::ProxyAssemble,
+            FailureKind::UpstreamHttp,
+            FailureKind::ProxyAssemble,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut start = base_event(RequestEventKind::Started);
+            start.request_id = format!("r{i}");
+            d.observe(start);
+            let mut fail = base_event(RequestEventKind::Failed);
+            fail.request_id = format!("r{i}");
+            fail.failure_kind = Some(kind);
+            d.observe(fail);
+        }
+        assert_eq!(
+            d.failures_for_report(Some(FailureKind::ProxyAssemble))
+                .len(),
+            2
+        );
+        assert_eq!(d.failures_for_report(None).len(), 3);
+    }
+}
