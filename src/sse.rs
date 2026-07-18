@@ -1,6 +1,7 @@
 use crate::proxy::CompatMode;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
+use tracing::warn;
 
 const MAX_STATE_BYTES: usize = 16 << 20;
 
@@ -582,6 +583,13 @@ impl Assembler {
     fn error(&mut self, kind: &str) -> Value {
         self.terminal = true;
         self.seq += 1;
+        warn!(
+            error_type = kind,
+            response_id = self.response_id,
+            output_state_count = self.outputs.len(),
+            buffered_state_bytes = self.state_bytes,
+            "response stream normalization failed"
+        );
         json!({"type":"error","sequence_number":self.seq,"response_id":self.response_id,"error":{"type":kind,"message":"The proxy could not safely assemble a complete Responses stream."}})
     }
 }
@@ -653,17 +661,15 @@ fn normalize_response(response: &mut Value, id: &str, model: &str, status: &str)
     let o = response.as_object_mut().unwrap();
     o.insert("object".into(), "response".into());
     o.insert("status".into(), status.into());
-    if !o
-        .get("id")
+    if o.get("id")
         .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty())
+        .is_none_or(|s| s.is_empty())
     {
         o.insert("id".into(), id.into());
     }
-    if !o
-        .get("model")
+    if o.get("model")
         .and_then(Value::as_str)
-        .is_some_and(|s| !s.is_empty())
+        .is_none_or(|s| s.is_empty())
     {
         o.insert(
             "model".into(),
@@ -674,7 +680,7 @@ fn normalize_response(response: &mut Value, id: &str, model: &str, status: &str)
             },
         );
     }
-    if !o.get("created_at").and_then(Value::as_u64).is_some() {
+    if o.get("created_at").and_then(Value::as_u64).is_none() {
         o.insert(
             "created_at".into(),
             chrono::Utc::now().timestamp().max(0).into(),
@@ -712,9 +718,9 @@ fn normalize_usage(usage: &mut Value) {
         *input_details = json!({});
     }
     let input_object = input_details.as_object_mut().unwrap();
-    if !input_object
+    if input_object
         .get("cached_tokens")
-        .is_some_and(|value| value.as_u64().is_some())
+        .is_none_or(|value| value.as_u64().is_none())
     {
         input_object.insert("cached_tokens".into(), 0.into());
     }
@@ -725,9 +731,9 @@ fn normalize_usage(usage: &mut Value) {
         *output_details = json!({});
     }
     let output_object = output_details.as_object_mut().unwrap();
-    if !output_object
+    if output_object
         .get("reasoning_tokens")
-        .is_some_and(|value| value.as_u64().is_some())
+        .is_none_or(|value| value.as_u64().is_none())
     {
         output_object.insert("reasoning_tokens".into(), 0.into());
     }

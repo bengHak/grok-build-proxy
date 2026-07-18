@@ -119,10 +119,12 @@ Canonical catalog routes, configured model-map aliases, and eligible generated
 `-fast` routes inherit their target's capability. Unknown or unsupported models
 omit the capability fields.
 
-## Why v0.0.7 is required for Responses Lite, Plan, and Goal
+## Responses Lite, Plan, and Goal compatibility
 
-Grok Build displays streamed text immediately, but accepts a turn from the final
-`response.completed.response.output`. Some private Responses Lite streams omit
+The required compatibility layer was introduced in v0.0.7 and remains enabled
+in current releases. Grok Build displays streamed text immediately, but accepts a
+turn from the final `response.completed.response.output`. Some private Responses
+Lite streams omit
 standard event-envelope fields such as `sequence_number`, `output_index`,
 `content_index`, or `item_id`; others emit a complete delta sequence followed by
 an empty or malformed `done` payload. A visible answer or complete tool call can
@@ -261,11 +263,14 @@ are rejected before the server starts.
 
 ## Configuration
 
+### Serve
+
 | Flag | Environment variable | Default |
 |---|---|---|
 | `--listen` | `GROK_BUILD_PROXY_LISTEN` | `127.0.0.1:18765` |
 | `--auth-file` | `GROK_BUILD_PROXY_AUTH_FILE` | dedicated Codex home `auth.json` |
 | `--upstream` | `GROK_BUILD_PROXY_UPSTREAM` | ChatGPT Codex Responses endpoint |
+| `--refresh-url` | `GROK_BUILD_PROXY_REFRESH_URL` | OpenAI OAuth token endpoint |
 | `--models` | `GROK_BUILD_PROXY_MODELS` | built-in catalog |
 | `--model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | empty |
 | `--codex-compat-version` | `GROK_BUILD_PROXY_CODEX_COMPAT_VERSION` | `0.144.0` |
@@ -273,6 +278,25 @@ are rejected before the server starts.
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
 | `--no-monitor` | — | auto-enable monitor on an interactive terminal |
+| `--print-grok-config` | — | print model blocks and exit |
+
+`GROK_BUILD_PROXY_RESPONSES_COMPAT` also accepts `legacy` for `text`, and
+`false` or `0` for `off`. Unknown values currently fall back to `full`.
+
+### Auth and doctor
+
+| Purpose | Flag or environment variable | Default |
+|---|---|---|
+| Dedicated Codex home | `--codex-home`, `GROK_BUILD_PROXY_CODEX_HOME`, or `CODEX_HOME` | `~/.codex-grok-build-proxy` |
+| Codex executable | `--codex-binary`, `GROK_BUILD_PROXY_CODEX_BINARY` | `codex` |
+| Grok executable (doctor) | `--grok-binary`, `GROK_BUILD_PROXY_GROK_BINARY` | `grok` |
+| Grok config (doctor) | `--grok-config`, `GROK_BUILD_PROXY_GROK_CONFIG` | `~/.grok/config.toml` |
+| Doctor timeout | `--timeout` | 5 seconds |
+
+`doctor` also accepts `--auth-file`, `--listen`, `--model-map`, and
+`--client-token`, with the same environment variables shown in the Serve table.
+Run `grok-build-proxy serve --help`, `auth <command> --help`, or `doctor --help`
+for the complete command-specific options.
 
 A bearer token is mandatory when binding to a non-loopback address. Keep the
 default loopback binding whenever possible.
@@ -283,7 +307,7 @@ default loopback binding whenever possible.
 - `auth.json` missing: run `grok-build-proxy auth login`.
 - The same text answer or a Plan/Goal tool call is repeated: upgrade to `0.0.7`
   or newer. Proxy-generated failures now log `error_type`, `response_id`, output
-  state count, and buffered byte count without logging model content.
+  state count, and buffered state byte count without logging model content.
 - `proxy_incomplete_output`: the upstream stream ended before a safe executable
   tool call could be reconstructed; the proxy intentionally did not complete it.
 - `proxy_missing_terminal_output`: no unambiguous text or tool output could be
