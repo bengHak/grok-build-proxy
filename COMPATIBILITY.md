@@ -38,14 +38,29 @@ The request adapter preserves:
 - request-level `reasoning.effort` on both `POST /v1/responses` and
   `POST /responses`, without replacing it with a proxy-wide value.
 
+## Kimi compatibility
+
+Requests for `kimi-for-coding`, `kimi-k2.6`, or `k2.6` are translated from the
+Responses API to Kimi's coding Chat Completions endpoint. The adapter preserves
+developer/system instructions, user and assistant messages, function calls and
+outputs, function definitions and tool choice, prompt-cache session affinity,
+and `low`, `medium`, or `high` reasoning effort. Output is translated back to
+incremental Responses events for reasoning summaries, text, function arguments,
+terminal output items, and token usage. Both streaming and non-streaming client
+requests are supported.
+
+Kimi currently accepts function tools through this adapter. Responses custom
+tools are rejected instead of being silently changed into a different tool
+contract.
+
 ## Reasoning effort and model discovery
 
 For capable models, both `GET /v1/models` and `GET /models` advertise
 `supports_reasoning_effort`, the default `reasoning_effort`, and the available
-`reasoning_efforts`. The advertised values are `low`, `medium`, `high`, and
-`xhigh`. `grok-build-proxy --print-grok-config` emits the corresponding
-`supports_reasoning_effort = true` and `reasoning_efforts` fields for Grok Build
-model entries.
+`reasoning_efforts`. Codex advertises `low`, `medium`, `high`, and `xhigh`; Kimi
+advertises `low`, `medium`, and `high`. `grok-build-proxy --print-grok-config`
+emits the corresponding `supports_reasoning_effort = true` and
+`reasoning_efforts` fields for Grok Build model entries.
 
 Capability metadata is inherited by canonical catalog routes, configured
 model-map aliases, and eligible generated `-fast` routes. Unknown or unsupported

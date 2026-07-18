@@ -34,8 +34,35 @@ fn config_output_uses_real_catalog_and_requested_address() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("model = \"gpt-5.6-sol\""));
+    assert!(text.contains("model = \"kimi-for-coding\""));
+    assert!(text.contains("name = \"Kimi K2.6\""));
     assert!(text.contains("base_url = \"http://127.0.0.1:28765/v1\""));
     assert!(text.contains("reasoning_efforts = [\"low\", \"medium\", \"high\", \"xhigh\"]"));
+}
+
+#[test]
+fn kimi_auth_status_reads_the_selected_auth_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("kimi-auth.json");
+    std::fs::write(
+        &path,
+        br#"{"access":"secret","refresh":"rotate","expires":1893456000000,"userId":"user-1"}"#,
+    )
+    .unwrap();
+    let output = binary()
+        .args(["kimi", "auth", "status", "--auth-file"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Kimi credential file:"));
+    assert!(text.contains("Refresh token: present"));
+    assert!(!text.contains("secret"));
 }
 
 #[test]

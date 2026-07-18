@@ -3,6 +3,7 @@ use crate::{
     catalog::{Catalog, ReasoningCapability},
     events::{classify_stream_end, parse_capture_diagnostics, sanitize},
     modelmap::ModelMap,
+    provider::{Provider, kimi},
 };
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
@@ -31,6 +32,7 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
 pub struct ProxyConfig {
     pub upstream_url: String,
     pub credentials: Arc<dyn CredentialProvider>,
+    pub kimi: Option<KimiConfig>,
     pub catalog: Catalog,
     pub model_map: ModelMap,
     pub client: reqwest::Client,
@@ -40,6 +42,12 @@ pub struct ProxyConfig {
     pub responses_compat: CompatMode,
     pub observer: Option<Arc<dyn Observer>>,
     pub max_body_bytes: usize,
+}
+
+#[derive(Clone)]
+pub struct KimiConfig {
+    pub upstream_url: String,
+    pub credentials: Arc<kimi::auth::Store>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompatMode {
@@ -66,6 +74,9 @@ struct AppState(Arc<ProxyConfig>);
 
 pub fn router(config: ProxyConfig) -> Result<Router> {
     url::Url::parse(&config.upstream_url).context("invalid upstream URL")?;
+    if let Some(kimi) = &config.kimi {
+        url::Url::parse(&kimi.upstream_url).context("invalid Kimi upstream URL")?;
+    }
     let limit = config.max_body_bytes;
     let state = AppState(Arc::new(config));
     Ok(Router::new()
@@ -124,13 +135,31 @@ async fn ready(State(s): State<AppState>, method: Method, headers: HeaderMap) ->
             "method not allowed",
         );
     };
-    match s.0.credentials.get(false).await {
-        Ok(_) => Json(json!({"ok":true,"auth":"ready"})).into_response(),
-        Err(e) => error(
+    let codex = s.0.credentials.get(false).await;
+    let kimi = match &s.0.kimi {
+        Some(config) => Some(config.credentials.get(false).await),
+        None => None,
+    };
+    if codex.is_ok() || kimi.as_ref().is_some_and(Result::is_ok) {
+        Json(json!({
+            "ok": true,
+            "auth": {
+                "codex": codex.is_ok(),
+                "kimi": kimi.as_ref().is_some_and(Result::is_ok)
+            }
+        }))
+        .into_response()
+    } else {
+        let message = codex
+            .err()
+            .map(|error| error.to_string())
+            .or_else(|| kimi.and_then(Result::err).map(|error| error.to_string()))
+            .unwrap_or_else(|| "no provider credentials configured".into());
+        error(
             StatusCode::SERVICE_UNAVAILABLE,
             "authentication_error",
-            e.to_string(),
-        ),
+            message,
+        )
     }
 }
 fn unauthorized() -> Response {
@@ -173,6 +202,7 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
         context: u64,
         fast: bool,
         reasoning: Option<ReasoningCapability>,
+        provider: Provider,
     }
     let mut routes = Vec::new();
     let mut seen = HashSet::new();
@@ -196,23 +226,27 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
                     if resolved.fast { " (Fast)" } else { "" }
                 ),
                 description: format!(
-                    "Maps {} to {} through ChatGPT Codex.",
-                    entry.source, effective
+                    "Maps {} to {} through {}.",
+                    entry.source,
+                    effective,
+                    m.provider.owned_by()
                 ),
                 context: m.context_window,
                 fast: resolved.fast,
                 reasoning: m.reasoning,
+                provider: m.provider,
             });
         }
         for m in s.0.catalog.models() {
             push(Route {
                 id: m.id.clone(),
-                target: m.id,
+                target: m.upstream_id,
                 name: m.display_name,
                 description: m.description,
                 context: m.context_window,
                 fast: false,
                 reasoning: m.reasoning,
+                provider: m.provider,
             });
         }
     }
@@ -227,6 +261,7 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
                 context: r.context,
                 fast: true,
                 reasoning: r.reasoning,
+                provider: r.provider,
             };
             if seen.insert(route.id.clone()) {
                 routes.push(route);
@@ -234,7 +269,7 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
         }
     }
     let data:Vec<Value>=routes.into_iter().map(|r|{
-        let mut value=json!({"id":r.id,"object":"model","owned_by":"openai-codex","name":r.name,"description":r.description,"context_window":r.context,"api_backend":"responses"});
+        let mut value=json!({"id":r.id,"object":"model","owned_by":r.provider.owned_by(),"name":r.name,"description":r.description,"context_window":r.context,"api_backend":"responses"});
         let object=value.as_object_mut().unwrap();
         if r.id!=r.target||r.fast { object.insert("target_model".into(),format!("{}{}",r.target,if r.fast{"-fast"}else{""}).into()); }
 
@@ -255,6 +290,7 @@ pub struct TransformedRequest {
     pub lite: bool,
     pub fast: bool,
     pub stream: bool,
+    pub provider: Provider,
 }
 pub fn transform_request(
     raw: &[u8],
@@ -279,8 +315,7 @@ pub fn transform_request(
     };
     let resolution = mappings.resolve(&requested);
     let (model, _) = catalog.lookup(&resolution.model);
-    object.insert("model".into(), resolution.model.clone().into());
-    object.insert("store".into(), false.into());
+    object.insert("model".into(), model.upstream_id.clone().into());
     let stream = object
         .get("stream")
         .and_then(Value::as_bool)
@@ -288,10 +323,16 @@ pub fn transform_request(
     if !object.get("stream").is_some_and(Value::is_boolean) {
         object.insert("stream".into(), true.into());
     }
-    if resolution.fast {
+    let fast = resolution.fast && model.provider == Provider::Codex;
+    if model.provider == Provider::Codex {
+        object.insert("store".into(), false.into());
+    }
+    if fast {
         object.entry("service_tier").or_insert("priority".into());
     }
-    if model.responses_lite {
+    if model.provider == Provider::Kimi {
+        object.remove("service_tier");
+    } else if model.responses_lite {
         apply_responses_lite(object)
     } else {
         object.entry("parallel_tool_calls").or_insert(true.into());
@@ -302,8 +343,9 @@ pub fn transform_request(
         model: resolution.model,
         mapped: resolution.mapped,
         lite: model.responses_lite,
-        fast: resolution.fast,
+        fast,
         stream,
+        provider: model.provider,
     })
 }
 fn apply_responses_lite(body: &mut Map<String, Value>) {
@@ -492,8 +534,77 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         && s.0.responses_compat != CompatMode::Off
         && status.is_success()
         && (is_sse || transformed.stream);
+    let translate_kimi = transformed.provider == Provider::Kimi && status.is_success();
     let observer = s.0.observer.clone();
-    let body = if normalize_stream {
+    let body = if translate_kimi && transformed.stream {
+        let mut source = upstream.bytes_stream();
+        let mut translator = kimi::stream::Translator::new(&request_id, kimi::WIRE_MODEL);
+        let observer = observer.clone();
+        let event = base_event.clone();
+        Body::from_stream(async_stream::stream! {
+            let mut guard = StreamObserveGuard::new(observer, event, status);
+            while let Some(chunk) = source.next().await {
+                match chunk {
+                    Ok(chunk) => {
+                        let output = translator.push(&chunk);
+                        capture_tail(&mut guard.capture, &output);
+                        if !output.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(output));
+                        }
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        guard.finish(Some(message.clone()));
+                        yield Err(std::io::Error::other(message));
+                        return;
+                    }
+                }
+            }
+            let output = translator.finish();
+            capture_tail(&mut guard.capture, &output);
+            guard.finish(None);
+            if !output.is_empty() {
+                yield Ok::<Bytes, std::io::Error>(Bytes::from(output));
+            }
+        })
+    } else if translate_kimi {
+        let upstream_body = match upstream.bytes().await {
+            Ok(body) => body,
+            Err(upstream_error) => {
+                observe_failure(
+                    &s.0,
+                    &base_event,
+                    FailureKind::StreamIo,
+                    "stream_io",
+                    upstream_error.to_string(),
+                    StatusCode::BAD_GATEWAY,
+                );
+                return with_request_id(
+                    error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        upstream_error.to_string(),
+                    ),
+                    &request_id,
+                );
+            }
+        };
+        let mut translator = kimi::stream::Translator::new(&request_id, kimi::WIRE_MODEL);
+        let mut capture = translator.push(&upstream_body);
+        capture.extend(translator.finish());
+        let response = translator.terminal_response().cloned().unwrap_or_else(|| {
+            json!({
+                "id": request_id,
+                "object": "response",
+                "status": "failed",
+                "model": kimi::WIRE_MODEL,
+                "output": [],
+                "error": {"type":"upstream_error","message":"Kimi stream ended without a response"}
+            })
+        });
+        observe_stream_end(&observer, base_event.clone(), status, &capture, None);
+        Body::from(serde_json::to_vec(&response).unwrap_or_default())
+    } else if normalize_stream {
         let mut source = upstream.bytes_stream();
         let mut normalizer = crate::sse::StreamNormalizer::new(
             s.0.responses_compat,
@@ -554,10 +665,14 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     };
     let mut response = Response::builder().status(status).body(body).unwrap();
     copy_headers(response.headers_mut(), &headers);
-    if normalize_stream {
+    if translate_kimi || normalize_stream {
         response.headers_mut().insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static("text/event-stream; charset=utf-8"),
+            HeaderValue::from_static(if transformed.stream {
+                "text/event-stream; charset=utf-8"
+            } else {
+                "application/json"
+            }),
         );
         response.headers_mut().remove(header::CONTENT_ENCODING);
     }
@@ -765,6 +880,33 @@ fn with_request_id(mut r: Response, id: &str) -> Response {
     r
 }
 async fn send_upstream(
+    cfg: &ProxyConfig,
+    t: &TransformedRequest,
+    incoming: &HeaderMap,
+    session: &str,
+    force: bool,
+) -> Result<reqwest::Response> {
+    match t.provider {
+        Provider::Codex => send_codex_upstream(cfg, t, incoming, session, force).await,
+        Provider::Kimi => {
+            let config = cfg
+                .kimi
+                .as_ref()
+                .context("Kimi provider is not configured")?;
+            kimi::client::send(
+                &cfg.client,
+                &config.upstream_url,
+                &config.credentials,
+                &t.body,
+                session,
+                force,
+            )
+            .await
+        }
+    }
+}
+
+async fn send_codex_upstream(
     cfg: &ProxyConfig,
     t: &TransformedRequest,
     incoming: &HeaderMap,
@@ -1235,6 +1377,7 @@ mod tests {
         let app = router(ProxyConfig {
             upstream_url: "http://127.0.0.1:9/responses".into(),
             credentials: Arc::new(Creds),
+            kimi: None,
             catalog: Catalog::default(),
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
@@ -1304,6 +1447,7 @@ mod tests {
         let app = router(ProxyConfig {
             upstream_url: format!("http://{address}/responses"),
             credentials: Arc::new(Creds),
+            kimi: None,
             catalog: Catalog::default(),
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
@@ -1465,6 +1609,7 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
         let config = ProxyConfig {
             upstream_url: "http://127.0.0.1:9/responses".into(),
             credentials: Arc::new(Creds),
+            kimi: None,
             catalog: Catalog::default(),
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),

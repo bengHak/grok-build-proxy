@@ -1,7 +1,7 @@
 # Security policy
 
-`grok-build-proxy` handles ChatGPT/Codex access and refresh tokens on macOS.
-Treat the Codex authentication file as a password.
+`grok-build-proxy` handles ChatGPT/Codex and Kimi access and refresh tokens on
+macOS. Treat both authentication files as passwords.
 
 ## Safe defaults
 
@@ -18,6 +18,8 @@ Treat the Codex authentication file as a password.
 - `grok-build-proxy auth` delegates login, device authorization, status, and
   logout to the official Codex CLI. It does not collect ChatGPT passwords or
   implement its own OAuth callback flow.
+- `grok-build-proxy kimi auth` uses Kimi's device-code OAuth endpoint. It never
+  collects a Kimi password and never prints access or refresh tokens.
 - `grok-build-proxy doctor` reports only redacted account metadata and never
   prints access or refresh token values.
 - Serve-monitor failure reports (`y`/`Y` clipboard, `w`/`W` under
@@ -29,14 +31,18 @@ Treat the Codex authentication file as a password.
 
 - Do not commit, upload, back up to a public location, or share `auth.json`.
 - The default proxy credential directory is `~/.codex-grok-build-proxy`.
+- Kimi credentials default to `~/.grok-build-proxy/kimi/auth.json`; the adjacent
+  `device_id` is not a bearer credential but is still kept private.
 - The auth wrapper configures `cli_auth_credentials_store = "file"` and
   `forced_login_method = "chatgpt"` in that dedicated Codex home.
 - Keep the authentication file readable only by your macOS user. The doctor
   reports group or world-readable credentials as a blocking problem.
+- Kimi auth and device ID files are atomically written with mode `0600` in a
+  mode `0700` directory.
 - Do not point multiple long-running proxy processes at the same credential
   file. A dedicated home reduces refresh-token races with normal Codex sessions.
-- Log out with `grok-build-proxy auth logout` before deleting a dedicated
-  credential directory.
+- Log out with `grok-build-proxy auth logout` or `grok-build-proxy kimi auth
+  logout` before deleting a dedicated credential directory.
 
 ## Network exposure
 

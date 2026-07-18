@@ -6,6 +6,7 @@ pub mod events;
 pub mod grokconfig;
 pub mod modelmap;
 pub mod monitor;
+pub mod provider;
 pub mod proxy;
 pub mod report;
 pub mod sse;

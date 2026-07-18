@@ -1,0 +1,84 @@
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, anyhow, bail};
+use tokio::{fs, io::AsyncWriteExt};
+
+use super::StoredAuth;
+
+pub(super) async fn load_auth(path: &Path) -> Result<StoredAuth> {
+    let data = fs::read(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            anyhow!(
+                "Kimi credentials not found at {}; run `grok-build-proxy kimi auth login`",
+                path.display()
+            )
+        } else {
+            anyhow!(error).context("read Kimi auth file")
+        }
+    })?;
+    let auth: StoredAuth = serde_json::from_slice(&data).context("parse Kimi auth file")?;
+    if auth.access.trim().is_empty() {
+        bail!("Kimi auth file is missing an access token; run `grok-build-proxy kimi auth login`")
+    }
+    Ok(auth)
+}
+
+pub(super) async fn save_auth(path: &Path, auth: &StoredAuth) -> Result<()> {
+    let mut data = serde_json::to_vec_pretty(auth)?;
+    data.push(b'\n');
+    save_private(path, &data).await
+}
+
+pub(super) async fn remove_auth(path: &Path) -> Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove Kimi auth file"),
+    }
+}
+
+pub(super) async fn device_id(auth_path: &Path) -> Result<String> {
+    let path = device_id_path(auth_path);
+    match fs::read_to_string(&path).await {
+        Ok(value) if !value.trim().is_empty() => return Ok(value.trim().to_owned()),
+        Ok(_) => bail!("Kimi device ID file is empty at {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("read Kimi device ID"),
+    }
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    save_private(&path, format!("{id}\n").as_bytes()).await?;
+    Ok(id)
+}
+
+fn device_id_path(auth_path: &Path) -> PathBuf {
+    auth_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("device_id")
+}
+
+async fn save_private(path: &Path, data: &[u8]) -> Result<()> {
+    let directory = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(directory).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    let temporary = directory.join(format!(".kimi-auth-{}", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .await?;
+    file.write_all(data).await?;
+    file.sync_all().await?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    fs::rename(&temporary, path).await?;
+    Ok(())
+}
