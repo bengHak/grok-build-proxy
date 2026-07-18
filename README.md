@@ -207,9 +207,11 @@ overwriting it, and passes through `prompt_cache_options` and
 
 Fork and subagent clients can send `x-grok-cache-lineage-id` to reuse a parent
 session's cache routing while retaining their own `x-grok-session-id` as the
-Codex thread identity. The upstream request then uses the lineage for
-`prompt_cache_key`, `session-id`, and `x-session-affinity`, while `thread-id`,
-`x-client-request-id`, and `x-codex-window-id` remain scoped to the child.
+Codex thread identity. The upstream request uses the lineage for `session-id`
+and `x-session-affinity`; a valid explicit `prompt_cache_key` controls only
+cache routing. `thread-id`, `x-client-request-id`, and `x-codex-window-id`
+remain scoped to the child. Cache keys longer than the Responses API's 64-byte
+limit are replaced with a stable bounded key.
 
 When terminal usage is available, plain logs include `input_tokens`,
 `cached_input_tokens`, `cache_write_tokens`, `uncached_input_tokens`, and

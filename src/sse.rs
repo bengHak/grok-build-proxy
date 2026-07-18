@@ -827,7 +827,7 @@ impl StreamNormalizer {
     }
 }
 
-fn frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+pub(crate) fn frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
     let lf = bytes.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
     let crlf = bytes
         .windows(4)

@@ -68,7 +68,9 @@ struct AppState(Arc<ProxyConfig>);
 struct UpstreamIdentity {
     /// Current Grok Build conversation/thread identity.
     thread_id: String,
-    /// Stable namespace used to route matching prompt prefixes to the same cache shard.
+    /// Root session shared by related threads.
+    session_id: String,
+    /// Stable, Responses-compatible prompt-cache routing key.
     cache_key: String,
 }
 
@@ -85,10 +87,12 @@ impl UpstreamIdentity {
         )
         .unwrap_or(fallback)
         .to_owned();
+        let session_id = first_valid_header(headers, &["x-grok-cache-lineage-id"])
+            .unwrap_or(&thread_id)
+            .to_owned();
 
-        // A standard Responses API prompt_cache_key is authoritative when supplied.
-        // The lineage header lets fork/subagent clients share the parent's cache namespace
-        // while keeping an independent thread identity.
+        // An explicit Responses API key controls only prompt-cache routing. Forks may
+        // otherwise share their root session's cache namespace without collapsing threads.
         let explicit_cache_key = serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|value| {
@@ -98,14 +102,11 @@ impl UpstreamIdentity {
                     .map(str::to_owned)
             })
             .filter(|value| valid_cache_key(value));
-        let lineage_cache_key =
-            first_valid_header(headers, &["x-grok-cache-lineage-id"]).map(str::to_owned);
-        let cache_key = explicit_cache_key
-            .or(lineage_cache_key)
-            .unwrap_or_else(|| thread_id.clone());
+        let cache_key = explicit_cache_key.unwrap_or_else(|| bounded_cache_key(&session_id));
 
         Self {
             thread_id,
+            session_id,
             cache_key,
         }
     }
@@ -118,7 +119,15 @@ fn first_valid_header<'a>(headers: &'a HeaderMap, keys: &[&str]) -> Option<&'a s
 }
 
 fn valid_cache_key(value: &str) -> bool {
-    valid_header(value)
+    !value.is_empty() && value.len() <= 64 && !value.chars().any(char::is_control)
+}
+
+fn bounded_cache_key(value: &str) -> String {
+    if valid_cache_key(value) {
+        value.to_owned()
+    } else {
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, value.as_bytes()).to_string()
+    }
 }
 
 pub fn router(config: ProxyConfig) -> Result<Router> {
@@ -557,7 +566,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
                 match chunk {
                     Ok(chunk) => {
                         let output = normalizer.push(&chunk);
-                        capture_tail(&mut guard.capture, &output);
+                        guard.capture(&output);
                         if !output.is_empty() {
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(output));
                         }
@@ -572,7 +581,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             }
             // Observe before final yield so client drop at the last chunk cannot force StreamIo.
             let output = normalizer.finish();
-            capture_tail(&mut guard.capture, &output);
+            guard.capture(&output);
             guard.finish(None);
             if !output.is_empty() {
                 yield Ok::<Bytes, std::io::Error>(Bytes::from(output));
@@ -586,7 +595,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             while let Some(chunk) = source.next().await {
                 match chunk {
                     Ok(chunk) => {
-                        capture_tail(&mut guard.capture, &chunk);
+                        guard.capture(&chunk);
                         yield Ok::<Bytes, std::io::Error>(chunk);
                     }
                     Err(error) => {
@@ -652,46 +661,60 @@ struct ObservedUsage {
     output_tokens: u64,
 }
 
+#[derive(Default)]
+struct UsageAccumulator {
+    pending: Vec<u8>,
+    observed: ObservedUsage,
+}
+
+impl UsageAccumulator {
+    fn push(&mut self, chunk: &[u8]) {
+        self.pending.extend_from_slice(chunk);
+        while let Some((position, separator_len)) = crate::sse::frame_boundary(&self.pending) {
+            let frame: Vec<u8> = self.pending.drain(..position + separator_len).collect();
+            if let Some(usage) = usage_from_frame(&frame) {
+                self.observed = usage;
+            }
+        }
+    }
+
+    fn finish(&mut self) -> ObservedUsage {
+        if let Some(usage) = usage_from_frame(&self.pending) {
+            self.observed = usage;
+        }
+        self.pending.clear();
+        self.observed
+    }
+}
+
+#[cfg(test)]
 fn observed_usage(bytes: &[u8]) -> ObservedUsage {
-    let text = String::from_utf8_lossy(bytes);
-    let mut observed = ObservedUsage::default();
-    let mut found = false;
+    let mut accumulator = UsageAccumulator::default();
+    accumulator.push(bytes);
+    accumulator.finish()
+}
 
-    for frame in text.split("\n\n") {
-        let data_lines: Vec<&str> = frame
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(|value| value.strip_prefix(' ').unwrap_or(value))
-            .collect();
-        if data_lines.is_empty() {
-            continue;
-        }
-        let joined;
-        let data = if data_lines.len() == 1 {
-            data_lines[0]
-        } else {
-            joined = data_lines.join("\n");
-            joined.as_str()
-        };
-        if data == "[DONE]" {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(data)
-            && let Some(usage) = usage_from_value(&value)
-        {
-            observed = usage;
-            found = true;
-        }
+fn usage_from_frame(frame: &[u8]) -> Option<ObservedUsage> {
+    let text = String::from_utf8_lossy(frame).replace("\r\n", "\n");
+    let data_lines: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .map(|value| value.strip_prefix(' ').unwrap_or(value))
+        .collect();
+    if data_lines.is_empty() {
+        return serde_json::from_str::<Value>(text.trim())
+            .ok()
+            .as_ref()
+            .and_then(usage_from_value);
     }
-
-    if !found
-        && let Ok(value) = serde_json::from_str::<Value>(text.trim())
-        && let Some(usage) = usage_from_value(&value)
-    {
-        observed = usage;
+    let data = data_lines.join("\n");
+    if data == "[DONE]" {
+        return None;
     }
-
-    observed
+    serde_json::from_str::<Value>(&data)
+        .ok()
+        .as_ref()
+        .and_then(usage_from_value)
 }
 
 fn usage_from_value(value: &Value) -> Option<ObservedUsage> {
@@ -729,6 +752,7 @@ struct StreamObserveGuard {
     event: RequestEvent,
     status: StatusCode,
     capture: Vec<u8>,
+    usage: UsageAccumulator,
     finished: bool,
 }
 
@@ -739,8 +763,14 @@ impl StreamObserveGuard {
             event,
             status,
             capture: Vec::new(),
+            usage: UsageAccumulator::default(),
             finished: false,
         }
+    }
+
+    fn capture(&mut self, chunk: &[u8]) {
+        self.usage.push(chunk);
+        capture_tail(&mut self.capture, chunk);
     }
 
     fn finish(&mut self, stream_io_error: Option<String>) {
@@ -748,11 +778,13 @@ impl StreamObserveGuard {
             return;
         }
         self.finished = true;
+        let usage = self.usage.finish();
         observe_stream_end(
             &self.observer,
             self.event.clone(),
             self.status,
             &self.capture,
+            usage,
             stream_io_error,
         );
     }
@@ -772,11 +804,13 @@ impl Drop for StreamObserveGuard {
         } else {
             Some("client disconnected".into())
         };
+        let usage = self.usage.finish();
         observe_stream_end(
             &self.observer,
             self.event.clone(),
             self.status,
             &self.capture,
+            usage,
             stream_io,
         );
     }
@@ -787,12 +821,12 @@ fn observe_stream_end(
     mut event: RequestEvent,
     status: StatusCode,
     capture: &[u8],
+    usage: ObservedUsage,
     stream_io_error: Option<String>,
 ) {
     event.status_code = status.as_u16();
     event.duration_ms = event.started_at.elapsed().as_millis() as u64;
     event.capture_bytes = capture.len() as u32;
-    let usage = observed_usage(capture);
     event.output_tokens = usage.output_tokens;
     if usage.input_tokens > 0
         || usage.cached_input_tokens > 0
@@ -800,11 +834,11 @@ fn observe_stream_end(
         || usage.output_tokens > 0
     {
         let uncached_input_tokens = usage.input_tokens.saturating_sub(usage.cached_input_tokens);
-        let cache_read_percent = if usage.input_tokens == 0 {
-            0
-        } else {
-            usage.cached_input_tokens.saturating_mul(100) / usage.input_tokens
-        };
+        let cache_read_percent = usage
+            .cached_input_tokens
+            .saturating_mul(100)
+            .checked_div(usage.input_tokens)
+            .unwrap_or(0);
         info!(
             request_id = event.request_id,
             session_id = event.session_id,
@@ -940,9 +974,9 @@ async fn send_upstream(
                 "grok-build-proxy"
             },
         )
-        .header("session-id", &identity.cache_key)
+        .header("session-id", &identity.session_id)
         .header("thread-id", &identity.thread_id)
-        .header("x-session-affinity", &identity.cache_key)
+        .header("x-session-affinity", &identity.session_id)
         .header("x-client-request-id", &identity.thread_id)
         .header("x-codex-window-id", format!("{}:0", identity.thread_id))
         .header("version", &cfg.compatibility_version);
@@ -969,7 +1003,8 @@ async fn send_upstream(
 pub fn codex_compat_body(raw: &[u8], session: &str, lite: bool) -> Result<Vec<u8>> {
     let identity = UpstreamIdentity {
         thread_id: session.to_owned(),
-        cache_key: session.to_owned(),
+        session_id: session.to_owned(),
+        cache_key: bounded_cache_key(session),
     };
     codex_compat_body_for_identity(raw, &identity, lite)
 }
@@ -1009,7 +1044,7 @@ fn codex_compat_body_for_identity(
         .and_then(Value::as_str)
         .filter(|value| valid_cache_key(value))
         .map(str::to_owned)
-        .unwrap_or_else(|| identity.cache_key.clone());
+        .unwrap_or_else(|| bounded_cache_key(&identity.cache_key));
     body.insert("prompt_cache_key".into(), prompt_cache_key.into());
     match body.get("tool_choice") {
         None | Some(Value::Null) => {
@@ -1053,7 +1088,7 @@ fn codex_compat_body_for_identity(
             .ok_or_else(|| anyhow!("client_metadata must be an object"))?;
         object.retain(|_, v| v.is_string());
         object.remove("ws_request_header_x_openai_internal_codex_responses_lite");
-        object.insert("session_id".into(), identity.cache_key.clone().into());
+        object.insert("session_id".into(), identity.session_id.clone().into());
         object.insert("thread_id".into(), identity.thread_id.clone().into());
         object.insert(
             "window_id".into(),
@@ -1380,9 +1415,52 @@ mod tests {
     }
 
     #[test]
+    fn cache_identity_keeps_session_and_explicit_key_separate() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("child-thread"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage-id",
+            HeaderValue::from_static("root-session"),
+        );
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"prompt_cache_key":"shared-cache"}"#,
+            "fallback",
+        );
+        assert_eq!(identity.thread_id, "child-thread");
+        assert_eq!(identity.session_id, "root-session");
+        assert_eq!(identity.cache_key, "shared-cache");
+    }
+
+    #[test]
+    fn cache_keys_enforce_utf8_byte_limit_and_bound_fallbacks() {
+        assert!(valid_cache_key(&"a".repeat(64)));
+        assert!(!valid_cache_key(&"a".repeat(65)));
+        assert!(valid_cache_key(&"é".repeat(32)));
+        assert!(!valid_cache_key(&"é".repeat(33)));
+
+        let lineage = "root".repeat(20);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-cache-lineage-id",
+            HeaderValue::from_str(&lineage).unwrap(),
+        );
+        let first = UpstreamIdentity::from_request(&headers, b"{}", "fallback");
+        let second = UpstreamIdentity::from_request(&headers, b"{}", "fallback");
+        assert_eq!(first.session_id, lineage);
+        assert_eq!(first.cache_key, second.cache_key);
+        assert!(valid_cache_key(&first.cache_key));
+        assert_ne!(first.cache_key, first.session_id);
+    }
+
+    #[test]
     fn preserves_explicit_prompt_cache_fields() {
         let identity = UpstreamIdentity {
             thread_id: "child-thread".into(),
+            session_id: "lineage-default".into(),
             cache_key: "lineage-default".into(),
         };
         let raw = br#"{"model":"gpt-5.6-sol","input":"hello","prompt_cache_key":"root-cache","prompt_cache_options":{"mode":"auto"},"prompt_cache_retention":"24h","client_metadata":{}}"#;
@@ -1401,13 +1479,22 @@ mod tests {
     fn invalid_prompt_cache_key_falls_back_to_lineage() {
         let identity = UpstreamIdentity {
             thread_id: "child-thread".into(),
+            session_id: "root-cache".into(),
             cache_key: "root-cache".into(),
         };
-        let raw = br#"{"model":"gpt-5.6-sol","input":"hello","prompt_cache_key":"bad\nkey"}"#;
-        let value: Value =
-            serde_json::from_slice(&codex_compat_body_for_identity(raw, &identity, false).unwrap())
-                .unwrap();
-        assert_eq!(value["prompt_cache_key"], "root-cache");
+        for invalid in ["bad\nkey".into(), "a".repeat(65), "é".repeat(33)] {
+            let raw = serde_json::to_vec(&json!({
+                "model": "gpt-5.6-sol",
+                "input": "hello",
+                "prompt_cache_key": invalid,
+            }))
+            .unwrap();
+            let value: Value = serde_json::from_slice(
+                &codex_compat_body_for_identity(&raw, &identity, false).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["prompt_cache_key"], "root-cache");
+        }
     }
 
     #[test]
@@ -1418,6 +1505,33 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":12000,"in
 "#;
         assert_eq!(
             observed_usage(capture),
+            ObservedUsage {
+                input_tokens: 12_000,
+                cached_input_tokens: 9_000,
+                cache_write_tokens: 1_500,
+                output_tokens: 321,
+            }
+        );
+    }
+
+    #[test]
+    fn usage_accumulator_handles_split_large_crlf_terminal_frame() {
+        let padding = "x".repeat((256 << 10) + 1);
+        let frame = format!(
+            "event: response.completed\r\ndata: {{\"type\":\"response.completed\",\"padding\":\"{padding}\",\"response\":{{\"usage\":{{\"input_tokens\":12000,\"input_tokens_details\":{{\"cached_tokens\":9000,\"cache_write_tokens\":1500}},\"output_tokens\":321}}}}}}\r\n\r\n"
+        );
+        let split = frame.len() / 2;
+        let mut accumulator = UsageAccumulator::default();
+        let mut diagnostic_tail = Vec::new();
+        accumulator.push(&frame.as_bytes()[..split]);
+        capture_tail(&mut diagnostic_tail, &frame.as_bytes()[..split]);
+        assert_eq!(accumulator.observed, ObservedUsage::default());
+        accumulator.push(&frame.as_bytes()[split..]);
+        capture_tail(&mut diagnostic_tail, &frame.as_bytes()[split..]);
+        assert_eq!(diagnostic_tail.len(), 256 << 10);
+        assert!(!diagnostic_tail.starts_with(b"event:"));
+        assert_eq!(
+            accumulator.finish(),
             ObservedUsage {
                 input_tokens: 12_000,
                 cached_input_tokens: 9_000,
@@ -1604,7 +1718,9 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":12000,"in
                     .header(header::CONTENT_TYPE, "application/json")
                     .header("x-grok-session-id", "child-thread")
                     .header("x-grok-cache-lineage-id", "root-cache")
-                    .body(Body::from(r#"{"model":"gpt-5.6-sol","input":"hi"}"#))
+                    .body(Body::from(
+                        r#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":"shared-cache","client_metadata":{}}"#,
+                    ))
                     .unwrap(),
             )
             .await
@@ -1621,7 +1737,9 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":12000,"in
         assert_eq!(headers["thread-id"], "child-thread");
         assert_eq!(headers["x-client-request-id"], "child-thread");
         assert_eq!(headers["x-codex-window-id"], "child-thread:0");
-        assert_eq!(body["prompt_cache_key"], "root-cache");
+        assert_eq!(body["prompt_cache_key"], "shared-cache");
+        assert_eq!(body["client_metadata"]["session_id"], "root-cache");
+        assert_eq!(body["client_metadata"]["thread_id"], "child-thread");
     }
 
     struct RecordingObserver {
@@ -1668,7 +1786,14 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":12000,"in
 data: {"type":"error","sequence_number":3,"response_id":"resp_x","error":{"type":"proxy_incomplete_output","message":"The proxy could not safely assemble a complete Responses stream."}}
 
 "#;
-        observe_stream_end(&observer, sample_event(), StatusCode::OK, capture, None);
+        observe_stream_end(
+            &observer,
+            sample_event(),
+            StatusCode::OK,
+            capture,
+            observed_usage(capture),
+            None,
+        );
         let events = obs.events.lock().unwrap();
         assert_eq!(events.len(), 1);
         let e = &events[0];
@@ -1695,6 +1820,7 @@ data: {"type":"error","sequence_number":3,"response_id":"resp_x","error":{"type"
             event,
             StatusCode::UNAUTHORIZED,
             br#"{"error":{"type":"invalid_request_error","message":"unauthorized"}}"#,
+            ObservedUsage::default(),
             None,
         );
         let events = obs.events.lock().unwrap();
@@ -1715,6 +1841,7 @@ data: {"type":"error","sequence_number":3,"response_id":"resp_x","error":{"type"
             sample_event(),
             StatusCode::OK,
             b"",
+            ObservedUsage::default(),
             Some("connection reset".into()),
         );
         let events = obs.events.lock().unwrap();
@@ -1732,7 +1859,14 @@ data: {"type":"error","sequence_number":3,"response_id":"resp_x","error":{"type"
 data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":"message","content":[{"type":"output_text","text":"configure proxy_mode now"}]}]}}
 
 "#;
-        observe_stream_end(&observer, sample_event(), StatusCode::OK, capture, None);
+        observe_stream_end(
+            &observer,
+            sample_event(),
+            StatusCode::OK,
+            capture,
+            observed_usage(capture),
+            None,
+        );
         let events = obs.events.lock().unwrap();
         assert_eq!(events[0].kind, RequestEventKind::Completed);
         assert_eq!(events[0].failure_kind, None);
