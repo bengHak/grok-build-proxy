@@ -1,6 +1,8 @@
 //! Structured monitor store: sessions, active/recent turns, failure ring, metrics samples.
 
-use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind, sanitize, sanitize_id};
+use crate::events::{
+    FailureKind, Observer, RequestEvent, RequestEventKind, TokenUsage, sanitize, sanitize_id,
+};
 use chrono::{DateTime, Utc};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -23,6 +25,7 @@ pub struct Request {
     pub error: String,
     pub error_type: String,
     pub failure_kind: Option<FailureKind>,
+    pub usage: Option<TokenUsage>,
     pub output_tokens: u64,
     pub started_at: Instant,
     pub ended_at: Option<Instant>,
@@ -58,7 +61,12 @@ pub struct Session {
     pub id: String,
     pub requests: u64,
     pub active: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub fresh_input_tokens: u64,
     pub output_tokens: u64,
+    pub usage_requests: u64,
     pub last_model: String,
     /// Latest non-empty user prompt preview observed for this session.
     pub last_prompt: String,
@@ -78,6 +86,15 @@ impl Session {
         } else {
             0.0
         }
+    }
+
+    /// Weighted cache-read ratio for the session: total cached input / total input.
+    pub fn cache_read_ratio(&self) -> Option<f64> {
+        ratio(
+            self.cached_input_tokens,
+            self.input_tokens,
+            self.usage_requests,
+        )
     }
 }
 
@@ -115,6 +132,32 @@ pub struct Snapshot {
     /// 1 Hz fleet-average session tok/s samples (monitor pushes; not per-request).
     pub metrics_tok_s: Vec<f64>,
     pub metrics_completed: Vec<f64>,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub fresh_input_tokens: u64,
+    pub usage_requests: u64,
+}
+
+impl Snapshot {
+    /// Weighted cache-read ratio across all observed usage: total cached input / total input.
+    pub fn cache_read_ratio(&self) -> Option<f64> {
+        ratio(
+            self.cached_input_tokens,
+            self.input_tokens,
+            self.usage_requests,
+        )
+    }
+}
+
+fn ratio(numerator: u64, denominator: u64, observations: u64) -> Option<f64> {
+    if observations == 0 {
+        None
+    } else if denominator == 0 {
+        Some(0.0)
+    } else {
+        Some(numerator as f64 / denominator as f64)
+    }
 }
 
 struct State {
@@ -129,6 +172,11 @@ struct State {
     /// Rolling 1 Hz fleet-average tok/s (filled by [`Dashboard::push_tok_s_sample`]).
     metrics_tok_s: VecDeque<f64>,
     metrics_completed: VecDeque<f64>,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    cache_write_tokens: u64,
+    fresh_input_tokens: u64,
+    usage_requests: u64,
 }
 
 impl Default for State {
@@ -144,6 +192,11 @@ impl Default for State {
             failure_cap: failure_cap_from_env(),
             metrics_tok_s: VecDeque::new(),
             metrics_completed: VecDeque::new(),
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            fresh_input_tokens: 0,
+            usage_requests: 0,
         }
     }
 }
@@ -202,6 +255,11 @@ impl Dashboard {
             failures: state.failures.iter().cloned().collect(),
             metrics_tok_s: state.metrics_tok_s.iter().copied().collect(),
             metrics_completed: state.metrics_completed.iter().copied().collect(),
+            input_tokens: state.input_tokens,
+            cached_input_tokens: state.cached_input_tokens,
+            cache_write_tokens: state.cache_write_tokens,
+            fresh_input_tokens: state.fresh_input_tokens,
+            usage_requests: state.usage_requests,
         }
     }
 
@@ -280,6 +338,7 @@ impl Dashboard {
                         error: String::new(),
                         error_type: String::new(),
                         failure_kind: None,
+                        usage: None,
                         output_tokens: 0,
                         started_at: event.started_at,
                         ended_at: None,
@@ -319,6 +378,7 @@ impl Dashboard {
                     error: String::new(),
                     error_type: String::new(),
                     failure_kind: None,
+                    usage: None,
                     output_tokens: 0,
                     started_at: event.started_at,
                     ended_at: None,
@@ -336,6 +396,7 @@ impl Dashboard {
                 request.error = sanitize(&event.error);
                 request.error_type = sanitize(&event.error_type);
                 request.failure_kind = event.failure_kind;
+                request.usage = event.usage;
                 request.output_tokens = event.output_tokens;
                 request.ended_at = Some(Instant::now());
                 request.duration_ms = if event.duration_ms > 0 {
@@ -402,6 +463,20 @@ impl Dashboard {
                 // Rolling outcome samples for fail%/done sparklines (tok/s is 1 Hz fleet avg).
                 push_rolling(&mut state.metrics_completed, if failed { 0.0 } else { 1.0 });
 
+                if let Some(usage) = event.usage {
+                    state.input_tokens = state.input_tokens.saturating_add(usage.input_tokens);
+                    state.cached_input_tokens = state
+                        .cached_input_tokens
+                        .saturating_add(usage.cached_input_tokens);
+                    state.cache_write_tokens = state
+                        .cache_write_tokens
+                        .saturating_add(usage.cache_write_tokens);
+                    state.fresh_input_tokens = state
+                        .fresh_input_tokens
+                        .saturating_add(usage.fresh_input_tokens());
+                    state.usage_requests = state.usage_requests.saturating_add(1);
+                }
+
                 let session_key = event.session_id;
                 let session = state
                     .sessions
@@ -411,7 +486,20 @@ impl Dashboard {
                         ..Default::default()
                     });
                 session.active = session.active.saturating_sub(1);
-                session.output_tokens += event.output_tokens;
+                session.output_tokens = session.output_tokens.saturating_add(event.output_tokens);
+                if let Some(usage) = event.usage {
+                    session.input_tokens = session.input_tokens.saturating_add(usage.input_tokens);
+                    session.cached_input_tokens = session
+                        .cached_input_tokens
+                        .saturating_add(usage.cached_input_tokens);
+                    session.cache_write_tokens = session
+                        .cache_write_tokens
+                        .saturating_add(usage.cache_write_tokens);
+                    session.fresh_input_tokens = session
+                        .fresh_input_tokens
+                        .saturating_add(usage.fresh_input_tokens());
+                    session.usage_requests = session.usage_requests.saturating_add(1);
+                }
                 if event.output_tokens > 0 {
                     session.sample_seconds += duration_secs;
                 }
@@ -454,6 +542,7 @@ mod tests {
             requested_model: "alias".into(),
             model: "gpt".into(),
             status_code: 200,
+            usage: None,
             output_tokens: 20,
             error: String::new(),
             started_at: Instant::now() - Duration::from_secs(2),
@@ -485,6 +574,86 @@ mod tests {
         assert!(!s.recent[0].id.contains('\n'));
         assert!(s.recent[0].mapped);
         assert!(s.recent[0].lite);
+    }
+
+    #[test]
+    fn aggregates_usage_with_weighted_cache_read_ratio() {
+        let d = Dashboard::new();
+        for (request_id, session_id, usage) in [
+            (
+                "large",
+                "session-a",
+                TokenUsage {
+                    input_tokens: 1_000,
+                    cached_input_tokens: 900,
+                    cache_write_tokens: 50,
+                    output_tokens: 20,
+                },
+            ),
+            (
+                "small",
+                "session-a",
+                TokenUsage {
+                    input_tokens: 10,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 4,
+                    output_tokens: 2,
+                },
+            ),
+            ("zero", "session-b", TokenUsage::default()),
+        ] {
+            let mut start = base_event(RequestEventKind::Started);
+            start.request_id = request_id.into();
+            start.session_id = session_id.into();
+            d.observe(start);
+            let mut completed = base_event(RequestEventKind::Completed);
+            completed.request_id = request_id.into();
+            completed.session_id = session_id.into();
+            completed.usage = Some(usage);
+            completed.output_tokens = usage.output_tokens;
+            d.observe(completed);
+        }
+
+        let snapshot = d.snapshot();
+        assert_eq!(snapshot.usage_requests, 3);
+        assert_eq!(snapshot.input_tokens, 1_010);
+        assert_eq!(snapshot.cached_input_tokens, 900);
+        assert_eq!(snapshot.cache_write_tokens, 54);
+        assert_eq!(snapshot.fresh_input_tokens, 56);
+        assert!((snapshot.cache_read_ratio().unwrap() - 900.0 / 1_010.0).abs() < 1e-12);
+        assert_eq!(snapshot.recent[0].usage, Some(TokenUsage::default()));
+
+        let session_a = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == "session-a")
+            .unwrap();
+        assert_eq!(session_a.usage_requests, 2);
+        assert_eq!(session_a.input_tokens, 1_010);
+        assert_eq!(session_a.cached_input_tokens, 900);
+        assert_eq!(session_a.cache_write_tokens, 54);
+        assert_eq!(session_a.fresh_input_tokens, 56);
+        // Weighted aggregate is ~89%, not the 45% average of per-request percentages.
+        assert!((session_a.cache_read_ratio().unwrap() - 900.0 / 1_010.0).abs() < 1e-12);
+
+        let session_b = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == "session-b")
+            .unwrap();
+        assert_eq!(session_b.cache_read_ratio(), Some(0.0));
+    }
+
+    #[test]
+    fn missing_usage_is_not_counted_as_zero_usage() {
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        d.observe(base_event(RequestEventKind::Completed));
+        let snapshot = d.snapshot();
+        assert_eq!(snapshot.usage_requests, 0);
+        assert_eq!(snapshot.cache_read_ratio(), None);
+        assert_eq!(snapshot.sessions[0].cache_read_ratio(), None);
+        assert_eq!(snapshot.recent[0].usage, None);
     }
 
     #[test]

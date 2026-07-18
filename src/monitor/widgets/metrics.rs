@@ -1,4 +1,4 @@
-//! Metrics mid-strip: tok/s, error rate, and completed outcome sparklines.
+//! Metrics mid-strip: tok/s, error rate, completed outcomes, and cache-read ratio.
 
 use crate::monitor::theme::Theme;
 use crate::store::{Session, Snapshot};
@@ -57,13 +57,14 @@ impl Widget for MetricsStrip<'_> {
 
         let tok = Metrics::from_snapshot(self.snapshot);
 
-        // Three equal columns on a single content row (bordered strip is height 3).
+        // Four compact columns on a single content row (bordered strip is height 3).
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(34),
-                Constraint::Percentage(33),
-                Constraint::Percentage(33),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
+                Constraint::Percentage(25),
             ])
             .split(inner);
 
@@ -114,6 +115,22 @@ impl Widget for MetricsStrip<'_> {
                 spark_style: self.theme.header,
             },
         );
+        render_metric(
+            cols[3],
+            buf,
+            MetricCell {
+                label: "cache",
+                value: tok
+                    .cache_read_ratio
+                    .map(|ratio| format!("{:.0}%", ratio * 100.0))
+                    .unwrap_or_else(|| "n/a".into()),
+                spark_values: &[],
+                fixed_max: Some(1.0),
+                value_style: self.theme.ok,
+                muted: self.theme.muted,
+                spark_style: self.theme.header,
+            },
+        );
     }
 }
 
@@ -150,6 +167,7 @@ fn render_metric(area: Rect, buf: &mut Buffer, cell: MetricCell<'_>) {
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
     pub avg_tok_s: f64,
+    pub cache_read_ratio: Option<f64>,
     pub error_rate: f64,
     pub completed_ok: usize,
     pub completed_fail: usize,
@@ -187,6 +205,7 @@ impl Metrics {
 
         Self {
             avg_tok_s,
+            cache_read_ratio: snapshot.cache_read_ratio(),
             error_rate,
             completed_ok,
             completed_fail,
@@ -303,6 +322,7 @@ mod tests {
         // Live avg = mean of session rates (10 + 30) / 2 = 20; spark ring is separate.
         assert!((m.avg_tok_s - 20.0).abs() < 1e-9);
         assert_eq!(m.tok_samples, vec![10.0, 20.0, 30.0]);
+        assert_eq!(m.cache_read_ratio, None);
         assert_eq!(m.completed_ok, 3);
         assert_eq!(m.completed_fail, 1);
         assert!((m.error_rate - 0.25).abs() < 1e-9);
@@ -326,6 +346,18 @@ mod tests {
             },
         ];
         assert!((fleet_avg_tok_s_from_sessions(&sessions) - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn metrics_uses_weighted_cache_ratio() {
+        let snap = Snapshot {
+            input_tokens: 1_010,
+            cached_input_tokens: 900,
+            usage_requests: 2,
+            ..Default::default()
+        };
+        let m = Metrics::from_snapshot(&snap);
+        assert!((m.cache_read_ratio.unwrap() - 900.0 / 1_010.0).abs() < 1e-12);
     }
 
     #[test]

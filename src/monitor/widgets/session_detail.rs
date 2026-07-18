@@ -369,6 +369,7 @@ mod tests {
             error: String::new(),
             error_type: String::new(),
             failure_kind: None,
+            usage: None,
             output_tokens: 0,
             started_at: Instant::now(),
             ended_at: None,
@@ -397,6 +398,7 @@ mod tests {
             last_failure_kind: Some(FailureKind::UpstreamHttp),
             updated_at: Some(Utc::now()),
             sample_seconds: 2.0,
+            ..Default::default()
         }
     }
 
