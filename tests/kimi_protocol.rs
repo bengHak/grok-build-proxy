@@ -119,6 +119,45 @@ fn kimi_request_translates_responses_history_tools_and_reasoning() {
 }
 
 #[test]
+fn kimi_request_preserves_multimodal_function_call_output() {
+    let request = json!({
+        "model": "kimi-k2.6",
+        "input": [
+            {"type":"function_call","call_id":"call_1","name":"inspect","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call_1","output":[
+                {"type":"input_text","text":"diagram"},
+                {"type":"input_image","image_url":"data:image/png;base64,AA=="}
+            ]}
+        ]
+    });
+
+    let translated = translate_request(&serde_json::to_vec(&request).unwrap(), None).unwrap();
+    let output = &translated["messages"][1]["content"];
+    assert_eq!(output[0], json!({"type":"text","text":"diagram"}));
+    assert_eq!(
+        output[1],
+        json!({"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}})
+    );
+}
+
+#[test]
+fn kimi_request_rejects_unsupported_function_call_output_parts() {
+    let request = json!({
+        "model": "kimi-k2.6",
+        "input": [{
+            "type":"function_call_output",
+            "call_id":"call_1",
+            "output":[{"type":"input_file","file_id":"file_1"}]
+        }]
+    });
+
+    let error = translate_request(&serde_json::to_vec(&request).unwrap(), None)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unsupported message content part \"input_file\""));
+}
+
+#[test]
 fn kimi_stream_translates_reasoning_text_tools_and_usage() {
     let upstream = concat!(
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n\n",

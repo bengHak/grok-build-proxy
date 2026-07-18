@@ -31,7 +31,7 @@ pub(super) fn translate_input(items: &[Value], messages: &mut Vec<Value>) -> Res
                 messages.push(json!({
                     "role":"tool",
                     "tool_call_id":required_string(item,"call_id")?,
-                    "content":tool_output(item.get("output")),
+                    "content":tool_output(item.get("output"))?,
                 }));
             }
             "message" => append_message(item, &mut assistant, messages)?,
@@ -169,10 +169,15 @@ fn plain_text(content: Option<&Value>) -> Result<String> {
     }
 }
 
-fn tool_output(output: Option<&Value>) -> Value {
+fn tool_output(output: Option<&Value>) -> Result<Value> {
     match output {
-        Some(Value::String(text)) => text.clone().into(),
-        Some(value) => serde_json::to_string(value).unwrap_or_default().into(),
-        None => "".into(),
+        Some(Value::String(text)) => Ok(text.clone().into()),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .map(chat_part)
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array),
+        Some(Value::Null) | None => Ok(String::new().into()),
+        Some(_) => bail!("function_call_output output must be a string or array"),
     }
 }

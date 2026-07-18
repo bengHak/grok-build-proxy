@@ -199,6 +199,56 @@ async fn permissive_kimi_device_ids_are_rejected() {
     assert!(error.contains("group/world-accessible"));
 }
 
+#[tokio::test]
+async fn kimi_headers_match_current_cli_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let device_id = dir.path().join("device_id");
+    fs::write(&device_id, "device-1\n").await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&device_id, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
+
+    let headers = Store::new(dir.path().join("auth.json"), "http://127.0.0.1:9")
+        .unwrap()
+        .headers()
+        .await
+        .unwrap();
+    assert_eq!(headers["x-msh-version"], "1.49.0");
+    assert_eq!(headers["user-agent"], "KimiCLI/1.49.0");
+}
+
+#[tokio::test]
+async fn kimi_headers_report_os_version_separately_from_architecture() {
+    let dir = tempfile::tempdir().unwrap();
+    let device_id = dir.path().join("device_id");
+    fs::write(&device_id, "device-1\n").await.unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&device_id, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
+
+    let headers = Store::new(dir.path().join("auth.json"), "http://127.0.0.1:9")
+        .unwrap()
+        .headers()
+        .await
+        .unwrap();
+    let os_version = headers["x-msh-os-version"].to_str().unwrap();
+    let device_model = headers["x-msh-device-model"].to_str().unwrap();
+    assert_ne!(os_version, std::env::consts::ARCH);
+    assert!(device_model.contains(std::env::consts::ARCH));
+    assert_ne!(
+        device_model,
+        format!("{} {}", std::env::consts::OS, std::env::consts::ARCH)
+    );
+}
+
 async fn refresh(
     State(state): State<OAuthState>,
     headers: HeaderMap,

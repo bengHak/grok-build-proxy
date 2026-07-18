@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -15,7 +18,7 @@ mod oauth;
 pub const DEFAULT_OAUTH_HOST: &str = "https://auth.kimi.com";
 pub const DEFAULT_UPSTREAM: &str = "https://api.kimi.com/coding/v1/chat/completions";
 pub const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
-const KIMI_CLI_VERSION: &str = "1.37.0";
+const KIMI_CLI_VERSION: &str = "1.49.0";
 const REFRESH_MARGIN_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -146,20 +149,14 @@ impl Store {
             .await?
             .clone();
         let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".into());
+        let (os_version, device_model) = platform_metadata();
         let mut headers = HeaderMap::new();
         for (name, value) in [
             ("x-msh-platform", "kimi_cli".to_owned()),
             ("x-msh-version", KIMI_CLI_VERSION.to_owned()),
             ("x-msh-device-name", ascii(&hostname)),
-            (
-                "x-msh-device-model",
-                ascii(&format!(
-                    "{} {}",
-                    std::env::consts::OS,
-                    std::env::consts::ARCH
-                )),
-            ),
-            ("x-msh-os-version", ascii(std::env::consts::ARCH)),
+            ("x-msh-device-model", ascii(device_model)),
+            ("x-msh-os-version", ascii(os_version)),
             ("x-msh-device-id", device_id),
         ] {
             headers.insert(
@@ -167,7 +164,10 @@ impl Store {
                 HeaderValue::from_str(&value)?,
             );
         }
-        headers.insert(USER_AGENT, HeaderValue::from_static("KimiCLI/1.37.0"));
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&format!("KimiCLI/{KIMI_CLI_VERSION}"))?,
+        );
         Ok(headers)
     }
 }
@@ -210,6 +210,63 @@ fn ascii(value: &str) -> String {
     } else {
         value.into()
     }
+}
+
+fn platform_metadata() -> &'static (String, String) {
+    static METADATA: OnceLock<(String, String)> = OnceLock::new();
+    METADATA.get_or_init(|| {
+        let os_version = platform_version();
+        let release = platform_release().unwrap_or_else(|| os_version.clone());
+        let system = if cfg!(target_os = "macos") {
+            "macOS"
+        } else {
+            std::env::consts::OS
+        };
+        (
+            os_version,
+            format!("{system} {release} {}", std::env::consts::ARCH),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn platform_version() -> String {
+    command_output("uname", &["-v"]).unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(not(unix))]
+fn platform_version() -> String {
+    std::env::consts::OS.to_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_release() -> Option<String> {
+    command_output("/usr/bin/sw_vers", &["-productVersion"])
+        .or_else(|| command_output("uname", &["-r"]))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn platform_release() -> Option<String> {
+    command_output("uname", &["-r"])
+}
+
+#[cfg(not(unix))]
+fn platform_release() -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 const fn default_device_expiry() -> u64 {

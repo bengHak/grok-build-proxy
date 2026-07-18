@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
@@ -34,6 +34,69 @@ impl CredentialProvider for CodexCredentials {
             expires_at: None,
         })
     }
+}
+
+struct SlowUnavailableCodexCredentials;
+
+#[async_trait::async_trait]
+impl CredentialProvider for SlowUnavailableCodexCredentials {
+    async fn get(&self, _: bool) -> Result<Credentials> {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Err(anyhow!("Codex credentials unavailable"))
+    }
+}
+
+#[tokio::test]
+async fn unscoped_readiness_returns_when_kimi_is_ready() {
+    let directory = tempfile::tempdir().unwrap();
+    let auth_path = directory.path().join("auth.json");
+    tokio::fs::write(
+        &auth_path,
+        br#"{"access":"kimi-token","refresh":"refresh","expires":4102444800000,"userId":"user-1"}"#,
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
+
+    let app = router(ProxyConfig {
+        upstream_url: "http://127.0.0.1:9/responses".into(),
+        credentials: Arc::new(SlowUnavailableCodexCredentials),
+        kimi: Some(KimiConfig {
+            upstream_url: "http://127.0.0.1:9/chat/completions".into(),
+            credentials: Arc::new(KimiStore::new(&auth_path, "http://127.0.0.1:9").unwrap()),
+        }),
+        catalog: Catalog::default(),
+        model_map: ModelMap::default(),
+        client: reqwest::Client::new(),
+        client_token: String::new(),
+        version: "test".into(),
+        compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+        responses_compat: CompatMode::Full,
+        observer: None,
+        max_body_bytes: 4096,
+    })
+    .unwrap();
+
+    let response = tokio::time::timeout(
+        Duration::from_millis(250),
+        app.oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("ready Kimi credentials must not wait for Codex")
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -319,22 +382,12 @@ async fn kimi_non_success_is_mapped_to_responses_error_contract() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(
-        response.headers()[header::CONTENT_TYPE],
-        "text/event-stream; charset=utf-8"
-    );
-    let body = String::from_utf8(
-        to_bytes(response.into_body(), 65536)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(body.contains("response.failed"));
-    assert!(body.contains("rate_limit_error"));
-    assert!(body.contains("too many requests"));
-    assert!(body.contains("data: [DONE]"));
-    assert!(!body.contains("\"choices\""));
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["message"], "too many requests");
+    assert!(body.get("choices").is_none());
 }
 
 async fn kimi_error_upstream(

@@ -310,27 +310,40 @@ async fn ready(
             ),
         };
     }
-    let codex_error = match s.0.credentials.get(false).await {
-        Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
-        Err(error) => error,
-    };
     if let Some(config) = &s.0.kimi {
-        match config.credentials.get(false).await {
-            Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
-            Err(kimi_error) => {
-                return error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "authentication_error",
-                    format!("Codex: {codex_error}; Kimi: {kimi_error}"),
-                );
-            }
-        }
+        let codex = s.0.credentials.get(false);
+        let kimi = config.credentials.get(false);
+        tokio::pin!(codex, kimi);
+        let (codex_error, kimi_error) = tokio::select! {
+            result = &mut codex => match result {
+                Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
+                Err(codex_error) => match kimi.await {
+                    Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
+                    Err(kimi_error) => (codex_error, kimi_error),
+                },
+            },
+            result = &mut kimi => match result {
+                Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
+                Err(kimi_error) => match codex.await {
+                    Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
+                    Err(codex_error) => (codex_error, kimi_error),
+                },
+            },
+        };
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_error",
+            format!("Codex: {codex_error}; Kimi: {kimi_error}"),
+        );
     }
-    error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "authentication_error",
-        codex_error.to_string(),
-    )
+    match s.0.credentials.get(false).await {
+        Ok(_) => Json(json!({"ok":true,"auth":"ready"})).into_response(),
+        Err(codex_error) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authentication_error",
+            codex_error.to_string(),
+        ),
+    }
 }
 fn unauthorized() -> Response {
     let mut r = error(
@@ -859,27 +872,6 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             }
         };
         let (error_type, message) = kimi_upstream_error(&upstream_body, status);
-        if transformed.stream {
-            let mut translator = kimi::stream::Translator::new(&request_id, kimi::WIRE_MODEL);
-            let capture = translator.fail(&json!({
-                "type": error_type,
-                "message": message,
-            }));
-            observe_stream_end(&observer, base_event.clone(), status, &capture, None, None);
-            let mut response = Response::builder()
-                .status(status)
-                .body(Body::from(capture))
-                .unwrap();
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("text/event-stream; charset=utf-8"),
-            );
-            response.headers_mut().insert(
-                "x-grok-build-proxy-version",
-                HeaderValue::from_str(&s.0.version).unwrap_or(HeaderValue::from_static("dev")),
-            );
-            return with_request_id(response, &request_id);
-        }
         let payload = json!({"error":{"type":error_type,"message":message.clone()}});
         let capture = serde_json::to_vec(&payload).unwrap_or_default();
         observe_stream_end(&observer, base_event.clone(), status, &capture, None, None);
