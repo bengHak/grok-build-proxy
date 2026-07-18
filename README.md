@@ -318,6 +318,7 @@ curl --fail http://127.0.0.1:18765/healthz
 
 # Protected when client-token authentication is enabled.
 curl --fail http://127.0.0.1:18765/readyz
+curl --fail 'http://127.0.0.1:18765/readyz?provider=kimi'
 curl -fsS http://127.0.0.1:18765/v1/models | python3 -c '
 import json, sys
 for model in json.load(sys.stdin)["data"]:
@@ -328,6 +329,10 @@ for model in json.load(sys.stdin)["data"]:
         print(model["id"], fields)
 '
 ```
+
+The default readiness check succeeds when any configured provider is ready.
+Use `?provider=codex` or `?provider=kimi` when checking a specific model route;
+`models status` performs this provider-specific check automatically.
 
 `GET /v1/models` and `GET /models` are equivalent route variants. When
 `--client-token` or `GROK_BUILD_PROXY_TOKEN` enables client authentication,

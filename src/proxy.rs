@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::any,
@@ -72,6 +72,11 @@ impl CompatMode {
 #[derive(Clone)]
 struct AppState(Arc<ProxyConfig>);
 
+#[derive(Default, serde::Deserialize)]
+struct ReadyQuery {
+    provider: Option<String>,
+}
+
 pub fn router(config: ProxyConfig) -> Result<Router> {
     url::Url::parse(&config.upstream_url).context("invalid upstream URL")?;
     if let Some(kimi) = &config.kimi {
@@ -124,7 +129,12 @@ async fn health(State(s): State<AppState>, method: Method) -> Response {
     };
     Json(json!({"ok":true,"service":"grok-build-proxy","version":s.0.version,"model_substitutions":s.0.model_map.len()})).into_response()
 }
-async fn ready(State(s): State<AppState>, method: Method, headers: HeaderMap) -> Response {
+async fn ready(
+    State(s): State<AppState>,
+    Query(query): Query<ReadyQuery>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
     if !authorized(&s.0, &headers) {
         return unauthorized();
     }
@@ -135,6 +145,30 @@ async fn ready(State(s): State<AppState>, method: Method, headers: HeaderMap) ->
             "method not allowed",
         );
     };
+    if let Some(provider) = query.provider.as_deref() {
+        let result = match provider {
+            "codex" => s.0.credentials.get(false).await.map(|_| ()),
+            "kimi" => match &s.0.kimi {
+                Some(config) => config.credentials.get(false).await.map(|_| ()),
+                None => Err(anyhow!("Kimi provider is not configured")),
+            },
+            _ => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "provider must be codex or kimi",
+                );
+            }
+        };
+        return match result {
+            Ok(()) => Json(json!({"ok":true,"auth":"ready","provider":provider})).into_response(),
+            Err(provider_error) => error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication_error",
+                provider_error.to_string(),
+            ),
+        };
+    }
     let codex_error = match s.0.credentials.get(false).await {
         Ok(_) => return Json(json!({"ok":true,"auth":"ready"})).into_response(),
         Err(error) => error,

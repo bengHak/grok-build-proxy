@@ -1,8 +1,10 @@
 use crate::{
     auth::Store,
+    catalog::{Catalog, normalize_id},
     codexcli,
     grokconfig::GrokConfig,
     modelmap::ModelMap,
+    provider::Provider,
     provider::kimi::auth::{DEFAULT_OAUTH_HOST as DEFAULT_KIMI_OAUTH_HOST, Store as KimiStore},
 };
 use anyhow::Result;
@@ -113,7 +115,6 @@ pub async fn run_full(
         )),
     }
 
-    let mut codex_ready = false;
     match Store::new(auth_file, crate::auth::DEFAULT_REFRESH_URL) {
         Ok(store) => match store.inspect().await {
             Ok(status) => {
@@ -122,7 +123,6 @@ pub async fn run_full(
                 #[cfg(not(unix))]
                 let secure = true;
                 if secure {
-                    codex_ready = true;
                     checks.push(Check::pass(
                         "ChatGPT auth",
                         format!("{} ({})", status.path.display(), status.auth_mode),
@@ -145,7 +145,6 @@ pub async fn run_full(
         Err(error) => checks.push(Check::fail("ChatGPT auth", error.to_string())),
     }
 
-    let mut kimi_ready = false;
     if let Some(path) = kimi_auth_file {
         match KimiStore::new(path, DEFAULT_KIMI_OAUTH_HOST) {
             Ok(store) => match store.inspect().await {
@@ -155,7 +154,6 @@ pub async fn run_full(
                     #[cfg(not(unix))]
                     let secure = true;
                     if secure {
-                        kimi_ready = true;
                         checks.push(Check::pass("Kimi auth", status.path.display().to_string()));
                     } else {
                         checks.push(Check::fail(
@@ -170,32 +168,22 @@ pub async fn run_full(
         }
     }
 
-    if kimi_ready {
-        for check in &mut checks {
-            if !check.ok
-                && !check.detail.contains("group/world")
-                && matches!(
-                    check.name,
-                    "Codex CLI" | "Codex credential configuration" | "ChatGPT auth"
-                )
-            {
-                check.ok = true;
-                check.warning = true;
-            }
-        }
-    }
-    if codex_ready {
-        for check in &mut checks {
-            if !check.ok && check.name == "Kimi auth" && !check.detail.contains("group/world") {
-                check.ok = true;
-                check.warning = true;
-            }
-        }
-    }
-
+    let mut required_codex = false;
+    let mut required_kimi = false;
     match GrokConfig::load(grok_config) {
         Ok(config) => {
             let records = config.records();
+            let catalog = Catalog::default();
+            if records.is_empty() {
+                required_codex = true;
+            }
+            for record in &records {
+                let (model, _) = normalize_id(&record.model);
+                match catalog.lookup(&model).0.provider {
+                    Provider::Codex => required_codex = true,
+                    Provider::Kimi => required_kimi = true,
+                }
+            }
             if records.is_empty() {
                 checks.push(Check::fail(
                     "Grok config",
@@ -217,6 +205,19 @@ pub async fn run_full(
             }
         }
         Err(error) => checks.push(Check::fail("Grok config", error.to_string())),
+    }
+
+    for check in &mut checks {
+        let unused_provider = (!required_codex
+            && matches!(
+                check.name,
+                "Codex CLI" | "Codex credential configuration" | "ChatGPT auth"
+            ))
+            || (!required_kimi && check.name == "Kimi auth");
+        if unused_provider && !check.ok && !check.detail.contains("group/world") {
+            check.ok = true;
+            check.warning = true;
+        }
     }
 
     let client = match reqwest::Client::builder().timeout(timeout).build() {
@@ -326,6 +327,7 @@ mod tests {
     async fn kimi_credentials_make_missing_codex_setup_optional() {
         let directory = tempfile::tempdir().unwrap();
         let kimi_auth = directory.path().join("kimi-auth.json");
+        let grok_config = directory.path().join("grok.toml");
         tokio::fs::write(
             &kimi_auth,
             br#"{"access":"token","refresh":"refresh","expires":4102444800000}"#,
@@ -339,12 +341,18 @@ mod tests {
                 .await
                 .unwrap();
         }
+        tokio::fs::write(
+            &grok_config,
+            "[model.kimi]\nmodel = \"kimi-for-coding\"\nname = \"Kimi K2.6\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n",
+        )
+        .await
+        .unwrap();
 
         let checks = run_full(
             &directory.path().join("missing-codex-auth.json"),
             Some(&kimi_auth),
+            &grok_config,
             directory.path(),
-            &directory.path().join("missing-grok.toml"),
             "127.0.0.1:0",
             "",
             "missing-codex",
@@ -369,5 +377,30 @@ mod tests {
                     .any(|check| { check.name == name && check.ok && check.warning })
             );
         }
+
+        tokio::fs::write(
+            &grok_config,
+            "[model.kimi]\nmodel = \"kimi-for-coding\"\nname = \"Kimi K2.6\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n\n[model.codex]\nmodel = \"gpt-5.6-sol\"\nname = \"Codex Sol\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 372000\n",
+        )
+        .await
+        .unwrap();
+        let mixed_checks = run_full(
+            &directory.path().join("missing-codex-auth.json"),
+            Some(&kimi_auth),
+            &grok_config,
+            directory.path(),
+            "127.0.0.1:0",
+            "",
+            "missing-codex",
+            "missing-grok",
+            "",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            mixed_checks
+                .iter()
+                .any(|check| check.name == "ChatGPT auth" && !check.ok)
+        );
     }
 }

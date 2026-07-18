@@ -82,7 +82,8 @@ impl ChangeSet {
 #[derive(Clone, Debug, Default)]
 struct EndpointStatus {
     proxy: bool,
-    ready: bool,
+    codex_ready: bool,
+    kimi_ready: bool,
     models: HashMap<String, JsonValue>,
     detail: String,
 }
@@ -511,6 +512,10 @@ pub async fn status(
             let advertised = advertised_value.is_some();
             let (base, fast) = normalize_id(&record.model);
             let (catalog_model, _) = catalog.lookup(&base);
+            let ready = match catalog_model.provider {
+                Provider::Codex => endpoint.codex_ready,
+                Provider::Kimi => endpoint.kimi_ready,
+            };
             let expected_context = catalog_model.context_window;
             let context_matches = model_item(&config.document, &record.alias)
                 .and_then(Item::as_table_like)
@@ -537,13 +542,19 @@ pub async fn status(
             if !endpoint.detail.is_empty() {
                 details.push(endpoint.detail.clone());
             }
+            if !ready {
+                details.push(format!(
+                    "{} provider is not ready",
+                    catalog_model.provider.as_str()
+                ));
+            }
             ModelStatus {
                 alias: record.alias,
                 model: record.model,
                 service_tier: record.service_tier,
                 configured,
                 proxy: endpoint.proxy,
-                ready: endpoint.ready,
+                ready,
                 advertised,
                 metadata,
                 detail: details.join("; "),
@@ -589,7 +600,11 @@ async fn inspect_endpoint(
             request.bearer_auth(client_token.trim())
         }
     };
-    let ready = authorized(format!("{root}/readyz"))
+    let codex_ready = authorized(format!("{root}/readyz?provider=codex"))
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success());
+    let kimi_ready = authorized(format!("{root}/readyz?provider=kimi"))
         .send()
         .await
         .is_ok_and(|response| response.status().is_success());
@@ -612,13 +627,10 @@ async fn inspect_endpoint(
     };
     EndpointStatus {
         proxy,
-        ready,
+        codex_ready,
+        kimi_ready,
         models,
-        detail: if ready {
-            String::new()
-        } else {
-            "proxy is not ready".into()
-        },
+        detail: String::new(),
     }
 }
 
@@ -958,24 +970,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_status_accepts_fast_priority_metadata() {
-        use axum::{Json, Router, routing::get};
+    async fn live_status_uses_provider_specific_readiness() {
+        use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
         use serde_json::json;
+        use std::collections::HashMap;
 
         let app = Router::new()
             .route(
                 "/healthz",
                 get(|| async { Json(json!({"service": "grok-build-proxy"})) }),
             )
-            .route("/readyz", get(|| async { Json(json!({"ok": true})) }))
+            .route(
+                "/readyz",
+                get(|Query(query): Query<HashMap<String, String>>| async move {
+                    let status = if query.get("provider").map(String::as_str) == Some("codex") {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (status, Json(json!({"ok": status.is_success()})))
+                }),
+            )
             .route(
                 "/v1/models",
                 get(|| async {
-                    Json(json!({"data": [{
-                        "id": "gpt-5.6-sol-fast",
-                        "service_tier": "priority",
-                        "target_model": "gpt-5.6-sol-fast"
-                    }]}))
+                    Json(json!({"data": [
+                        {
+                            "id": "gpt-5.6-sol-fast",
+                            "service_tier": "priority",
+                            "target_model": "gpt-5.6-sol-fast"
+                        },
+                        {"id":"kimi-for-coding"}
+                    ]}))
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -996,6 +1022,17 @@ mod tests {
         )
         .unwrap();
         config.add(&spec).unwrap();
+        let kimi = model_spec(
+            &Catalog::default(),
+            "kimi",
+            "kimi-for-coding",
+            false,
+            &address.to_string(),
+            "",
+            None,
+        )
+        .unwrap();
+        config.add(&kimi).unwrap();
         let statuses = status(
             &config,
             None,
@@ -1005,13 +1042,26 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(statuses.len(), 1);
-        let status = &statuses[0];
+        assert_eq!(statuses.len(), 2);
+        let status = statuses
+            .iter()
+            .find(|status| status.alias == "codex-sol-fast")
+            .unwrap();
         assert!(status.configured);
         assert!(status.proxy);
         assert!(status.ready);
         assert!(status.advertised);
         assert!(status.metadata);
+        let kimi = statuses
+            .iter()
+            .find(|status| status.alias == "kimi")
+            .unwrap();
+        assert!(kimi.configured);
+        assert!(kimi.proxy);
+        assert!(!kimi.ready);
+        assert!(kimi.advertised);
+        assert!(kimi.metadata);
+        assert!(kimi.detail.contains("kimi provider is not ready"));
     }
 
     #[test]

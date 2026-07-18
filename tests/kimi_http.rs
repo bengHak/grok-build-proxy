@@ -93,6 +93,24 @@ async fn kimi_model_routes_to_chat_completions_and_translates_stream() {
         serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
     assert_eq!(readiness, serde_json::json!({"ok":true,"auth":"ready"}));
 
+    for provider in ["codex", "kimi"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/readyz?provider={provider}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let readiness: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(readiness["provider"], provider);
+    }
+
     let response = app
         .clone()
         .oneshot(
