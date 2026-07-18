@@ -827,7 +827,7 @@ impl StreamNormalizer {
     }
 }
 
-pub(crate) fn frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+fn frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
     let lf = bytes.windows(2).position(|w| w == b"\n\n").map(|p| (p, 2));
     let crlf = bytes
         .windows(4)
@@ -1037,6 +1037,37 @@ data: [DONE]
             "proxy_incomplete_output"
         );
     }
+    #[test]
+    fn stream_normalizer_preserves_cache_usage_details() {
+        let stream = r#"event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"ok"}
+
+event: response.completed
+data: {"type":"response.completed","response":{"output":[],"usage":{"input_tokens":100,"input_tokens_details":{"cached_tokens":60,"cache_write_tokens":25,"vendor_detail":7},"output_tokens":4}}}
+
+"#;
+        let mut normalizer = StreamNormalizer::new(CompatMode::Full, "gpt-5.6-sol", "test");
+        let bytes = stream.as_bytes();
+        let mut output = Vec::new();
+        for chunk in bytes.chunks(17) {
+            output.extend(normalizer.push(chunk));
+        }
+        output.extend(normalizer.finish());
+        let text = String::from_utf8(output).unwrap();
+        let completed = text
+            .split("\n\n")
+            .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .last()
+            .unwrap();
+        let usage = &completed["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 100);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 60);
+        assert_eq!(usage["input_tokens_details"]["cache_write_tokens"], 25);
+        assert_eq!(usage["input_tokens_details"]["vendor_detail"], 7);
+        assert_eq!(usage["output_tokens"], 4);
+    }
+
     #[test]
     fn compact_auxiliary_and_usage_envelopes_are_filled() {
         let stream = r#"event: response.created

@@ -1,7 +1,29 @@
 //! Structured request lifecycle events for the serve monitor.
 
+use serde_json::Value;
 use std::fmt;
 use std::time::Instant;
+
+/// Token usage reported by an upstream terminal response.
+///
+/// The enclosing `Option` on request events distinguishes an absent usage payload from a
+/// payload that explicitly reports zero tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Input that was neither read from cache nor written into cache for future requests.
+    pub fn fresh_input_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_sub(self.cached_input_tokens)
+            .saturating_sub(self.cache_write_tokens)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestEventKind {
@@ -59,6 +81,8 @@ pub struct RequestEvent {
     pub requested_model: String,
     pub model: String,
     pub status_code: u16,
+    /// Absent until an upstream usage payload is observed; explicit zero usage is `Some`.
+    pub usage: Option<TokenUsage>,
     pub output_tokens: u64,
     pub error: String,
     pub started_at: Instant,
@@ -79,6 +103,10 @@ pub struct RequestEvent {
 
 pub trait Observer: Send + Sync {
     fn observe(&self, event: RequestEvent);
+
+    /// Record monitor-only session context discovered in an incoming request.
+    /// Implementations that do not expose a session inspector may ignore it.
+    fn observe_session_context(&self, _session_id: &str, _last_prompt: &str, _cwd: &str) {}
 }
 
 impl RequestEvent {
@@ -98,6 +126,7 @@ impl RequestEvent {
             requested_model: requested_model.into(),
             model: model.into(),
             status_code: 0,
+            usage: None,
             output_tokens: 0,
             error: String::new(),
             started_at: Instant::now(),
@@ -119,6 +148,19 @@ impl RequestEvent {
         self.duration_ms = self.started_at.elapsed().as_millis() as u64;
         self
     }
+}
+
+/// Preserve an identifier losslessly while making control characters safe to display.
+pub fn sanitize_id(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Sanitize monitor-facing strings: strip control chars, cap length.
@@ -167,6 +209,185 @@ impl CaptureDiagnostics {
     }
 }
 
+const MAX_USAGE_BODY_BYTES: usize = 64 << 20;
+
+/// Incrementally extracts usage without relying on the bounded diagnostic capture.
+///
+/// SSE mode parses complete frames as they arrive and retains only the current incomplete frame.
+/// JSON mode retains the body until EOF. Both modes stop buffering after 64 MiB, while preserving
+/// any terminal usage already parsed from earlier SSE frames. `None` distinguishes missing usage
+/// from an explicitly reported all-zero usage object.
+pub struct UsageAccumulator {
+    is_sse: bool,
+    pending: Vec<u8>,
+    terminal_usage: Option<TokenUsage>,
+    overflowed: bool,
+    finished: bool,
+}
+
+impl UsageAccumulator {
+    pub fn new(is_sse: bool) -> Self {
+        Self {
+            is_sse,
+            pending: Vec::new(),
+            terminal_usage: None,
+            overflowed: false,
+            finished: false,
+        }
+    }
+
+    pub fn push(&mut self, chunk: &[u8]) {
+        if self.finished || self.overflowed || chunk.is_empty() {
+            return;
+        }
+        if self.is_sse {
+            self.push_sse(chunk);
+        } else if self.pending.len().saturating_add(chunk.len()) <= MAX_USAGE_BODY_BYTES {
+            self.pending.extend_from_slice(chunk);
+        } else {
+            self.pending.clear();
+            self.overflowed = true;
+        }
+    }
+
+    /// Usage parsed from complete terminal SSE frames seen so far.
+    ///
+    /// Non-stream JSON usage is not available until [`Self::finish`] observes EOF.
+    pub fn current(&self) -> Option<TokenUsage> {
+        self.terminal_usage
+    }
+
+    /// Parse any final unterminated SSE frame or the complete non-stream JSON body at EOF.
+    pub fn finish(&mut self) -> Option<TokenUsage> {
+        if self.finished {
+            return self.current();
+        }
+        self.finished = true;
+        if !self.overflowed {
+            if self.is_sse {
+                if !self.pending.is_empty() {
+                    let frame = std::mem::take(&mut self.pending);
+                    self.parse_sse_frame(&frame);
+                }
+            } else {
+                self.terminal_usage = serde_json::from_slice::<Value>(&self.pending)
+                    .ok()
+                    .and_then(|value| token_usage_from_value(&value));
+                self.pending.clear();
+            }
+        }
+        self.current()
+    }
+
+    fn push_sse(&mut self, mut chunk: &[u8]) {
+        while !chunk.is_empty() {
+            let available = MAX_USAGE_BODY_BYTES.saturating_sub(self.pending.len());
+            if available == 0 {
+                self.pending.clear();
+                self.overflowed = true;
+                return;
+            }
+            let take = available.min(chunk.len());
+            self.pending.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+            self.parse_complete_sse_frames();
+            if !chunk.is_empty() && self.pending.len() == MAX_USAGE_BODY_BYTES {
+                self.pending.clear();
+                self.overflowed = true;
+                return;
+            }
+        }
+    }
+
+    fn parse_complete_sse_frames(&mut self) {
+        while let Some((position, separator_len)) = usage_frame_boundary(&self.pending) {
+            let frame: Vec<u8> = self.pending.drain(..position + separator_len).collect();
+            self.parse_sse_frame(&frame);
+        }
+    }
+
+    fn parse_sse_frame(&mut self, frame: &[u8]) {
+        let text = String::from_utf8_lossy(frame);
+        let mut event_name = None;
+        let mut data_lines = Vec::new();
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("event:") {
+                event_name = Some(value.trim().to_owned());
+            } else if let Some(value) = line.strip_prefix("data:") {
+                data_lines.push(value.strip_prefix(' ').unwrap_or(value));
+            }
+        }
+        if data_lines.is_empty() {
+            return;
+        }
+        let data = data_lines.join("\n");
+        if data.trim() == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            return;
+        };
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .or(event_name.as_deref())
+            .unwrap_or("");
+        if is_terminal_response_event(event_type)
+            && let Some(usage) = token_usage_from_value(&value)
+        {
+            self.terminal_usage = Some(usage);
+        }
+    }
+}
+
+fn usage_frame_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+    let lf = bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|p| (p, 2));
+    let crlf = bytes
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|p| (p, 4));
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) => Some(if lf.0 <= crlf.0 { lf } else { crlf }),
+        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+        (None, None) => None,
+    }
+}
+
+fn is_terminal_response_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.completed" | "response.failed" | "response.incomplete" | "response.done"
+    )
+}
+
+fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
+    let usage = value
+        .pointer("/response/usage")
+        .or_else(|| value.get("usage"))?
+        .as_object()?;
+    let details = usage.get("input_tokens_details").and_then(Value::as_object);
+    let number = |value: Option<&Value>| value.and_then(Value::as_u64).unwrap_or(0);
+    let cache_write_tokens = details
+        .and_then(|details| {
+            details
+                .get("cache_write_tokens")
+                .or_else(|| details.get("cache_creation_tokens"))
+        })
+        .or_else(|| usage.get("cache_write_tokens"))
+        .or_else(|| usage.get("cache_creation_tokens"));
+
+    Some(TokenUsage {
+        input_tokens: number(usage.get("input_tokens")),
+        cached_input_tokens: number(details.and_then(|details| details.get("cached_tokens"))),
+        cache_write_tokens: number(cache_write_tokens),
+        output_tokens: number(usage.get("output_tokens")),
+    })
+}
+
 const KNOWN_PROXY_ERROR_TYPES: &[&str] =
     &["proxy_incomplete_output", "proxy_missing_terminal_output"];
 
@@ -196,10 +417,10 @@ pub fn parse_capture_diagnostics(bytes: &[u8]) -> CaptureDiagnostics {
     // response_id: last occurrence of "response_id":"..." or "id":"resp_..."
     for marker in ["\"response_id\"", "\"id\""] {
         for (index, _) in text.match_indices(marker) {
-            if let Some(id) = extract_json_string_after(&text[index + marker.len()..]) {
-                if id.starts_with("resp_") || marker == "\"response_id\"" {
-                    diag.response_id = sanitize(&id);
-                }
+            if let Some(id) = extract_json_string_after(&text[index + marker.len()..])
+                && (id.starts_with("resp_") || marker == "\"response_id\"")
+            {
+                diag.response_id = sanitize(&id);
             }
         }
     }
@@ -270,10 +491,10 @@ pub fn parse_capture_diagnostics(bytes: &[u8]) -> CaptureDiagnostics {
                 diag.terminal_event = "error".into();
             }
         }
-        if diag.error_message.is_empty() {
-            if let Some(msg) = extract_nested_error_message(&text) {
-                diag.error_message = sanitize(&msg);
-            }
+        if diag.error_message.is_empty()
+            && let Some(msg) = extract_nested_error_message(&text)
+        {
+            diag.error_message = sanitize(&msg);
         }
     }
 
@@ -334,10 +555,10 @@ fn extract_nested_error_type(json: &str) -> Option<String> {
     // Prefer "error":{"type":"..."} over top-level "type"
     if let Some(err_idx) = json.find("\"error\"") {
         let rest = &json[err_idx..];
-        if let Some(type_rel) = rest.find("\"type\"") {
-            if let Some(et) = extract_json_string_after(&rest[type_rel + "\"type\"".len()..]) {
-                return Some(et);
-            }
+        if let Some(type_rel) = rest.find("\"type\"")
+            && let Some(et) = extract_json_string_after(&rest[type_rel + "\"type\"".len()..])
+        {
+            return Some(et);
         }
     }
     None
@@ -495,6 +716,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn usage_accumulator_handles_arbitrary_sse_chunk_splits_and_line_endings() {
+        let streams: &[&[u8]] = &[
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"usage\":{\"input_tokens\":1}}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":80,\"cache_write_tokens\":25},\"output_tokens\":9}}}\n\n",
+            b"event: response.in_progress\r\ndata: {\"type\":\"response.in_progress\",\"usage\":{\"input_tokens\":999}}\r\n\r\nevent: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":80,\"cache_creation_tokens\":25},\"output_tokens\":9}}}\r\n\r\ndata: [DONE]\n\n",
+        ];
+        let expected = Some(TokenUsage {
+            input_tokens: 120,
+            cached_input_tokens: 80,
+            cache_write_tokens: 25,
+            output_tokens: 9,
+        });
+
+        for stream in streams {
+            for split in 0..=stream.len() {
+                let mut usage = UsageAccumulator::new(true);
+                usage.push(&stream[..split]);
+                usage.push(&stream[split..]);
+                assert_eq!(usage.finish(), expected, "split at byte {split}");
+                assert_eq!(usage.current(), expected);
+            }
+
+            let mut usage = UsageAccumulator::new(true);
+            for byte in stream.chunks(1) {
+                usage.push(byte);
+            }
+            assert_eq!(usage.finish(), expected, "single-byte chunks");
+        }
+    }
+
+    #[test]
+    fn usage_accumulator_parses_json_at_eof_and_preserves_missing_vs_zero() {
+        let body = br#"{"id":"resp_json","usage":{"input_tokens":8,"input_tokens_details":{"cached_tokens":3},"cache_write_tokens":2,"output_tokens":1}}"#;
+        let expected = Some(TokenUsage {
+            input_tokens: 8,
+            cached_input_tokens: 3,
+            cache_write_tokens: 2,
+            output_tokens: 1,
+        });
+        for split in 0..=body.len() {
+            let mut usage = UsageAccumulator::new(false);
+            usage.push(&body[..split]);
+            usage.push(&body[split..]);
+            assert_eq!(usage.current(), None);
+            assert_eq!(usage.finish(), expected, "split at byte {split}");
+        }
+
+        let mut zero = UsageAccumulator::new(false);
+        zero.push(br#"{"usage":{"input_tokens":0,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":0}}"#);
+        assert_eq!(zero.finish(), Some(TokenUsage::default()));
+
+        let mut missing = UsageAccumulator::new(false);
+        missing.push(br#"{"output":[]}"#);
+        assert_eq!(missing.finish(), None);
+
+        let mut missing_sse = UsageAccumulator::new(true);
+        missing_sse.push(b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\r\n\r\n");
+        assert_eq!(missing_sse.finish(), None);
+    }
+
+    #[test]
+    fn fresh_input_decomposition_saturates() {
+        assert_eq!(
+            TokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 60,
+                cache_write_tokens: 25,
+                output_tokens: 0,
+            }
+            .fresh_input_tokens(),
+            15
+        );
+        assert_eq!(
+            TokenUsage {
+                input_tokens: 10,
+                cached_input_tokens: 9,
+                cache_write_tokens: 9,
+                output_tokens: 0,
+            }
+            .fresh_input_tokens(),
+            0
+        );
+    }
+
+    #[test]
     fn classifies_proxy_incomplete_on_2xx() {
         let sse = r#"event: error
 data: {"type":"error","error":{"type":"proxy_incomplete_output","message":"The proxy could not safely assemble a terminal response."}}
@@ -563,6 +868,16 @@ data: {"type":"response.incomplete","response":{"id":"resp_inc","error":{"type":
         assert_eq!(fk, Some(FailureKind::StreamIo));
         assert_eq!(et, "stream_io");
         assert!(msg.contains("connection reset"));
+    }
+
+    #[test]
+    fn sanitize_id_is_lossless_and_control_safe() {
+        let newline = sanitize_id("session\n");
+        let literal = sanitize_id("session\\n");
+        assert_eq!(newline, "session\\n");
+        assert_eq!(literal, "session\\\\n");
+        assert_ne!(newline, literal);
+        assert!(!newline.contains('\n'));
     }
 
     #[test]

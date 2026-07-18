@@ -90,17 +90,21 @@ that can use the selected Codex model.
 
 When standard input and output are attached to a terminal, `grok-build-proxy
 serve` (and the default `grok-build-proxy` command) opens an interactive monitor
-instead of scrolling logs. It shows sessions, active and recent requests, a
-metrics strip (tok/s, rolling `fail%`, and recent completion-outcome sparklines
-from store samples — distinct from the header `err●N` failure-ring count), and a failures
-panel classified from real proxy traffic.
+instead of scrolling logs. It shows **active sessions** only (in-flight
+requests), a **session detail** inspector for the session selected on the left
+(identity, counters, tok/s, last failure, workspace path, latest user-prompt
+preview, plus that session's active and recent turns), a metrics strip (`tok/s` = mean of per-session lifetime rates with a
+1 Hz sparkline history; rolling `fail%` and completion-outcome sparklines —
+distinct from the header `err●N` failure-ring count), and a failures panel
+classified from real proxy traffic. Prompt/path previews are sanitized, capped at
+256 characters, and kept only in the in-memory monitor store.
 
 **Keybindings**
 
 | Key | Action |
 |---|---|
 | `j` / `k` or `↓` / `↑` | Move selection within the focused panel |
-| `Tab` / `Shift-Tab` | Cycle panel focus: sessions → active → failures |
+| `Tab` / `Shift-Tab` | Cycle panel focus: sessions → session detail → failures |
 | `f` | Cycle failure filter: All → ProxyAssemble → Upstream → Auth → Stream |
 | `y` / `Y` | Copy filtered failure report (markdown / JSON) to the clipboard |
 | `w` / `W` | Write filtered failure report to disk (markdown / JSON) |
@@ -200,21 +204,31 @@ omit the capability fields.
 
 ## Prompt cache efficiency
 
-The proxy assigns a stable Codex prompt-cache namespace to each Grok Build
-session. It also preserves a valid client-supplied `prompt_cache_key` instead of
-overwriting it, and passes through `prompt_cache_options` and
-`prompt_cache_retention` for clients and upstreams that support those fields.
+The proxy keeps Grok thread identity separate from prompt-cache routing. A valid
+client `prompt_cache_key` is preserved; otherwise the cache key falls back to
+`x-grok-conv-id`, then `x-grok-session-id`. The per-request `x-grok-req-id` and
+the proxy's generated request UUID are never used as cache keys. If no stable
+key is available, the proxy omits both `prompt_cache_key` and
+`x-session-affinity` rather than manufacturing one.
 
-Fork and subagent clients can send `x-grok-cache-lineage-id` to reuse a parent
-session's cache routing while retaining their own `x-grok-session-id` as the
-Codex thread identity. The upstream request uses the lineage for `session-id`
-and `x-session-affinity`; a valid explicit `prompt_cache_key` controls only
-cache routing. `thread-id`, `x-client-request-id`, and `x-codex-window-id`
-remain scoped to the child. Cache keys longer than the Responses API's 64-byte
-limit are replaced with a stable bounded key.
+`session-id`, `thread-id`, and (when the client sends `client_metadata`)
+`client_metadata.session_id` and `client_metadata.thread_id` retain the stable
+`x-grok-session-id` thread identity, falling back to the conversation ID only
+when no session ID is present. `x-session-affinity` is deliberately allowed to
+carry the separate cache key because it is a routing hint;
+`x-client-request-id` preserves the incoming request ID. Public Grok Build does
+not send a cache-lineage header, so none is supported here.
+
+Client cache policy fields pass through only when they match current OpenAI
+semantics. `prompt_cache_key` must be a string of at most 64 characters.
+GPT-5.6 models accept `prompt_cache_options.mode` values `implicit`
+or `explicit` and only the `30m` TTL. GPT-5.5 models accept only the `24h`
+`prompt_cache_retention`; older models may accept `in_memory` or `24h`. The
+proxy does not invent policy defaults, and returns `400 invalid_request_error`
+for malformed or model-incompatible combinations.
 
 When terminal usage is available, plain logs include `input_tokens`,
-`cached_input_tokens`, `cache_write_tokens`, `uncached_input_tokens`, and
+`cached_input_tokens`, `cache_write_tokens`, `fresh_input_tokens`, and
 `cache_read_percent`. These metrics do not include prompt or response content.
 
 ## Responses Lite, Plan, and Goal compatibility

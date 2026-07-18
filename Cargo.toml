@@ -1,6 +1,6 @@
 [package]
 name = "grok-build-proxy"
-version = "0.0.13"
+version = "0.0.14"
 edition = "2024"
 rust-version = "1.88"
 description = "A local Grok Build to ChatGPT Codex proxy for macOS"
@@ -31,7 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 toml_edit = { version = "0.23", features = ["serde"] }
 url = "2"
-uuid = { version = "1", features = ["v4", "v5"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
