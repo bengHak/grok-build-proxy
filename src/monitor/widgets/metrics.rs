@@ -1,4 +1,4 @@
-//! Metrics mid-strip: tok/s, error rate, completed outcomes, and cache-read ratio.
+//! Metrics mid-strip: tok/s, error rate, completed outcomes, and cache-read counts.
 
 use crate::monitor::theme::Theme;
 use crate::store::{Session, Snapshot};
@@ -8,6 +8,32 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
 };
+
+/// Compact absolute token count for tight metric cells (`900`, `1.2k`, `3.4M`).
+pub fn format_token_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Fleet/session cache cell: absolute cache-read tokens plus optional ratio.
+///
+/// - No usage observations yet → `n/a`
+/// - Otherwise → `{count} · {pct}%` so zero reads stay visible as `0 · 0%`
+pub fn format_cache_read_value(cached_input_tokens: u64, ratio: Option<f64>) -> String {
+    match ratio {
+        None => "n/a".into(),
+        Some(ratio) => format!(
+            "{} · {:.0}%",
+            format_token_count(cached_input_tokens),
+            ratio * 100.0
+        ),
+    }
+}
 
 /// Mean of per-session lifetime tok/s over sessions that have a defined rate.
 ///
@@ -120,10 +146,7 @@ impl Widget for MetricsStrip<'_> {
             buf,
             MetricCell {
                 label: "cache",
-                value: tok
-                    .cache_read_ratio
-                    .map(|ratio| format!("{:.0}%", ratio * 100.0))
-                    .unwrap_or_else(|| "n/a".into()),
+                value: tok.cache_cell_value(),
                 spark_values: &[],
                 fixed_max: Some(1.0),
                 value_style: self.theme.ok,
@@ -167,6 +190,8 @@ fn render_metric(area: Rect, buf: &mut Buffer, cell: MetricCell<'_>) {
 #[derive(Clone, Debug, Default)]
 pub struct Metrics {
     pub avg_tok_s: f64,
+    /// Fleet total cache-read tokens from terminal usage aggregates.
+    pub cached_input_tokens: u64,
     pub cache_read_ratio: Option<f64>,
     pub error_rate: f64,
     pub completed_ok: usize,
@@ -205,6 +230,7 @@ impl Metrics {
 
         Self {
             avg_tok_s,
+            cached_input_tokens: snapshot.cached_input_tokens,
             cache_read_ratio: snapshot.cache_read_ratio(),
             error_rate,
             completed_ok,
@@ -213,6 +239,11 @@ impl Metrics {
             error_samples,
             outcome_samples,
         }
+    }
+
+    /// Value rendered in the metrics strip `cache` cell.
+    pub fn cache_cell_value(&self) -> String {
+        format_cache_read_value(self.cached_input_tokens, self.cache_read_ratio)
     }
 }
 
@@ -357,7 +388,49 @@ mod tests {
             ..Default::default()
         };
         let m = Metrics::from_snapshot(&snap);
+        assert_eq!(m.cached_input_tokens, 900);
         assert!((m.cache_read_ratio.unwrap() - 900.0 / 1_010.0).abs() < 1e-12);
+        assert_eq!(m.cache_cell_value(), "900 · 89%");
+    }
+
+    #[test]
+    fn metrics_cache_cell_shows_absolute_zero_reads() {
+        let snap = Snapshot {
+            input_tokens: 500,
+            cached_input_tokens: 0,
+            usage_requests: 3,
+            ..Default::default()
+        };
+        let m = Metrics::from_snapshot(&snap);
+        assert_eq!(m.cached_input_tokens, 0);
+        assert!((m.cache_read_ratio.unwrap() - 0.0).abs() < 1e-12);
+        let cell = m.cache_cell_value();
+        assert!(
+            cell.starts_with('0'),
+            "zero cache reads must show absolute 0, got {cell}"
+        );
+        assert_eq!(cell, "0 · 0%");
+    }
+
+    #[test]
+    fn metrics_cache_cell_n_a_without_usage_observations() {
+        let m = Metrics::from_snapshot(&Snapshot::default());
+        assert_eq!(m.cached_input_tokens, 0);
+        assert_eq!(m.cache_read_ratio, None);
+        assert_eq!(m.cache_cell_value(), "n/a");
+    }
+
+    #[test]
+    fn format_token_count_compacts_large_values() {
+        assert_eq!(format_token_count(0), "0");
+        assert_eq!(format_token_count(999), "999");
+        assert_eq!(format_token_count(1_234), "1.2k");
+        assert_eq!(format_token_count(12_300), "12.3k");
+        assert_eq!(format_token_count(2_500_000), "2.5M");
+        assert_eq!(
+            format_cache_read_value(12_300, Some(0.91)),
+            "12.3k · 91%"
+        );
     }
 
     #[test]

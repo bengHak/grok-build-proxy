@@ -8,7 +8,22 @@
 
 use super::truncate;
 use crate::monitor::theme::Theme;
+use crate::monitor::widgets::metrics::{format_cache_read_value, format_token_count};
 use crate::store::{Request, Session, Snapshot};
+
+/// Session summary `tokens` line: output, absolute cache reads, and lifetime tok/s.
+///
+/// Cache reads use the same absolute+ratio formatting as the fleet metrics strip so a
+/// zero-cache session is visible without leaving the inspector.
+pub fn format_session_tokens_line(session: &Session) -> String {
+    let cache = format_cache_read_value(session.cached_input_tokens, session.cache_read_ratio());
+    format!(
+        "{} out · cache {} · {:.1} t/s",
+        format_token_count(session.output_tokens),
+        cache,
+        session.tokens_per_second()
+    )
+}
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -208,14 +223,7 @@ impl SessionDetailPanel<'_> {
             ]),
             Line::from(vec![
                 Span::styled("tokens  ", self.theme.muted),
-                Span::styled(
-                    format!(
-                        "{:<5} {:.1} t/s",
-                        session.output_tokens,
-                        session.tokens_per_second()
-                    ),
-                    self.theme.header,
-                ),
+                Span::styled(format_session_tokens_line(session), self.theme.header),
             ]),
             Line::from(vec![
                 Span::styled("last    ", self.theme.muted),
@@ -444,6 +452,51 @@ mod tests {
         );
         assert!(SessionDetailPanel::session(&snap, None).is_none());
         assert!(SessionDetailPanel::session(&snap, Some("gone")).is_none());
+    }
+
+    #[test]
+    fn session_tokens_line_shows_absolute_cache_reads() {
+        let hot = Session {
+            id: "hot".into(),
+            output_tokens: 40,
+            input_tokens: 1_010,
+            cached_input_tokens: 900,
+            usage_requests: 2,
+            sample_seconds: 2.0,
+            ..Default::default()
+        };
+        let line = format_session_tokens_line(&hot);
+        assert!(
+            line.contains("900") && line.contains("cache") && line.contains("89%"),
+            "nonzero cache reads missing absolute count: {line}"
+        );
+        assert!(line.contains("40 out"), "output count missing: {line}");
+
+        let cold = Session {
+            id: "cold".into(),
+            output_tokens: 10,
+            input_tokens: 500,
+            cached_input_tokens: 0,
+            usage_requests: 4,
+            sample_seconds: 1.0,
+            ..Default::default()
+        };
+        let line = format_session_tokens_line(&cold);
+        assert!(
+            line.contains("cache 0 · 0%"),
+            "zero cache reads must stay visible: {line}"
+        );
+
+        let unknown = Session {
+            id: "new".into(),
+            output_tokens: 0,
+            ..Default::default()
+        };
+        let line = format_session_tokens_line(&unknown);
+        assert!(
+            line.contains("cache n/a"),
+            "no usage observations → n/a: {line}"
+        );
     }
 
     #[test]

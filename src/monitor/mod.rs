@@ -27,7 +27,8 @@ use std::{
 use theme::Theme;
 use widgets::{
     FailuresPanel, Footer, Header, HelpOverlay, MetricsStrip, SessionDetailPanel, SessionsPanel,
-    TurnKind, active_sessions, fleet_avg_tok_s, should_show_metrics, truncate,
+    TurnKind, active_sessions, fleet_avg_tok_s, format_session_tokens_line, should_show_metrics,
+    truncate,
 };
 
 /// Below this width, panels stack as a single focused "tab" instead of side-by-side.
@@ -434,7 +435,7 @@ fn session_detail_text(session: &Session, snapshot: &Snapshot) -> String {
         session.last_prompt.as_str()
     };
     format!(
-        "Session {}\n  model: {}\n  requests: {}  active: {}  errors: {}\n  tokens: {}  tok/s: {:.1}\n  last_failure: {last}\n  fail_ring: {fail_n}  turns_visible: {turns}\n  updated: {updated}\n  cwd: {cwd}\n  last_prompt: {prompt}",
+        "Session {}\n  model: {}\n  requests: {}  active: {}  errors: {}\n  tokens: {}\n  last_failure: {last}\n  fail_ring: {fail_n}  turns_visible: {turns}\n  updated: {updated}\n  cwd: {cwd}\n  last_prompt: {prompt}",
         session.id,
         if session.last_model.is_empty() {
             "-"
@@ -444,8 +445,7 @@ fn session_detail_text(session: &Session, snapshot: &Snapshot) -> String {
         session.requests,
         session.active,
         session.errors,
-        session.output_tokens,
-        session.tokens_per_second(),
+        format_session_tokens_line(session),
     )
 }
 
@@ -899,6 +899,74 @@ mod tests {
         assert!(
             text.contains("tok/s") && !text.contains("tok/s 0.0"),
             "tok/s should be non-zero from fixture session rates:\n{text}"
+        );
+    }
+
+    #[test]
+    fn metrics_and_session_detail_show_absolute_cache_reads() {
+        use crate::events::TokenUsage;
+        use super::widgets::metrics::format_cache_read_value;
+
+        let d = Dashboard::new();
+        let mut started = base_event(RequestEventKind::Started);
+        started.request_id = "req-cache-hot".into();
+        d.observe(started);
+        d.observe_session_context("sess-abc", "cache probe", "/tmp/cache");
+        let mut completed = base_event(RequestEventKind::Completed);
+        completed.request_id = "req-cache-hot".into();
+        completed.usage = Some(TokenUsage {
+            input_tokens: 1_010,
+            cached_input_tokens: 900,
+            cache_write_tokens: 50,
+            output_tokens: 40,
+        });
+        d.observe(completed);
+
+        let mut cold_start = base_event(RequestEventKind::Started);
+        cold_start.request_id = "req-cache-cold".into();
+        cold_start.session_id = "sess-cold".into();
+        d.observe(cold_start);
+        d.observe_session_context("sess-cold", "cold session", "/tmp/cold");
+        let mut cold_done = base_event(RequestEventKind::Completed);
+        cold_done.request_id = "req-cache-cold".into();
+        cold_done.session_id = "sess-cold".into();
+        cold_done.usage = Some(TokenUsage {
+            input_tokens: 500,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 5,
+        });
+        d.observe(cold_done);
+
+        let snap = d.snapshot();
+        assert_eq!(snap.cached_input_tokens, 900);
+        // Fleet ratio is weighted across both sessions: 900 / (1010+500) ≈ 59.6%.
+        let fleet_cell =
+            format_cache_read_value(snap.cached_input_tokens, snap.cache_read_ratio());
+        assert_eq!(fleet_cell, "900 · 60%");
+
+        let mut app = App::new();
+        app.selected_session_key = Some("sess-abc".into());
+        app.focus = Focus::SessionDetail;
+        let text = render_test(120, 28, &snap, "127.0.0.1:1", "0.0.15", &app);
+        assert!(
+            text.contains("cache") && text.contains("900"),
+            "fleet metrics must show absolute cache-read count:\n{text}"
+        );
+        assert!(
+            text.contains(&fleet_cell),
+            "fleet metrics should render absolute count + ratio ({fleet_cell}):\n{text}"
+        );
+        assert!(
+            text.contains("cache 900 · 89%"),
+            "selected session tokens line must show absolute cache reads:\n{text}"
+        );
+
+        app.selected_session_key = Some("sess-cold".into());
+        let text = render_test(120, 28, &snap, "127.0.0.1:1", "0.0.15", &app);
+        assert!(
+            text.contains("cache 0 · 0%"),
+            "zero-cache session must show absolute 0 reads:\n{text}"
         );
     }
 
