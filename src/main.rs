@@ -516,6 +516,7 @@ async fn models_command(args: ModelsArgs) -> Result<()> {
             } else {
                 listen_from_base_url(&current.base_url).unwrap_or_else(|| listen.clone())
             };
+            let name = action.name.as_deref().unwrap_or(&current.name);
             let spec = grokconfig::model_spec(
                 &catalog,
                 action.alias,
@@ -523,7 +524,7 @@ async fn models_command(args: ModelsArgs) -> Result<()> {
                 fast,
                 &update_listen,
                 &api_key,
-                action.name.as_deref(),
+                Some(name),
             )?;
             let changes = config.update(&spec)?;
             apply_changes(config, changes, action.write)

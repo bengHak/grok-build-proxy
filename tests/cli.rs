@@ -64,6 +64,8 @@ fn model_crud_supports_fast_and_preserves_other_config() {
             "codex-sol",
             "--model",
             "gpt-5.6-sol",
+            "--name",
+            "My Codex",
             "--yes",
         ])
         .output()
@@ -96,6 +98,7 @@ fn model_crud_supports_fast_and_preserves_other_config() {
     );
     let text = fs::read_to_string(&config).unwrap();
     assert!(text.contains("model = \"gpt-5.6-sol-fast\""));
+    assert!(text.contains("name = \"My Codex\""));
 
     let retarget = binary()
         .args([
@@ -111,11 +114,9 @@ fn model_crud_supports_fast_and_preserves_other_config() {
         .output()
         .unwrap();
     assert!(retarget.status.success());
-    assert!(
-        fs::read_to_string(&config)
-            .unwrap()
-            .contains("model = \"gpt-5.6-terra-fast\"")
-    );
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("model = \"gpt-5.6-terra-fast\""));
+    assert!(text.contains("name = \"My Codex\""));
 
     let list = binary()
         .args(["models", "--grok-config", path, "list", "--json"])
