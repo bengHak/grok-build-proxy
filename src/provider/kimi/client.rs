@@ -9,14 +9,14 @@ pub async fn send(
     upstream_url: &str,
     store: &Store,
     raw: &[u8],
-    session_id: &str,
+    prompt_cache_key: Option<&str>,
     force_refresh: bool,
 ) -> Result<reqwest::Response> {
     let credentials = store
         .get(force_refresh)
         .await
         .context("load Kimi credentials")?;
-    let body = translate_request(raw, session_id)?;
+    let body = translate_request(raw, prompt_cache_key)?;
     let response = store
         .http_client()
         .post(upstream_url)

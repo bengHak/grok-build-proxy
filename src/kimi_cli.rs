@@ -105,15 +105,25 @@ fn default_auth_path() -> Result<PathBuf> {
 
 fn masked(value: &str) -> String {
     let characters: Vec<_> = value.chars().collect();
-    if characters.len() <= 8 {
-        format!("…{value}")
-    } else {
-        format!(
-            "{}…{}",
-            characters[..4].iter().collect::<String>(),
-            characters[characters.len() - 4..]
-                .iter()
-                .collect::<String>()
-        )
+    if characters.is_empty() {
+        return "…".into();
+    }
+    let suffix_start = characters.len().saturating_sub(4).max(1);
+    format!("…{}", characters[suffix_start..].iter().collect::<String>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::masked;
+
+    #[test]
+    fn user_ids_are_always_masked() {
+        for value in ["a", "abcd", "abcdefgh", "abcdefghijkl", "사용자"] {
+            let masked = masked(value);
+            assert_ne!(masked, value);
+            assert!(!masked.contains(value));
+        }
+        assert_eq!(masked(""), "…");
+        assert_eq!(masked("abcdefgh"), "…efgh");
     }
 }

@@ -84,7 +84,7 @@ fn kimi_request_translates_responses_history_tools_and_reasoning() {
     });
 
     let translated =
-        translate_request(&serde_json::to_vec(&request).unwrap(), "session-1").unwrap();
+        translate_request(&serde_json::to_vec(&request).unwrap(), Some("session-1")).unwrap();
 
     assert_eq!(translated["model"], "kimi-for-coding");
     assert_eq!(translated["stream"], true);
@@ -112,6 +112,10 @@ fn kimi_request_translates_responses_history_tools_and_reasoning() {
     assert_eq!(translated["tool_choice"]["function"]["name"], "search");
     assert!(translated.get("input").is_none());
     assert!(translated.get("store").is_none());
+
+    let without_cache_key =
+        translate_request(&serde_json::to_vec(&request).unwrap(), None).unwrap();
+    assert!(without_cache_key.get("prompt_cache_key").is_none());
 }
 
 #[test]
@@ -325,7 +329,12 @@ fn kimi_stream_fail_emits_terminal_after_partial_output() {
             .unwrap()["response"]["error"]["message"],
         "upstream chunk error"
     );
-    // A second fail/finish must not emit another terminal.
+    // Repeated failures and finish must not emit another terminal.
+    assert!(
+        translator
+            .fail(&serde_json::json!({"type":"upstream_error","message":"late error"}))
+            .is_empty()
+    );
     assert!(translator.finish().is_empty());
 }
 

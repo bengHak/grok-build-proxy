@@ -1,20 +1,20 @@
 //! Ratatui panel widgets for the serve monitor.
 
-mod active;
 mod failures;
 mod footer;
 mod header;
 mod help;
 mod metrics;
+mod session_detail;
 mod sessions;
 
-pub use active::{ActivePanel, TurnKind};
 pub use failures::FailuresPanel;
 pub use footer::Footer;
 pub use header::Header;
 pub use help::HelpOverlay;
-pub use metrics::{MetricsStrip, should_show_metrics};
-pub use sessions::SessionsPanel;
+pub use metrics::{MetricsStrip, fleet_avg_tok_s, should_show_metrics};
+pub use session_detail::{SessionDetailPanel, TurnKind};
+pub use sessions::{SessionsPanel, active_sessions};
 
 /// Truncate a display string to `max` chars, appending `…` when needed.
 pub(crate) fn truncate(s: &str, max: usize) -> String {

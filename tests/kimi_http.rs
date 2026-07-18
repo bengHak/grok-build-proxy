@@ -54,9 +54,26 @@ async fn kimi_model_routes_to_chat_completions_and_translates_stream() {
     )
     .await
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
     tokio::fs::write(directory.path().join("device_id"), "device-1\n")
         .await
         .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(
+            directory.path().join("device_id"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+    }
 
     let app = router(ProxyConfig {
         upstream_url: "http://127.0.0.1:9/responses".into(),
@@ -225,9 +242,26 @@ async fn kimi_non_success_is_mapped_to_responses_error_contract() {
     )
     .await
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
     tokio::fs::write(directory.path().join("device_id"), "device-1\n")
         .await
         .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(
+            directory.path().join("device_id"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+    }
 
     let app = router(ProxyConfig {
         upstream_url: "http://127.0.0.1:9/responses".into(),

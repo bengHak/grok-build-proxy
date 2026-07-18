@@ -130,6 +130,10 @@ impl Translator {
         self.terminal_response.as_ref()
     }
 
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     fn consume(&mut self, data: &str) -> Vec<u8> {
         if self.terminal {
             return Vec::new();

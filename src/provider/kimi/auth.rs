@@ -111,7 +111,7 @@ impl Store {
 
     pub async fn inspect(&self) -> Result<AuthStatus> {
         let _guard = self.lock.lock().await;
-        let auth = file::load_auth(&self.path).await?;
+        let auth = file::load_auth_for_inspection(&self.path).await?;
         let metadata = tokio::fs::metadata(&self.path).await?;
         #[cfg(unix)]
         let file_mode = {
@@ -120,7 +120,9 @@ impl Store {
         };
         #[cfg(not(unix))]
         let file_mode = 0;
-        let expires_at = DateTime::from_timestamp_millis(auth.expires as i64)
+        let expires =
+            i64::try_from(auth.expires).context("Kimi credential expiry is out of range")?;
+        let expires_at = DateTime::from_timestamp_millis(expires)
             .context("Kimi credential expiry is out of range")?;
         Ok(AuthStatus {
             path: self.path.clone(),
@@ -176,21 +178,25 @@ impl CredentialProvider for Store {
         let _guard = self.lock.lock().await;
         let auth = file::load_auth(&self.path).await?;
         let now = Utc::now().timestamp_millis().max(0) as u64;
-        let auth = if force_refresh || auth.expires <= now + REFRESH_MARGIN_MS {
+        let refresh_at = now.saturating_add(REFRESH_MARGIN_MS);
+        let auth = if force_refresh || auth.expires <= refresh_at {
             self.refresh(&auth).await?
         } else {
             auth
         };
-        Ok(credentials(&auth))
+        credentials(&auth)
     }
 }
 
-fn credentials(auth: &StoredAuth) -> Credentials {
-    Credentials {
+fn credentials(auth: &StoredAuth) -> Result<Credentials> {
+    let expires = i64::try_from(auth.expires).context("Kimi credential expiry is out of range")?;
+    let expires_at = DateTime::from_timestamp_millis(expires)
+        .context("Kimi credential expiry is out of range")?;
+    Ok(Credentials {
         access_token: auth.access.clone(),
         account_id: auth.user_id.clone().unwrap_or_default(),
-        expires_at: DateTime::from_timestamp_millis(auth.expires as i64),
-    }
+        expires_at: Some(expires_at),
+    })
 }
 
 fn ascii(value: &str) -> String {

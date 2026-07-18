@@ -49,6 +49,11 @@ fn kimi_auth_status_reads_the_selected_auth_file() {
         br#"{"access":"secret","refresh":"rotate","expires":1893456000000,"userId":"user-1"}"#,
     )
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let output = binary()
         .args(["kimi", "auth", "status", "--auth-file"])
         .arg(&path)

@@ -6,14 +6,15 @@ use tokio::{fs, io::AsyncWriteExt};
 use super::StoredAuth;
 
 pub(super) async fn load_auth(path: &Path) -> Result<StoredAuth> {
-    match fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("refusing to read Kimi credentials through a symbolic link")
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("inspect Kimi auth file"),
-    }
+    load_auth_with_policy(path, true).await
+}
+
+pub(super) async fn load_auth_for_inspection(path: &Path) -> Result<StoredAuth> {
+    load_auth_with_policy(path, false).await
+}
+
+async fn load_auth_with_policy(path: &Path, require_private: bool) -> Result<StoredAuth> {
+    validate_private_file(path, "Kimi credentials", require_private).await?;
     let data = fs::read(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             anyhow!(
@@ -29,6 +30,35 @@ pub(super) async fn load_auth(path: &Path) -> Result<StoredAuth> {
         bail!("Kimi auth file is missing an access token; run `grok-build-proxy kimi auth login`")
     }
     Ok(auth)
+}
+
+async fn validate_private_file(
+    path: &Path,
+    description: &str,
+    require_private: bool,
+) -> Result<()> {
+    match fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("refusing to read {description} through a symbolic link")
+        }
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!("{description} path is not a regular file")
+        }
+        #[cfg(unix)]
+        Ok(metadata) if require_private => {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                bail!(
+                    "refusing to read group/world-accessible {description}; run `chmod 600 {}`",
+                    path.display()
+                )
+            }
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context(format!("inspect {description}")),
+    }
+    Ok(())
 }
 
 pub(super) async fn save_auth(path: &Path, auth: &StoredAuth) -> Result<()> {
@@ -47,6 +77,7 @@ pub(super) async fn remove_auth(path: &Path) -> Result<()> {
 
 pub(super) async fn device_id(auth_path: &Path) -> Result<String> {
     let path = device_id_path(auth_path);
+    validate_private_file(&path, "Kimi device ID", true).await?;
     match fs::read_to_string(&path).await {
         Ok(value) if !value.trim().is_empty() => return Ok(value.trim().to_owned()),
         Ok(_) => bail!("Kimi device ID file is empty at {}", path.display()),
@@ -67,10 +98,9 @@ fn device_id_path(auth_path: &Path) -> PathBuf {
 
 async fn save_private(path: &Path, data: &[u8]) -> Result<()> {
     let directory = path.parent().unwrap_or(Path::new("."));
-    let directory_existed = fs::metadata(directory).await.is_ok();
     fs::create_dir_all(directory).await?;
     #[cfg(unix)]
-    if !directory_existed {
+    {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).await?;
     }

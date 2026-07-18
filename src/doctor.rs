@@ -160,7 +160,22 @@ pub async fn run_full(
                     #[cfg(not(unix))]
                     let secure = true;
                     if secure {
-                        checks.push(Check::pass("Kimi auth", status.path.display().to_string()));
+                        let now = chrono::Utc::now();
+                        if status.expires_at <= now && !status.has_refresh_token {
+                            checks.push(Check::fail(
+                                "Kimi auth",
+                                "credential is expired and has no refresh token; run `grok-build-proxy kimi auth login`",
+                            ));
+                        } else {
+                            checks
+                                .push(Check::pass("Kimi auth", status.path.display().to_string()));
+                            if !status.has_refresh_token {
+                                checks.push(Check::warn(
+                                    "Kimi refresh token",
+                                    "missing; login may need to be repeated when the access token expires",
+                                ));
+                            }
+                        }
                     } else {
                         checks.push(Check::fail(
                             "Kimi auth",
@@ -174,15 +189,14 @@ pub async fn run_full(
         }
     }
 
-    let mut required_codex = false;
-    let mut required_kimi = false;
+    let mut required_codex = true;
+    let mut required_kimi = true;
     match GrokConfig::load(grok_config) {
         Ok(config) => {
             let records = config.records();
             let catalog = Catalog::default();
-            if records.is_empty() {
-                required_codex = true;
-            }
+            required_codex = records.is_empty();
+            required_kimi = records.is_empty();
             for record in &records {
                 let resolved = mappings
                     .as_ref()
@@ -370,6 +384,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unusable_grok_config_keeps_kimi_auth_required() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-grok.toml");
+        let empty = directory.path().join("empty-grok.toml");
+        tokio::fs::write(&empty, "").await.unwrap();
+
+        for grok_config in [&missing, &empty] {
+            let checks = run_full(
+                &directory.path().join("missing-codex.json"),
+                Some(&directory.path().join("missing-kimi.json")),
+                grok_config,
+                directory.path(),
+                "127.0.0.1:0",
+                "",
+                "missing-codex",
+                "missing-grok",
+                "",
+                Duration::from_millis(50),
+            )
+            .await;
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| { check.name == "Kimi auth" && !check.ok && !check.warning })
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn kimi_credentials_make_missing_codex_setup_optional() {
         let directory = tempfile::tempdir().unwrap();
         let kimi_auth = directory.path().join("kimi-auth.json");
@@ -448,6 +491,52 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "ChatGPT auth" && !check.ok)
         );
+    }
+
+    #[tokio::test]
+    async fn expired_kimi_credentials_without_refresh_fail_doctor() {
+        let directory = tempfile::tempdir().unwrap();
+        let kimi_auth = directory.path().join("kimi-auth.json");
+        let grok_config = directory.path().join("grok.toml");
+        tokio::fs::write(
+            &kimi_auth,
+            br#"{"access":"expired","refresh":"","expires":1}"#,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&kimi_auth, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            &grok_config,
+            "[model.kimi]\nmodel = \"kimi-for-coding\"\nname = \"Kimi\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n",
+        )
+        .await
+        .unwrap();
+
+        let checks = run_full(
+            &directory.path().join("missing-codex.json"),
+            Some(&kimi_auth),
+            &grok_config,
+            directory.path(),
+            "127.0.0.1:0",
+            "",
+            "missing-codex",
+            "missing-grok",
+            "",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(checks.iter().any(|check| {
+            check.name == "Kimi auth"
+                && !check.ok
+                && check.detail.contains("expired")
+                && check.detail.contains("no refresh token")
+        }));
     }
 
     #[tokio::test]

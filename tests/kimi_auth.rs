@@ -6,13 +6,17 @@ use grok_build_proxy::{
     provider::kimi::auth::{Store, StoredAuth},
 };
 use serde_json::{Value, json};
-use tokio::{fs, sync::Mutex};
+use tokio::{
+    fs,
+    sync::{Mutex, Notify},
+};
 
 #[derive(Clone, Default)]
 struct OAuthState {
     forms: Arc<Mutex<Vec<HashMap<String, String>>>>,
     headers: Arc<Mutex<Vec<HeaderMap>>>,
     polls: Arc<Mutex<usize>>,
+    first_poll: Arc<Notify>,
 }
 
 #[tokio::test]
@@ -40,9 +44,26 @@ async fn expired_kimi_credentials_refresh_and_rotate_tokens() {
     )
     .await
     .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+    }
     fs::write(dir.path().join("device_id"), "stable-device-id\n")
         .await
         .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            dir.path().join("device_id"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .await
+        .unwrap();
+    }
 
     let store = Store::new(&path, format!("http://{address}")).unwrap();
     let credentials = store.get(false).await.unwrap();
@@ -59,8 +80,33 @@ async fn expired_kimi_credentials_refresh_and_rotate_tokens() {
     assert_eq!(headers[0]["x-msh-device-id"], "stable-device-id");
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn kimi_device_login_polls_and_persists_credentials() {
+async fn permissive_kimi_credentials_are_rejected_for_use() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    fs::write(
+        &path,
+        br#"{"access":"secret","refresh":"refresh","expires":4102444800000}"#,
+    )
+    .await
+    .unwrap();
+    fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .await
+        .unwrap();
+
+    let store = Store::new(&path, "http://127.0.0.1:9").unwrap();
+    let error = store.get(false).await.unwrap_err().to_string();
+    assert!(error.contains("group/world-accessible"));
+
+    // Inspection still succeeds so doctor/status can report and remediate the bad mode.
+    assert_eq!(store.inspect().await.unwrap().file_mode & 0o077, 0o044);
+}
+
+#[tokio::test]
+async fn kimi_device_login_polling_does_not_block_and_persists_credentials() {
     let state = OAuthState::default();
     let app = Router::new()
         .route(
@@ -89,7 +135,19 @@ async fn kimi_device_login_polls_and_persists_credentials() {
         authorization.verification_uri_complete,
         "https://example.test/activate"
     );
-    store.finish_device_login(&authorization).await.unwrap();
+    let login_store = store.clone();
+    let login = tokio::spawn(async move { login_store.finish_device_login(&authorization).await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.first_poll.notified(),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_millis(500), store.inspect())
+        .await
+        .expect("credential reads must not wait for device authorization")
+        .expect_err("the first login has not written credentials yet");
+    login.await.unwrap().unwrap();
 
     let saved: StoredAuth = serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
     assert_eq!(saved.access, "device-access");
@@ -104,9 +162,41 @@ async fn kimi_device_login_polls_and_persists_credentials() {
         );
         assert_eq!(
             fs::metadata(dir.path()).await.unwrap().permissions().mode() & 0o777,
-            0o755
+            0o700
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn kimi_device_id_symlinks_are_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target-device-id");
+    fs::write(&target, "linked-device\n").await.unwrap();
+    symlink(&target, dir.path().join("device_id")).unwrap();
+
+    let store = Store::new(dir.path().join("auth.json"), "http://127.0.0.1:9").unwrap();
+    let error = store.headers().await.unwrap_err().to_string();
+    assert!(error.contains("symbolic link"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn permissive_kimi_device_ids_are_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let device_id = dir.path().join("device_id");
+    fs::write(&device_id, "public-device\n").await.unwrap();
+    fs::set_permissions(&device_id, std::fs::Permissions::from_mode(0o644))
+        .await
+        .unwrap();
+
+    let store = Store::new(dir.path().join("auth.json"), "http://127.0.0.1:9").unwrap();
+    let error = store.headers().await.unwrap_err().to_string();
+    assert!(error.contains("group/world-accessible"));
 }
 
 async fn refresh(
@@ -140,6 +230,7 @@ async fn device_token(
 ) -> (axum::http::StatusCode, Json<Value>) {
     let mut polls = state.polls.lock().await;
     *polls += 1;
+    state.first_poll.notify_one();
     if *polls == 1 {
         return (
             axum::http::StatusCode::BAD_REQUEST,

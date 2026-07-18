@@ -24,8 +24,7 @@ impl Store {
             .context("start Kimi device authorization")?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!("start Kimi device authorization: HTTP {status}: {body}")
+            bail!("start Kimi device authorization: HTTP {status}")
         }
         response
             .json()
@@ -34,7 +33,6 @@ impl Store {
     }
 
     pub async fn finish_device_login(&self, authorization: &DeviceAuthorization) -> Result<()> {
-        let _guard = self.lock.lock().await;
         let deadline =
             tokio::time::Instant::now() + std::time::Duration::from_secs(authorization.expires_in);
         let mut interval = authorization.interval.max(1);
@@ -58,6 +56,7 @@ impl Store {
                 let tokens: TokenResponse =
                     response.json().await.context("decode Kimi device token")?;
                 let auth = stored_auth(tokens, None)?;
+                let _guard = self.lock.lock().await;
                 return file::save_auth(&self.path, &auth).await;
             }
             let status = response.status();
@@ -135,12 +134,20 @@ fn stored_auth(tokens: TokenResponse, current: Option<&StoredAuth>) -> Result<St
             .filter(|token| !token.is_empty())
             .or_else(|| current.map(|auth| auth.refresh.clone()))
             .unwrap_or_default(),
-        expires: now + tokens.expires_in.unwrap_or(900) * 1000,
+        expires: token_expiry(now, tokens.expires_in.unwrap_or(900))?,
         scope: tokens
             .scope
             .or_else(|| current.and_then(|auth| auth.scope.clone())),
         user_id,
     })
+}
+
+fn token_expiry(now: u64, expires_in: u64) -> Result<u64> {
+    let lifetime_ms = expires_in
+        .checked_mul(1000)
+        .context("Kimi token lifetime is out of range")?;
+    now.checked_add(lifetime_ms)
+        .context("Kimi token expiry is out of range")
 }
 
 fn user_id(token: &str) -> Option<String> {

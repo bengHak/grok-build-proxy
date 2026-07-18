@@ -8,7 +8,7 @@ use history::translate_input;
 
 const DEFAULT_MAX_TOKENS: u64 = 32_000;
 
-pub fn translate_request(raw: &[u8], session_id: &str) -> Result<Value> {
+pub fn translate_request(raw: &[u8], prompt_cache_key: Option<&str>) -> Result<Value> {
     let request: Value = serde_json::from_slice(raw).context("invalid JSON request")?;
     let request = request
         .as_object()
@@ -60,9 +60,11 @@ pub fn translate_request(raw: &[u8], session_id: &str) -> Result<Value> {
         "max_tokens": max_tokens,
         "reasoning_effort": effort,
         "thinking": {"type":"enabled"},
-        "prompt_cache_key": session_id,
     });
     let output = translated.as_object_mut().unwrap();
+    if let Some(prompt_cache_key) = prompt_cache_key.filter(|value| !value.is_empty()) {
+        output.insert("prompt_cache_key".into(), prompt_cache_key.into());
+    }
     if let Some(tools) = translate_tools(request.get("tools"))? {
         output.insert("tools".into(), tools);
     }
