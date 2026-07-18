@@ -669,7 +669,8 @@ pub fn transform_request(
     })
 }
 fn apply_responses_lite(body: &mut Map<String, Value>) {
-    body.insert("parallel_tool_calls".into(), false.into());
+    // gpt-5.6 models advertise supports_parallel_tool_calls; do not force false.
+    body.entry("parallel_tool_calls").or_insert(true.into());
     for (key, name, value) in [
         (
             "client_metadata",
@@ -1511,7 +1512,7 @@ fn codex_compat_body_for_identity(
         );
     }
     if lite {
-        body.insert("parallel_tool_calls".into(), false.into());
+        body.entry("parallel_tool_calls").or_insert(true.into());
         body.entry("reasoning")
             .or_insert_with(|| json!({}))
             .as_object_mut()
@@ -1776,15 +1777,32 @@ mod tests {
         let c = Catalog::default();
         let t=transform_request(br#"{"model":"gpt-5.6-sol","input":"hi","instructions":"dev","tools":[{"type":"function"}]}"#,&c,&ModelMap::default()).unwrap();
         let v: Value = serde_json::from_slice(&t.body).unwrap();
-        assert_eq!(v["parallel_tool_calls"], false);
+        assert_eq!(v["parallel_tool_calls"], true);
         assert_eq!(v["input"][0]["type"], "additional_tools");
         assert!(v["input"][0].get("id").is_none());
         let wire: Value =
             serde_json::from_slice(&codex_compat_body(&t.body, "session", true).unwrap()).unwrap();
+        assert_eq!(wire["parallel_tool_calls"], true);
         assert!(wire["input"][0].get("id").is_none());
         assert_eq!(wire["input"][0]["type"], "additional_tools");
         assert_eq!(v["input"][1]["role"], "developer");
         assert_eq!(v["input"][2]["role"], "user");
+    }
+
+    #[test]
+    fn lite_preserves_explicit_parallel_tool_calls_false() {
+        let c = Catalog::default();
+        let t = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","parallel_tool_calls":false}"#,
+            &c,
+            &ModelMap::default(),
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&t.body).unwrap();
+        assert_eq!(v["parallel_tool_calls"], false);
+        let wire: Value =
+            serde_json::from_slice(&codex_compat_body(&t.body, "session", true).unwrap()).unwrap();
+        assert_eq!(wire["parallel_tool_calls"], false);
     }
 
     #[test]
