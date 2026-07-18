@@ -202,6 +202,35 @@ Canonical catalog routes, configured model-map aliases, and eligible generated
 `-fast` routes inherit their target's capability. Unknown or unsupported models
 omit the capability fields.
 
+## Prompt cache efficiency
+
+The proxy keeps Grok thread identity separate from prompt-cache routing. A valid
+client `prompt_cache_key` is preserved; otherwise the cache key falls back to
+`x-grok-conv-id`, then `x-grok-session-id`. The per-request `x-grok-req-id` and
+the proxy's generated request UUID are never used as cache keys. If no stable
+key is available, the proxy omits both `prompt_cache_key` and
+`x-session-affinity` rather than manufacturing one.
+
+`session-id`, `thread-id`, and (when the client sends `client_metadata`)
+`client_metadata.session_id` and `client_metadata.thread_id` retain the stable
+`x-grok-session-id` thread identity, falling back to the conversation ID only
+when no session ID is present. `x-session-affinity` is deliberately allowed to
+carry the separate cache key because it is a routing hint;
+`x-client-request-id` preserves the incoming request ID. Public Grok Build does
+not send a cache-lineage header, so none is supported here.
+
+Client cache policy fields pass through only when they match current OpenAI
+semantics. `prompt_cache_key` must be a string of at most 64 characters.
+GPT-5.6 models accept `prompt_cache_options.mode` values `implicit`
+or `explicit` and only the `30m` TTL. GPT-5.5 models accept only the `24h`
+`prompt_cache_retention`; older models may accept `in_memory` or `24h`. The
+proxy does not invent policy defaults, and returns `400 invalid_request_error`
+for malformed or model-incompatible combinations.
+
+When terminal usage is available, plain logs include `input_tokens`,
+`cached_input_tokens`, `cache_write_tokens`, `fresh_input_tokens`, and
+`cache_read_percent`. These metrics do not include prompt or response content.
+
 ## Responses Lite, Plan, and Goal compatibility
 
 The required compatibility layer was introduced in v0.0.7 and remains enabled

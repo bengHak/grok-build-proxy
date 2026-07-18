@@ -29,7 +29,9 @@ fn created_event_uses_in_progress_response_status() {
 
 #[test]
 fn normalization_is_invariant_to_network_chunk_boundaries() {
-    let input=b"event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_chunks\"}}\r\n\r\nevent: keepalive\r\ndata: {\"type\":\"keepalive\"}\r\n\r\nevent: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"chunk safe\"}\r\n\r\ndata: [DONE]\r\n\r\n";
+    // Supply a fixed timestamp so the one-shot and incrementally chunked normalizers remain
+    // comparable even when this loop crosses a wall-clock second boundary.
+    let input=b"event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_chunks\",\"created_at\":123}}\r\n\r\nevent: keepalive\r\ndata: {\"type\":\"keepalive\"}\r\n\r\nevent: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"chunk safe\"}\r\n\r\ndata: [DONE]\r\n\r\n";
     let expected = normalize_sse(input, CompatMode::Full, "gpt-5.6-sol", "chunks");
     assert!(!String::from_utf8_lossy(&expected).contains("keepalive"));
     let expected = stable_sse_bytes(&expected);

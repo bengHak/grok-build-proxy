@@ -101,56 +101,56 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
             );
         })?;
 
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(key) = event::read()? {
-                // Crossterm may emit Press/Release/Repeat; accept Press + Repeat
-                // so held j/k navigates under enhanced keyboard protocols.
-                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    continue;
-                }
-                let prev_focus = app.focus;
-                if app.handle(key, sessions_len, detail_len, failures_len) {
-                    return Ok(());
-                }
-                // After Tab into Sessions, restore selection to the pinned session.
-                if app.focus == Focus::Sessions && prev_focus != Focus::Sessions {
-                    app.restore_session_selection(&active);
-                }
-                // Sessions navigation updates the detail pin.
-                if app.focus == Focus::Sessions {
-                    app.pin_session_from_selection(&active);
-                }
-                // Report export: filtered failures → clipboard (y/Y) or file (w/W).
-                if let Some(outcome) = try_export(key.code, &snapshot, &app, address, version) {
-                    app.set_toast(outcome.toast());
-                }
-                // Pin detail overlays by identity so list churn cannot swap rows.
-                if app.mode == Mode::Detail {
-                    match app.focus {
-                        Focus::SessionDetail if app.detail_turn_key.is_none() => {
-                            let rows = SessionDetailPanel::rows(
-                                &snapshot,
-                                app.selected_session_key.as_deref(),
-                            );
-                            if let Some((_, request)) = rows.get(app.selected) {
-                                app.pin_turn_detail(request.id.clone());
-                            }
-                        }
-                        Focus::Failures if app.detail_request_id.is_none() => {
-                            let rows = FailuresPanel::ordered(&snapshot, app.failure_filter);
-                            if let Some(f) = rows.get(app.selected) {
-                                app.pin_failure_detail(f.request_id.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                // Filter cycle (`f`) may shrink the list; re-clamp with new filter length.
-                let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
-                let detail_len =
-                    SessionDetailPanel::row_count(&snapshot, app.selected_session_key.as_deref());
-                app.clamp_selection(sessions_len, detail_len, failures_len);
+        if event::poll(Duration::from_millis(250))?
+            && let Event::Key(key) = event::read()?
+        {
+            // Crossterm may emit Press/Release/Repeat; accept Press + Repeat
+            // so held j/k navigates under enhanced keyboard protocols.
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                continue;
             }
+            let prev_focus = app.focus;
+            if app.handle(key, sessions_len, detail_len, failures_len) {
+                return Ok(());
+            }
+            // After Tab into Sessions, restore selection to the pinned session.
+            if app.focus == Focus::Sessions && prev_focus != Focus::Sessions {
+                app.restore_session_selection(&active);
+            }
+            // Sessions navigation updates the detail pin.
+            if app.focus == Focus::Sessions {
+                app.pin_session_from_selection(&active);
+            }
+            // Report export: filtered failures → clipboard (y/Y) or file (w/W).
+            if let Some(outcome) = try_export(key.code, &snapshot, &app, address, version) {
+                app.set_toast(outcome.toast());
+            }
+            // Pin detail overlays by identity so list churn cannot swap rows.
+            if app.mode == Mode::Detail {
+                match app.focus {
+                    Focus::SessionDetail if app.detail_turn_key.is_none() => {
+                        let rows = SessionDetailPanel::rows(
+                            &snapshot,
+                            app.selected_session_key.as_deref(),
+                        );
+                        if let Some((_, request)) = rows.get(app.selected) {
+                            app.pin_turn_detail(request.id.clone());
+                        }
+                    }
+                    Focus::Failures if app.detail_request_id.is_none() => {
+                        let rows = FailuresPanel::ordered(&snapshot, app.failure_filter);
+                        if let Some(f) = rows.get(app.selected) {
+                            app.pin_failure_detail(f.request_id.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Filter cycle (`f`) may shrink the list; re-clamp with new filter length.
+            let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
+            let detail_len =
+                SessionDetailPanel::row_count(&snapshot, app.selected_session_key.as_deref());
+            app.clamp_selection(sessions_len, detail_len, failures_len);
         }
         tokio::task::yield_now().await;
     }
@@ -617,6 +617,7 @@ mod tests {
             requested_model: "alias".into(),
             model: "gpt-test".into(),
             status_code: 200,
+            usage: None,
             output_tokens: 40,
             error: String::new(),
             started_at: Instant::now() - Duration::from_secs(2),
@@ -747,7 +748,10 @@ mod tests {
             "metrics strip title missing on tall/wide terminal:\n{text}"
         );
         assert!(
-            text.contains("tok/s") && text.contains("fail%") && text.contains("done"),
+            text.contains("tok/s")
+                && text.contains("fail%")
+                && text.contains("done")
+                && text.contains("cache"),
             "metrics strip labels missing:\n{text}"
         );
     }
@@ -919,6 +923,10 @@ mod tests {
         assert!(
             text.contains("0ok/0f"),
             "cold-start done should be 0ok/0f:\n{text}"
+        );
+        assert!(
+            text.contains("cache") && text.contains("n/a"),
+            "cold-start cache metric should distinguish missing usage:\n{text}"
         );
         assert!(
             text.contains('·'),
