@@ -557,6 +557,7 @@ mod tests {
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            diagnostics: Default::default(),
         }
     }
 

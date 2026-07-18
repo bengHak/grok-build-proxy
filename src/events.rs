@@ -73,6 +73,17 @@ impl fmt::Display for FailureKind {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestDiagnostics {
+    pub request_body_bytes: u64,
+    pub input_item_count: u32,
+    pub proxy_prepare_ms: u64,
+    pub credential_ms: u64,
+    pub upstream_headers_ms: u64,
+    pub first_chunk_ms: u64,
+    pub request_fingerprint: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct RequestEvent {
     pub kind: RequestEventKind,
@@ -99,6 +110,7 @@ pub struct RequestEvent {
     pub attempt: u32,
     pub output_count: u32,
     pub capture_bytes: u32,
+    pub diagnostics: RequestDiagnostics,
 }
 
 pub trait Observer: Send + Sync {
@@ -141,6 +153,7 @@ impl RequestEvent {
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            diagnostics: RequestDiagnostics::default(),
         }
     }
 
