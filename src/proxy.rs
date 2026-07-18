@@ -1116,19 +1116,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         "x-grok-build-proxy-version",
         HeaderValue::from_str(&s.0.version).unwrap_or(HeaderValue::from_static("dev")),
     );
-    let response = with_request_id(response, &request_id);
-    info!(
-        request_id,
-        requested_model = transformed.requested_model,
-        model = transformed.model,
-        mapped = transformed.mapped,
-        responses_lite = transformed.lite,
-        fast = transformed.fast,
-        status = status.as_u16(),
-        duration_ms = started.elapsed().as_millis(),
-        "request complete"
-    );
-    response
+    with_request_id(response, &request_id)
 }
 /// Map a Kimi Chat Completions error body into Responses-style type/message fields.
 fn kimi_upstream_error(body: &[u8], status: StatusCode) -> (String, String) {
@@ -1322,6 +1310,7 @@ fn observe_stream_end(
         } else {
             sanitize(&format!("upstream HTTP {}", status.as_u16()))
         };
+        log_request_diagnostics(&event);
         if let Some(observer) = observer {
             observer.observe(event);
         }
@@ -1348,9 +1337,33 @@ fn observe_stream_end(
         String::new()
     };
 
+    log_request_diagnostics(&event);
     if let Some(observer) = observer {
         observer.observe(event);
     }
+}
+
+fn log_request_diagnostics(event: &RequestEvent) {
+    info!(
+        request_id = event.request_id,
+        requested_model = event.requested_model,
+        model = event.model,
+        mapped = event.mapped,
+        responses_lite = event.lite,
+        fast = event.fast,
+        status = event.status_code,
+        duration_ms = event.duration_ms,
+        request_body_bytes = event.diagnostics.request_body_bytes,
+        input_item_count = event.diagnostics.input_item_count,
+        proxy_prepare_ms = event.diagnostics.proxy_prepare_ms,
+        credential_ms = event.diagnostics.credential_ms,
+        upstream_headers_ms = event.diagnostics.upstream_headers_ms,
+        first_chunk_ms = event.diagnostics.first_chunk_ms,
+        request_fingerprint = event.diagnostics.request_fingerprint,
+        attempt = event.attempt,
+        output_count = event.output_count,
+        "request complete"
+    );
 }
 
 fn observe_failure(
@@ -1361,14 +1374,15 @@ fn observe_failure(
     message: String,
     status: StatusCode,
 ) {
+    let mut event = base.clone();
+    event.kind = RequestEventKind::Failed;
+    event.status_code = status.as_u16();
+    event.duration_ms = event.started_at.elapsed().as_millis() as u64;
+    event.failure_kind = Some(kind);
+    event.error_type = sanitize(error_type);
+    event.error = sanitize(&message);
+    log_request_diagnostics(&event);
     if let Some(observer) = &config.observer {
-        let mut event = base.clone();
-        event.kind = RequestEventKind::Failed;
-        event.status_code = status.as_u16();
-        event.duration_ms = event.started_at.elapsed().as_millis() as u64;
-        event.failure_kind = Some(kind);
-        event.error_type = sanitize(error_type);
-        event.error = sanitize(&message);
         observer.observe(event);
     }
 }
@@ -2705,6 +2719,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     fn sample_event() -> RequestEvent {
         RequestEvent {
             kind: RequestEventKind::Started,
@@ -2730,6 +2766,39 @@ mod tests {
             capture_bytes: 0,
             diagnostics: Default::default(),
         }
+    }
+
+    #[test]
+    fn request_diagnostics_log_omits_content_and_credentials() {
+        let output = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .finish();
+        let mut event = sample_event();
+        event.kind = RequestEventKind::Completed;
+        event.status_code = 200;
+        event.error = "secret prompt response secret access_token=bearer account_id=acct".into();
+        event.diagnostics = RequestDiagnostics {
+            request_body_bytes: 1234,
+            input_item_count: 9,
+            proxy_prepare_ms: 3,
+            credential_ms: 4,
+            upstream_headers_ms: 5,
+            first_chunk_ms: 8,
+            request_fingerprint: "fp-safe".into(),
+        };
+
+        tracing::subscriber::with_default(subscriber, || log_request_diagnostics(&event));
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+
+        assert!(text.contains("request_body_bytes=1234"));
+        assert!(text.contains("request_fingerprint=\"fp-safe\""));
+        assert!(!text.contains("secret prompt"));
+        assert!(!text.contains("response secret"));
+        assert!(!text.contains("access_token"));
+        assert!(!text.contains("account_id"));
     }
 
     #[test]

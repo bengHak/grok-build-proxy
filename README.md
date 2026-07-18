@@ -203,8 +203,10 @@ terminal is too short to keep the body panels usable.
 - Path: `~/.grok/proxy-reports/failure-YYYYMMDD-HHMMSS.md` (or `.json` with
   `W`; `Y` copies JSON to the clipboard). The directory is created with mode
   `0700` and files with `0600`.
-- Contents: selected `FailureRecord` metadata only; diagnostic error messages,
-  prompts, response bodies, and credentials are omitted. See
+- Contents: selected `FailureRecord` metadata only, including request size,
+  input-item count, latency phases, process-local fingerprint, and estimated
+  retry-candidate flag. Diagnostic error messages, prompts, response bodies,
+  and credentials are omitted. See
   [`SECURITY.md`](SECURITY.md).
 
 **Failure kinds** (filter groups in parentheses)
@@ -223,6 +225,11 @@ terminal is too short to keep the body panels usable.
 Same-session failures within 30s are grouped in the failures panel with an
 **estimated** retry label (heuristic, not a confirmed Grok turn id).
 
+Turn and failure details also show `retry_candidate`. It is set only when two
+different request IDs in the same session have the same non-empty fingerprint
+within 30 seconds and at least one result failed or had no output. The flag is
+diagnostic evidence, not proof of a client retry.
+
 Use plain logs for scripts, background services, or troubleshooting:
 
 ```sh
@@ -230,6 +237,10 @@ grok-build-proxy serve --no-monitor
 ```
 
 Non-interactive output automatically keeps the existing plain-log behavior.
+Completed-request logs include `request_body_bytes`, `input_item_count`,
+`proxy_prepare_ms`, `credential_ms`, `upstream_headers_ms`, `first_chunk_ms`,
+and `request_fingerprint`. The fingerprint is randomized per proxy process and
+cannot be compared across restarts. No request or response content is logged.
 
 ## Model configuration management
 
@@ -327,6 +338,13 @@ prompt-cache key as session affinity.
 When terminal usage is available, plain logs include `input_tokens`,
 `cached_input_tokens`, `cache_write_tokens`, `fresh_input_tokens`, and
 `cache_read_percent`. These metrics do not include prompt or response content.
+
+`proxy_prepare_ms` covers body collection and request transformation before
+credential loading. `credential_ms` combines credential lock wait, file read,
+and refresh time. `upstream_headers_ms` covers upstream send through response
+headers and is cumulative across an auth retry. `first_chunk_ms` covers the
+final upstream attempt through its first body chunk; zero means no measurable
+chunk delay was recorded.
 
 ## Responses Lite, Plan, and Goal compatibility
 

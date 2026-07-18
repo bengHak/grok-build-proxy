@@ -113,6 +113,14 @@ fn format_failure_md(index: usize, r: &FailureRecord) -> String {
          - mapped: {}  lite: {}  fast: {}\n\
          - outputs: {}\n\
          - capture_bytes: {}\n\
+         - request_body_bytes: {}\n\
+         - input_item_count: {}\n\
+         - proxy_prepare_ms: {}\n\
+         - credential_ms: {}\n\
+         - upstream_headers_ms: {}\n\
+         - first_chunk_ms: {}\n\
+         - request_fingerprint: {}\n\
+         - retry_candidate: {}\n\
          - error_type: {}\n",
         r.ts.to_rfc3339(),
         r.request_id,
@@ -131,6 +139,14 @@ fn format_failure_md(index: usize, r: &FailureRecord) -> String {
         r.fast,
         r.output_count,
         r.capture_bytes,
+        r.diagnostics.request_body_bytes,
+        r.diagnostics.input_item_count,
+        r.diagnostics.proxy_prepare_ms,
+        r.diagnostics.credential_ms,
+        r.diagnostics.upstream_headers_ms,
+        r.diagnostics.first_chunk_ms,
+        r.diagnostics.request_fingerprint,
+        r.retry_candidate,
         etype,
     )
 }
@@ -177,6 +193,14 @@ fn failure_to_json(r: &FailureRecord) -> Value {
         "attempt": r.attempt,
         "output_count": r.output_count,
         "capture_bytes": r.capture_bytes,
+        "request_body_bytes": r.diagnostics.request_body_bytes,
+        "input_item_count": r.diagnostics.input_item_count,
+        "proxy_prepare_ms": r.diagnostics.proxy_prepare_ms,
+        "credential_ms": r.diagnostics.credential_ms,
+        "upstream_headers_ms": r.diagnostics.upstream_headers_ms,
+        "first_chunk_ms": r.diagnostics.first_chunk_ms,
+        "request_fingerprint": r.diagnostics.request_fingerprint,
+        "retry_candidate": r.retry_candidate,
         "session_failure_index": r.session_failure_index,
     })
 }
@@ -406,8 +430,16 @@ mod tests {
             output_count: 2,
             capture_bytes: 4096,
             session_failure_index: 1,
-            diagnostics: Default::default(),
-            retry_candidate: false,
+            diagnostics: crate::events::RequestDiagnostics {
+                request_body_bytes: 1234,
+                input_item_count: 9,
+                proxy_prepare_ms: 3,
+                credential_ms: 4,
+                upstream_headers_ms: 5,
+                first_chunk_ms: 8,
+                request_fingerprint: "fp-safe".into(),
+            },
+            retry_candidate: true,
         }
     }
 
@@ -443,6 +475,14 @@ mod tests {
         assert!(md.contains("duration_ms: 1823"));
         assert!(md.contains("auth_retried: false"));
         assert!(md.contains("capture_bytes: 4096"));
+        assert!(md.contains("request_body_bytes: 1234"));
+        assert!(md.contains("input_item_count: 9"));
+        assert!(md.contains("proxy_prepare_ms: 3"));
+        assert!(md.contains("credential_ms: 4"));
+        assert!(md.contains("upstream_headers_ms: 5"));
+        assert!(md.contains("first_chunk_ms: 8"));
+        assert!(md.contains("request_fingerprint: fp-safe"));
+        assert!(md.contains("retry_candidate: true"));
         assert!(md.contains("(no error message, prompt, or response body included)"));
         // The stored diagnostic may contain upstream-echoed secrets; reports must omit it.
         assert!(!md.contains("could not assemble"));
@@ -465,6 +505,14 @@ mod tests {
         assert_eq!(v["meta"]["summary"]["AuthRetryFailed"], 1);
         assert_eq!(v["failures"][0]["kind"], "AuthRetryFailed");
         assert_eq!(v["failures"][0]["request_id"], "r");
+        assert_eq!(v["failures"][0]["request_body_bytes"], 1234);
+        assert_eq!(v["failures"][0]["input_item_count"], 9);
+        assert_eq!(v["failures"][0]["proxy_prepare_ms"], 3);
+        assert_eq!(v["failures"][0]["credential_ms"], 4);
+        assert_eq!(v["failures"][0]["upstream_headers_ms"], 5);
+        assert_eq!(v["failures"][0]["first_chunk_ms"], 8);
+        assert_eq!(v["failures"][0]["request_fingerprint"], "fp-safe");
+        assert_eq!(v["failures"][0]["retry_candidate"], true);
         assert!(v["failures"][0].get("error_message").is_none());
         let text = s.to_lowercase();
         assert!(!text.contains("access_token"));
