@@ -178,12 +178,13 @@ Non-interactive output automatically keeps the existing plain-log behavior.
 ## Model configuration management
 
 ```sh
-# Show configured proxy models or all available Codex targets.
+# Show configured proxy models or all available Codex and Kimi targets.
 grok-build-proxy models list
 grok-build-proxy models list --available
 
 # Add, update, switch service tier, and remove one model.
 grok-build-proxy models add codex-sol --model gpt-5.6-sol
+grok-build-proxy models add kimi-kimi-for-coding --model kimi-for-coding
 grok-build-proxy models update codex-sol --model gpt-5.6-terra
 grok-build-proxy models update codex-sol --fast
 grok-build-proxy models update codex-sol --no-fast
@@ -414,8 +415,11 @@ sources, self-maps, and cycles are rejected before the server starts.
 | Grok config (doctor) | `--grok-config`, `GROK_BUILD_PROXY_GROK_CONFIG` | `~/.grok/config.toml` |
 | Doctor timeout | `--timeout` | 5 seconds |
 
-`doctor` also accepts `--auth-file`, `--listen`, `--model-map`, and
-`--client-token`, with the same environment variables shown in the Serve table.
+`doctor` also accepts `--auth-file`, `--kimi-auth-file`, `--listen`,
+`--model-map`, and `--client-token`, with the same environment variables shown
+in the Serve table. Codex-specific checks become warnings when secure Kimi
+credentials are available, and vice versa; insecure credential files remain
+blocking.
 Run `grok-build-proxy serve --help`, `auth <command> --help`, `kimi auth
 <command> --help`, or `doctor --help` for the complete command-specific options.
 

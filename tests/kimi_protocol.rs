@@ -171,6 +171,20 @@ fn kimi_stream_translation_is_invariant_to_network_chunk_boundaries() {
 }
 
 #[test]
+fn kimi_stream_parses_mixed_crlf_and_lf_frames_in_wire_order() {
+    let upstream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"mixed\"}}]}\r\n\r\n",
+        "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let parsed = events(&translate_stream(upstream.as_bytes(), upstream.len()));
+    assert!(parsed.iter().any(|event| {
+        event["type"] == "response.output_text.delta" && event["delta"] == "mixed"
+    }));
+    assert_eq!(parsed.last().unwrap()["type"], "response.completed");
+}
+
+#[test]
 fn kimi_stream_fails_closed_on_truncated_or_invalid_tool_calls() {
     for upstream in [
         "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n",
@@ -211,6 +225,12 @@ fn kimi_stream_rejects_malformed_frames_and_reports_length_as_incomplete() {
                 .iter()
                 .any(|event| event["type"] == "response.completed")
         );
+        if terminal == "response.incomplete" {
+            assert_eq!(
+                parsed.last().unwrap()["response"]["output"][0]["content"][0]["text"],
+                "partial"
+            );
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 use crate::catalog::{Catalog, normalize_id, supports_fast};
+use crate::provider::Provider;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -358,16 +359,25 @@ pub fn model_spec(
         bail!("model `{base_model}` does not support the fast priority tier")
     }
     let (model, _) = catalog.lookup(&base_model);
+    let provider_name = match model.provider {
+        Provider::Codex => "Codex",
+        Provider::Kimi => "Kimi",
+    };
     let name = custom_name.map(str::to_owned).unwrap_or_else(|| {
-        format!(
-            "Codex {}{}",
-            model.display_name,
-            if fast { " (Fast)" } else { "" }
-        )
+        let display_name = if model.display_name.starts_with(provider_name) {
+            model.display_name.clone()
+        } else {
+            format!("{provider_name} {}", model.display_name)
+        };
+        format!("{display_name}{}", if fast { " (Fast)" } else { "" })
     });
     let description = format!(
-        "{} via ChatGPT Codex{}",
+        "{} via {}{}",
         model.description.trim_end_matches('.'),
+        match model.provider {
+            Provider::Codex => "ChatGPT Codex",
+            Provider::Kimi => "Kimi Coding API",
+        },
         if fast { " priority tier" } else { "" }
     );
     let effective_model = if fast {
@@ -764,6 +774,7 @@ fn canonical_alias(model: &str) -> String {
         "gpt-5.6-sol" => "codex-sol".into(),
         "gpt-5.6-terra" => "codex-terra".into(),
         "gpt-5.6-luna" => "codex-luna".into(),
+        "kimi-for-coding" => "kimi-kimi-for-coding".into(),
         _ => format!("codex-{}", model.replace(['.', '_', '/'], "-")),
     }
 }
@@ -920,6 +931,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn kimi_model_specs_use_kimi_metadata_and_aliases() {
+        let catalog = Catalog::default();
+        let spec = model_spec(
+            &catalog,
+            "kimi",
+            "kimi-for-coding",
+            false,
+            "127.0.0.1:18765",
+            "",
+            None,
+        )
+        .unwrap();
+        assert_eq!(spec.name, "Kimi K2.6");
+        assert!(spec.description.contains("via Kimi Coding API"));
+
+        let (specs, _) = sync_specs(&catalog, "127.0.0.1:18765", "", false).unwrap();
+        assert!(specs.iter().any(|spec| {
+            spec.alias == "kimi-kimi-for-coding"
+                && spec.effective_model == "kimi-for-coding"
+                && spec.name == "Kimi K2.6"
+        }));
     }
 
     #[tokio::test]

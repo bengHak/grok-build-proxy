@@ -92,7 +92,7 @@ impl Translator {
     fn incomplete(&mut self) -> Vec<u8> {
         let mut output = self.start();
         self.terminal = true;
-        let mut response = self.response("incomplete", Vec::new());
+        let mut response = self.response("incomplete", self.snapshot_outputs("incomplete"));
         response.as_object_mut().unwrap().insert(
             "incomplete_details".into(),
             json!({"reason":"max_output_tokens"}),
@@ -101,6 +101,32 @@ impl Translator {
         output.extend(self.event("response.incomplete", json!({"response":response})));
         output.extend_from_slice(b"data: [DONE]\n\n");
         output
+    }
+
+    fn snapshot_outputs(&self, status: &str) -> Vec<Value> {
+        self.outputs
+            .values()
+            .map(|output| match output {
+                Output::Reasoning { id, text } => json!({
+                    "id":id,"type":"reasoning","status":status,
+                    "summary":[{"type":"summary_text","text":text}]
+                }),
+                Output::Message { id, text } => json!({
+                    "id":id,"type":"message","status":status,"role":"assistant",
+                    "content":[{"type":"output_text","text":text,"annotations":[]}]
+                }),
+                Output::Tool {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                    ..
+                } => json!({
+                    "id":id,"type":"function_call","status":status,
+                    "call_id":call_id,"name":name,"arguments":arguments
+                }),
+            })
+            .collect()
     }
 
     pub(super) fn fail(&mut self, error: &Value) -> Vec<u8> {

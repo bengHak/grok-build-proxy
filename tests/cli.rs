@@ -220,6 +220,8 @@ fn model_sync_preview_and_fast_selection_are_safe() {
     let text = fs::read_to_string(&config).unwrap();
     assert!(text.contains("[model.codex-sol-fast]"));
     assert!(text.contains("model = \"gpt-5.6-sol-fast\""));
+    assert!(text.contains("[model.kimi-kimi-for-coding]"));
+    assert!(text.contains("name = \"Kimi K2.6\""));
 
     let available = binary()
         .args([

@@ -68,6 +68,7 @@ pub struct Store {
     path: PathBuf,
     oauth_host: String,
     client: reqwest::Client,
+    upstream_client: reqwest::Client,
     lock: Arc<Mutex<()>>,
     device_id: Arc<OnceCell<String>>,
 }
@@ -90,6 +91,11 @@ impl Store {
                 .timeout(std::time::Duration::from_secs(30))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            upstream_client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(20)
+                .build()?,
             lock: Arc::new(Mutex::new(())),
             device_id: Arc::new(OnceCell::new()),
         })
@@ -100,7 +106,7 @@ impl Store {
     }
 
     pub(super) fn http_client(&self) -> &reqwest::Client {
-        &self.client
+        &self.upstream_client
     }
 
     pub async fn inspect(&self) -> Result<AuthStatus> {

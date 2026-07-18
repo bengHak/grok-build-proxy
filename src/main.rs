@@ -106,6 +106,8 @@ struct DoctorArgs {
     codex_home: Option<PathBuf>,
     #[arg(long, env = "GROK_BUILD_PROXY_AUTH_FILE")]
     auth_file: Option<PathBuf>,
+    #[arg(long, env = "GROK_BUILD_PROXY_KIMI_AUTH_FILE")]
+    kimi_auth_file: Option<PathBuf>,
     #[arg(long, env = "GROK_BUILD_PROXY_GROK_CONFIG")]
     grok_config: Option<PathBuf>,
     #[arg(long, env = "GROK_BUILD_PROXY_CODEX_BINARY", default_value = "codex")]
@@ -464,9 +466,13 @@ async fn doctor_command(a: DoctorArgs) -> Result<()> {
     let auth = a
         .auth_file
         .unwrap_or_else(|| codex_home_path.join("auth.json"));
+    let kimi_auth = a
+        .kimi_auth_file
+        .unwrap_or(home()?.join(".grok-build-proxy/kimi/auth.json"));
     let config = a.grok_config.unwrap_or(home()?.join(".grok/config.toml"));
     let checks = doctor::run_full(
         &auth,
+        Some(&kimi_auth),
         &config,
         &codex_home_path,
         &a.listen,

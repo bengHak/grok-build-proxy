@@ -1,4 +1,10 @@
-use crate::{auth::Store, codexcli, grokconfig::GrokConfig, modelmap::ModelMap};
+use crate::{
+    auth::Store,
+    codexcli,
+    grokconfig::GrokConfig,
+    modelmap::ModelMap,
+    provider::kimi::auth::{DEFAULT_OAUTH_HOST as DEFAULT_KIMI_OAUTH_HOST, Store as KimiStore},
+};
 use anyhow::Result;
 use serde_json::Value;
 use std::{net::SocketAddr, path::Path, time::Duration};
@@ -40,6 +46,7 @@ impl Check {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_full(
     auth_file: &Path,
+    kimi_auth_file: Option<&Path>,
     grok_config: &Path,
     codex_home: &Path,
     listen: &str,
@@ -106,6 +113,7 @@ pub async fn run_full(
         )),
     }
 
+    let mut codex_ready = false;
     match Store::new(auth_file, crate::auth::DEFAULT_REFRESH_URL) {
         Ok(store) => match store.inspect().await {
             Ok(status) => {
@@ -114,6 +122,7 @@ pub async fn run_full(
                 #[cfg(not(unix))]
                 let secure = true;
                 if secure {
+                    codex_ready = true;
                     checks.push(Check::pass(
                         "ChatGPT auth",
                         format!("{} ({})", status.path.display(), status.auth_mode),
@@ -134,6 +143,54 @@ pub async fn run_full(
             Err(error) => checks.push(Check::fail("ChatGPT auth", error.to_string())),
         },
         Err(error) => checks.push(Check::fail("ChatGPT auth", error.to_string())),
+    }
+
+    let mut kimi_ready = false;
+    if let Some(path) = kimi_auth_file {
+        match KimiStore::new(path, DEFAULT_KIMI_OAUTH_HOST) {
+            Ok(store) => match store.inspect().await {
+                Ok(status) => {
+                    #[cfg(unix)]
+                    let secure = status.file_mode & 0o077 == 0;
+                    #[cfg(not(unix))]
+                    let secure = true;
+                    if secure {
+                        kimi_ready = true;
+                        checks.push(Check::pass("Kimi auth", status.path.display().to_string()));
+                    } else {
+                        checks.push(Check::fail(
+                            "Kimi auth",
+                            "credential file is group/world accessible",
+                        ));
+                    }
+                }
+                Err(error) => checks.push(Check::fail("Kimi auth", error.to_string())),
+            },
+            Err(error) => checks.push(Check::fail("Kimi auth", error.to_string())),
+        }
+    }
+
+    if kimi_ready {
+        for check in &mut checks {
+            if !check.ok
+                && !check.detail.contains("group/world")
+                && matches!(
+                    check.name,
+                    "Codex CLI" | "Codex credential configuration" | "ChatGPT auth"
+                )
+            {
+                check.ok = true;
+                check.warning = true;
+            }
+        }
+    }
+    if codex_ready {
+        for check in &mut checks {
+            if !check.ok && check.name == "Kimi auth" && !check.detail.contains("group/world") {
+                check.ok = true;
+                check.warning = true;
+            }
+        }
     }
 
     match GrokConfig::load(grok_config) {
@@ -219,6 +276,7 @@ pub async fn run_full(
 pub async fn run(auth_file: &Path, grok_config: &Path, codex_home: &Path) -> Vec<Check> {
     run_full(
         auth_file,
+        None,
         grok_config,
         codex_home,
         "127.0.0.1:18765",
@@ -262,5 +320,54 @@ mod tests {
                 .iter()
                 .any(|check| check.detail.contains("access_token"))
         );
+    }
+
+    #[tokio::test]
+    async fn kimi_credentials_make_missing_codex_setup_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        let kimi_auth = directory.path().join("kimi-auth.json");
+        tokio::fs::write(
+            &kimi_auth,
+            br#"{"access":"token","refresh":"refresh","expires":4102444800000}"#,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&kimi_auth, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+
+        let checks = run_full(
+            &directory.path().join("missing-codex-auth.json"),
+            Some(&kimi_auth),
+            directory.path(),
+            &directory.path().join("missing-grok.toml"),
+            "127.0.0.1:0",
+            "",
+            "missing-codex",
+            "missing-grok",
+            "",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.name == "Kimi auth" && check.ok)
+        );
+        for name in [
+            "Codex CLI",
+            "Codex credential configuration",
+            "ChatGPT auth",
+        ] {
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| { check.name == name && check.ok && check.warning })
+            );
+        }
     }
 }

@@ -77,18 +77,37 @@ impl Store {
         if current.refresh.trim().is_empty() {
             bail!("Kimi credentials cannot be refreshed; run `grok-build-proxy kimi auth login`")
         }
-        let response = self
-            .client
-            .post(format!("{}/api/oauth/token", self.oauth_host))
-            .headers(self.headers().await?)
-            .form(&[
-                ("client_id", CLIENT_ID),
-                ("grant_type", "refresh_token"),
-                ("refresh_token", current.refresh.as_str()),
-            ])
-            .send()
-            .await
-            .context("refresh Kimi access token")?;
+        let mut attempt = 0;
+        let response = loop {
+            attempt += 1;
+            let result = self
+                .client
+                .post(format!("{}/api/oauth/token", self.oauth_host))
+                .headers(self.headers().await?)
+                .form(&[
+                    ("client_id", CLIENT_ID),
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", current.refresh.as_str()),
+                ])
+                .send()
+                .await;
+            match result {
+                Ok(response)
+                    if attempt < 3
+                        && (response.status().is_server_error()
+                            || response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(250 << (attempt - 1)))
+                        .await;
+                }
+                Ok(response) => break response,
+                Err(_) if attempt < 3 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250 << (attempt - 1)))
+                        .await;
+                }
+                Err(error) => return Err(error).context("refresh Kimi access token"),
+            }
+        };
         let status = response.status();
         if !status.is_success() {
             bail!(
