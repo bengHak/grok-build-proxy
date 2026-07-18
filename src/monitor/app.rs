@@ -1,7 +1,7 @@
 //! View state: mode, panel focus, selection, failure filter, session pin.
 
 use crate::events::FailureKind;
-use crate::store::{Session, Snapshot};
+use crate::store::Session;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -177,11 +177,11 @@ impl App {
 
     /// Restore Sessions `selected` to the pinned session when tabbing back.
     pub fn restore_session_selection(&mut self, active: &[&Session]) {
-        if let Some(id) = &self.selected_session_id {
-            if let Some(i) = active.iter().position(|s| s.id == *id) {
-                self.selected = i;
-                return;
-            }
+        if let Some(id) = &self.selected_session_id
+            && let Some(i) = active.iter().position(|s| s.id == *id)
+        {
+            self.selected = i;
+            return;
         }
         self.selected = 0;
         self.pin_session_from_selection(active);
@@ -317,13 +317,6 @@ impl App {
         }
         self.clamp_selection(sessions_len, detail_len, failures_len);
         false
-    }
-
-    /// Convenience: pin from snapshot's active sessions (for tests).
-    #[cfg(test)]
-    pub fn sync_from_snapshot(&mut self, snapshot: &Snapshot) {
-        let ids: Vec<&Session> = snapshot.sessions.iter().filter(|s| s.active > 0).collect();
-        self.sync_selected_session(&ids);
     }
 }
 

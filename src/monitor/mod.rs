@@ -72,7 +72,7 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
     loop {
         let snapshot = dashboard.snapshot();
         let active = active_sessions(&snapshot);
-        let sessions_len = active.len();
+        let sessions_len = SessionsPanel::row_count(&snapshot);
         let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
         app.tick_toast();
         app.sync_selected_session(&active);
