@@ -77,7 +77,7 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
         app.tick_toast();
         app.sync_selected_session(&active);
         let detail_len =
-            SessionDetailPanel::row_count(&snapshot, app.selected_session_id.as_deref());
+            SessionDetailPanel::row_count(&snapshot, app.selected_session_key.as_deref());
         app.clamp_selection(sessions_len, detail_len, failures_len);
 
         // 1 Hz fleet-average tok/s sample for the metrics sparkline.
@@ -121,21 +121,31 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
                 if let Some(outcome) = try_export(key.code, &snapshot, &app, address, version) {
                     app.set_toast(outcome.toast());
                 }
-                // After Enter on Failures, pin stable request_id so live push_front
-                // does not swap the overlay to a different row.
-                if app.mode == Mode::Detail
-                    && app.focus == Focus::Failures
-                    && app.detail_request_id.is_none()
-                {
-                    let rows = FailuresPanel::ordered(&snapshot, app.failure_filter);
-                    if let Some(f) = rows.get(app.selected) {
-                        app.pin_failure_detail(f.request_id.clone());
+                // Pin detail overlays by identity so list churn cannot swap rows.
+                if app.mode == Mode::Detail {
+                    match app.focus {
+                        Focus::SessionDetail if app.detail_turn_key.is_none() => {
+                            let rows = SessionDetailPanel::rows(
+                                &snapshot,
+                                app.selected_session_key.as_deref(),
+                            );
+                            if let Some((_, request)) = rows.get(app.selected) {
+                                app.pin_turn_detail(request.id.clone());
+                            }
+                        }
+                        Focus::Failures if app.detail_request_id.is_none() => {
+                            let rows = FailuresPanel::ordered(&snapshot, app.failure_filter);
+                            if let Some(f) = rows.get(app.selected) {
+                                app.pin_failure_detail(f.request_id.clone());
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 // Filter cycle (`f`) may shrink the list; re-clamp with new filter length.
                 let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
                 let detail_len =
-                    SessionDetailPanel::row_count(&snapshot, app.selected_session_id.as_deref());
+                    SessionDetailPanel::row_count(&snapshot, app.selected_session_key.as_deref());
                 app.clamp_selection(sessions_len, detail_len, failures_len);
             }
         }
@@ -275,7 +285,7 @@ fn draw(
 
         SessionDetailPanel {
             snapshot,
-            session_id: app.selected_session_id.as_deref(),
+            session_id: app.selected_session_key.as_deref(),
             selected: app.selected,
             focused: app.focus == Focus::SessionDetail && app.mode == Mode::Dashboard,
             theme,
@@ -324,7 +334,7 @@ fn draw_focused_panel(
         .render(area, buf),
         Focus::SessionDetail => SessionDetailPanel {
             snapshot,
-            session_id: app.selected_session_id.as_deref(),
+            session_id: app.selected_session_key.as_deref(),
             selected: app.selected,
             focused: dash,
             theme,
@@ -395,36 +405,62 @@ fn detail_text(snapshot: &Snapshot, app: &App) -> String {
                 "No session selected".into()
             }
         }
-        Focus::SessionDetail => {
-            let rows = SessionDetailPanel::rows(snapshot, app.selected_session_id.as_deref());
-            if let Some((kind, r)) = rows.get(app.selected) {
-                let kind_label = match kind {
-                    TurnKind::Active => "active",
-                    TurnKind::Recent => "recent",
-                };
-                let err = if r.error.is_empty() {
-                    r.error_type.as_str()
-                } else {
-                    r.error.as_str()
-                };
-                let fk = r.failure_kind.map(|k| k.as_str()).unwrap_or("-");
-                format!(
-                    "Turn {} ({kind_label})\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration: {:.1}s  tokens: {}\n  failure: {fk}\n  error: {err}",
-                    r.id,
-                    r.session_id,
-                    r.model,
-                    r.requested_model,
-                    r.status,
-                    r.attempt,
-                    r.duration().as_secs_f64(),
-                    r.output_tokens,
-                )
-            } else {
-                "No turn selected".into()
-            }
-        }
+        Focus::SessionDetail => turn_detail_text(snapshot, app),
         Focus::Failures => failure_detail_text(snapshot, app),
     }
+}
+
+fn turn_detail_text(snapshot: &Snapshot, app: &App) -> String {
+    let rows = SessionDetailPanel::rows(snapshot, app.selected_session_key.as_deref());
+    let pinned;
+    let row = if let Some(key) = app.detail_turn_key.as_ref() {
+        pinned = snapshot
+            .active
+            .iter()
+            .find(|request| &request.id == key)
+            .map(|request| (TurnKind::Active, request))
+            .or_else(|| {
+                snapshot
+                    .recent
+                    .iter()
+                    .find(|request| &request.id == key)
+                    .map(|request| (TurnKind::Recent, request))
+            });
+        match pinned.as_ref() {
+            Some(row) => row,
+            None => return "Turn no longer in history".into(),
+        }
+    } else {
+        match rows.get(app.selected) {
+            Some(row) => row,
+            None => return "No turn selected".into(),
+        }
+    };
+    let (kind, request) = row;
+    let kind_label = match kind {
+        TurnKind::Active => "active",
+        TurnKind::Recent => "recent",
+    };
+    let error = if request.error.is_empty() {
+        request.error_type.as_str()
+    } else {
+        request.error.as_str()
+    };
+    let failure = request
+        .failure_kind
+        .map(|kind| kind.as_str())
+        .unwrap_or("-");
+    format!(
+        "Turn {} ({kind_label})\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration: {:.1}s  tokens: {}\n  failure: {failure}\n  error: {error}",
+        request.id,
+        request.session_id,
+        request.model,
+        request.requested_model,
+        request.status,
+        request.attempt,
+        request.duration().as_secs_f64(),
+        request.output_tokens,
+    )
 }
 
 fn failure_detail_text(snapshot: &Snapshot, app: &App) -> String {
@@ -691,7 +727,7 @@ mod tests {
         app.handle(
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             active.len(),
-            SessionDetailPanel::row_count(&snap, app.selected_session_id.as_deref()),
+            SessionDetailPanel::row_count(&snap, app.selected_session_key.as_deref()),
             FailuresPanel::row_count(&snap, app.failure_filter),
         );
         assert_eq!(app.focus, Focus::SessionDetail);
@@ -843,6 +879,30 @@ mod tests {
             !text.contains("UpstreamHttp"),
             "UpstreamHttp should be filtered out of list:\n{text}"
         );
+    }
+
+    #[test]
+    fn turn_detail_uses_pinned_request_identity() {
+        let dashboard = Dashboard::new();
+        let mut first = base_event(RequestEventKind::Started);
+        first.request_id = "turn-a".into();
+        dashboard.observe(first);
+        let mut second = base_event(RequestEventKind::Started);
+        second.request_id = "turn-b".into();
+        dashboard.observe(second);
+
+        let mut app = App::new();
+        app.focus = Focus::SessionDetail;
+        app.selected_session_key = Some("sess-abc".into());
+        app.selected = 1;
+        app.pin_turn_detail("turn-b");
+        assert!(turn_detail_text(&dashboard.snapshot(), &app).starts_with("Turn turn-b"));
+
+        let mut completed = base_event(RequestEventKind::Completed);
+        completed.request_id = "turn-a".into();
+        dashboard.observe(completed);
+        app.selected = 0;
+        assert!(turn_detail_text(&dashboard.snapshot(), &app).starts_with("Turn turn-b"));
     }
 
     #[test]

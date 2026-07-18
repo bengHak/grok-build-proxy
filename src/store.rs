@@ -1,6 +1,6 @@
 //! Structured monitor store: sessions, active/recent turns, failure ring, metrics samples.
 
-use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind, sanitize};
+use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind, sanitize, sanitize_id};
 use chrono::{DateTime, Utc};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -152,6 +152,13 @@ fn failure_cap_from_env() -> usize {
         .unwrap_or(DEFAULT_FAILURE_CAP)
 }
 
+fn push_rolling(samples: &mut VecDeque<f64>, value: f64) {
+    if samples.len() == METRICS_CAP {
+        samples.pop_front();
+    }
+    samples.push_back(value);
+}
+
 #[derive(Clone, Default)]
 pub struct Dashboard {
     inner: Arc<Mutex<State>>,
@@ -202,8 +209,7 @@ impl Dashboard {
         } else {
             0.0
         };
-        state.metrics_tok_s.push_back(v);
-        state.metrics_tok_s.truncate(METRICS_CAP);
+        push_rolling(&mut state.metrics_tok_s, v);
     }
 
     /// Failures for later report export (newest first). Optional kind filter.
@@ -219,8 +225,8 @@ impl Dashboard {
 
     fn apply(&self, event: RequestEvent) {
         let mut state = lock_state(&self.inner);
-        let request_id = sanitize(&event.request_id);
-        let session_id = sanitize(&event.session_id);
+        let request_id = sanitize_id(&event.request_id);
+        let session_id = sanitize_id(&event.session_id);
         match event.kind {
             RequestEventKind::Started => {
                 if state.completed.contains(&event.request_id) {
@@ -369,14 +375,12 @@ impl Dashboard {
                 }
 
                 // Rolling outcome samples for fail%/done sparklines (tok/s is 1 Hz fleet avg).
-                state
-                    .metrics_completed
-                    .push_back(if failed { 0.0 } else { 1.0 });
-                state.metrics_completed.truncate(METRICS_CAP);
+                push_rolling(&mut state.metrics_completed, if failed { 0.0 } else { 1.0 });
 
+                let session_key = event.session_id;
                 let session = state
                     .sessions
-                    .entry(event.session_id)
+                    .entry(session_key.clone())
                     .or_insert_with(|| Session {
                         id: session_id,
                         ..Default::default()
@@ -544,13 +548,53 @@ mod tests {
     }
 
     #[test]
-    fn push_tok_s_sample_fills_ring() {
+    fn push_tok_s_sample_rolls_forward_at_capacity() {
         let d = Dashboard::new();
-        assert!(d.snapshot().metrics_tok_s.is_empty());
-        d.push_tok_s_sample(12.5);
-        d.push_tok_s_sample(-1.0); // clamped to 0
-        let s = d.snapshot();
-        assert_eq!(s.metrics_tok_s, vec![12.5, 0.0]);
+        for i in 0..=METRICS_CAP {
+            d.push_tok_s_sample(i as f64);
+        }
+        let samples = d.snapshot().metrics_tok_s;
+        assert_eq!(samples.len(), METRICS_CAP);
+        assert_eq!(samples.first(), Some(&1.0));
+        assert_eq!(samples.last(), Some(&(METRICS_CAP as f64)));
+    }
+
+    #[test]
+    fn completion_metrics_roll_forward_at_capacity() {
+        let d = Dashboard::new();
+        for i in 0..=METRICS_CAP {
+            let mut start = base_event(RequestEventKind::Started);
+            start.request_id = format!("metric-{i}");
+            d.observe(start);
+            let mut done = base_event(if i == METRICS_CAP {
+                RequestEventKind::Failed
+            } else {
+                RequestEventKind::Completed
+            });
+            done.request_id = format!("metric-{i}");
+            d.observe(done);
+        }
+        let samples = d.snapshot().metrics_completed;
+        assert_eq!(samples.len(), METRICS_CAP);
+        assert_eq!(samples.first(), Some(&1.0));
+        assert_eq!(samples.last(), Some(&0.0));
+    }
+
+    #[test]
+    fn full_session_keys_do_not_collide_after_display_truncation() {
+        let d = Dashboard::new();
+        let prefix = "x".repeat(256);
+        for suffix in ["a", "b"] {
+            let mut start = base_event(RequestEventKind::Started);
+            start.request_id = format!("req-{suffix}");
+            start.session_id = format!("{prefix}{suffix}");
+            d.observe(start);
+        }
+        let snapshot = d.snapshot();
+        assert_eq!(snapshot.sessions.len(), 2);
+        assert_eq!(snapshot.active.len(), 2);
+        assert_ne!(snapshot.sessions[0].id, snapshot.sessions[1].id);
+        assert_ne!(snapshot.active[0].session_id, snapshot.active[1].session_id);
     }
 
     #[test]

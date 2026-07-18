@@ -121,6 +121,19 @@ impl RequestEvent {
     }
 }
 
+/// Preserve an identifier losslessly while making control characters safe to display.
+pub fn sanitize_id(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Sanitize monitor-facing strings: strip control chars, cap length.
 pub fn sanitize(value: &str) -> String {
     let original_len = value.chars().count();
@@ -563,6 +576,16 @@ data: {"type":"response.incomplete","response":{"id":"resp_inc","error":{"type":
         assert_eq!(fk, Some(FailureKind::StreamIo));
         assert_eq!(et, "stream_io");
         assert!(msg.contains("connection reset"));
+    }
+
+    #[test]
+    fn sanitize_id_is_lossless_and_control_safe() {
+        let newline = sanitize_id("session\n");
+        let literal = sanitize_id("session\\n");
+        assert_eq!(newline, "session\\n");
+        assert_eq!(literal, "session\\\\n");
+        assert_ne!(newline, literal);
+        assert!(!newline.contains('\n'));
     }
 
     #[test]

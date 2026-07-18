@@ -81,8 +81,10 @@ pub struct App {
     pub focus: Focus,
     pub selected: usize,
     pub failure_filter: FailureFilter,
-    /// Pinned session for the session-detail panel (stable across list churn).
-    pub selected_session_id: Option<String>,
+    /// Pinned session key for the session-detail panel (stable across list churn).
+    pub selected_session_key: Option<String>,
+    /// Stable identity for a turn detail overlay.
+    pub detail_turn_key: Option<String>,
     /// Stable identity for Failure detail overlay (avoids index shift on push_front).
     pub detail_request_id: Option<String>,
     /// Wall-clock start of the monitor loop (for uptime).
@@ -133,58 +135,60 @@ impl App {
         }
     }
 
-    /// Keep `selected_session_id` aligned with the active-session list.
-    ///
-    /// When focus is Sessions, pin follows `selected`. Otherwise, if the pin
-    /// left the active set, re-pin to the clamped index or clear.
+    /// Keep the selected active session stable when the list is re-sorted.
     pub fn sync_selected_session(&mut self, active: &[&Session]) {
         if active.is_empty() {
-            self.selected_session_id = None;
+            self.selected_session_key = None;
             if self.focus == Focus::Sessions {
                 self.selected = 0;
             }
             return;
         }
-        match self.focus {
-            Focus::Sessions => {
-                if self.selected >= active.len() {
-                    self.selected = active.len() - 1;
-                }
-                self.selected_session_id = Some(active[self.selected].id.clone());
+
+        if let Some(key) = self.selected_session_key.as_ref()
+            && let Some(index) = active.iter().position(|session| session.id == *key)
+        {
+            if self.focus == Focus::Sessions {
+                self.selected = index;
             }
-            Focus::SessionDetail | Focus::Failures => {
-                let still = self
-                    .selected_session_id
-                    .as_ref()
-                    .is_some_and(|id| active.iter().any(|s| s.id == *id));
-                if !still {
-                    let idx = self.selected.min(active.len() - 1);
-                    self.selected_session_id = Some(active[idx].id.clone());
-                }
-            }
+            return;
         }
+
+        let index = if self.focus == Focus::Sessions {
+            self.selected.min(active.len() - 1)
+        } else {
+            0
+        };
+        if self.focus != Focus::Failures {
+            self.selected = index;
+        }
+        self.selected_session_key = Some(active[index].id.clone());
     }
 
-    /// Pin session id from the active list at `selected` (Sessions navigation).
+    /// Pin session key from the active list at `selected` (Sessions navigation).
     pub fn pin_session_from_selection(&mut self, active: &[&Session]) {
         if active.is_empty() {
-            self.selected_session_id = None;
+            self.selected_session_key = None;
             return;
         }
         let idx = self.selected.min(active.len() - 1);
-        self.selected_session_id = Some(active[idx].id.clone());
+        self.selected_session_key = Some(active[idx].id.clone());
     }
 
     /// Restore Sessions `selected` to the pinned session when tabbing back.
     pub fn restore_session_selection(&mut self, active: &[&Session]) {
-        if let Some(id) = &self.selected_session_id
-            && let Some(i) = active.iter().position(|s| s.id == *id)
+        if let Some(key) = &self.selected_session_key
+            && let Some(i) = active.iter().position(|session| session.id == *key)
         {
             self.selected = i;
             return;
         }
         self.selected = 0;
         self.pin_session_from_selection(active);
+    }
+
+    pub fn pin_turn_detail(&mut self, request_key: impl Into<String>) {
+        self.detail_turn_key = Some(request_key.into());
     }
 
     /// True when at least one second has passed since the last tok/s sample.
@@ -259,6 +263,7 @@ impl App {
             KeyCode::Esc | KeyCode::Backspace => {
                 if self.mode != Mode::Dashboard {
                     self.mode = Mode::Dashboard;
+                    self.detail_turn_key = None;
                     self.detail_request_id = None;
                 }
             }
@@ -268,8 +273,8 @@ impl App {
                         Self::focus_count(self.focus, sessions_len, detail_len, failures_len);
                     if count > 0 {
                         self.mode = Mode::Detail;
-                        // Failures: caller pins request_id via `pin_failure_detail`.
-                        // Clear any stale pin from a previous overlay session.
+                        // Caller pins the selected row's stable identity.
+                        self.detail_turn_key = None;
                         self.detail_request_id = None;
                     }
                 }
@@ -386,15 +391,28 @@ mod tests {
         app.focus = Focus::Sessions;
         app.selected = 1;
         app.sync_selected_session(&list);
-        assert_eq!(app.selected_session_id.as_deref(), Some("b"));
+        assert_eq!(app.selected_session_key.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn sync_keeps_session_identity_when_list_reorders() {
+        let a = sess("a", 1);
+        let b = sess("b", 1);
+        let mut app = App::new();
+        app.focus = Focus::Sessions;
+        app.selected = 1;
+        app.sync_selected_session(&[&a, &b]);
+        app.sync_selected_session(&[&b, &a]);
+        assert_eq!(app.selected_session_key.as_deref(), Some("b"));
+        assert_eq!(app.selected, 0);
     }
 
     #[test]
     fn sync_clears_when_no_active_sessions() {
         let mut app = App::new();
-        app.selected_session_id = Some("gone".into());
+        app.selected_session_key = Some("gone".into());
         app.sync_selected_session(&[]);
-        assert!(app.selected_session_id.is_none());
+        assert!(app.selected_session_key.is_none());
     }
 
     #[test]
@@ -403,9 +421,23 @@ mod tests {
         let list = vec![&a];
         let mut app = App::new();
         app.focus = Focus::SessionDetail;
-        app.selected_session_id = Some("gone".into());
+        app.selected = 4;
+        app.selected_session_key = Some("gone".into());
         app.sync_selected_session(&list);
-        assert_eq!(app.selected_session_id.as_deref(), Some("a"));
+        assert_eq!(app.selected_session_key.as_deref(), Some("a"));
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn session_repin_does_not_change_failure_selection() {
+        let a = sess("a", 1);
+        let mut app = App::new();
+        app.focus = Focus::Failures;
+        app.selected = 3;
+        app.selected_session_key = Some("gone".into());
+        app.sync_selected_session(&[&a]);
+        assert_eq!(app.selected_session_key.as_deref(), Some("a"));
+        assert_eq!(app.selected, 3);
     }
 
     #[test]

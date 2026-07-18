@@ -61,8 +61,13 @@ impl Widget for SessionDetailPanel<'_> {
         } else {
             self.theme.title
         };
-        let title = match self.session_id {
-            Some(id) => format!(" session detail {} ", truncate(id, 12)),
+        let title = match self.session_id.and_then(|key| {
+            self.snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == key)
+        }) {
+            Some(session) => format!(" session detail {} ", truncate(&session.id, 12)),
             None => " session detail ".to_owned(),
         };
         let block = Block::default()
@@ -189,5 +194,19 @@ mod tests {
         assert_eq!(rows[2].1.id, "r3");
         assert!(SessionDetailPanel::rows(&snap, None).is_empty());
         assert!(SessionDetailPanel::rows(&snap, Some("missing")).is_empty());
+    }
+
+    #[test]
+    fn rows_join_on_full_session_key() {
+        let prefix = "x".repeat(256);
+        let first = format!("{prefix}a");
+        let second = format!("{prefix}b");
+        let snap = Snapshot {
+            active: vec![req("a1", &first), req("a2", &second)],
+            ..Default::default()
+        };
+        let rows = SessionDetailPanel::rows(&snap, Some(&first));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.id, "a1");
     }
 }
