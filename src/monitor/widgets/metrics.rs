@@ -9,26 +9,44 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
+/// Terminal display width for metric layout.
+///
+/// Metric strings use ASCII plus single-width Unicode (middle dot, block sparklines).
+/// Using UTF-8 byte length under-counts spark room when `·` (2 bytes, 1 column) appears.
+pub fn display_width(s: &str) -> usize {
+    s.chars().count()
+}
+
 /// Compact absolute token count for tight metric cells (`900`, `1.2k`, `3.4M`).
+///
+/// One-decimal rounding that would print as `1000.0k` / `1000.0M` is promoted to the
+/// next unit so the string never grows longer at unit boundaries.
 pub fn format_token_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
+    if n < 1_000 {
+        return n.to_string();
     }
+    let k = (n as f64 / 1_000.0 * 10.0).round() / 10.0;
+    if k < 1000.0 {
+        return format!("{k:.1}k");
+    }
+    let m = (n as f64 / 1_000_000.0 * 10.0).round() / 10.0;
+    if m < 1000.0 {
+        return format!("{m:.1}M");
+    }
+    let g = (n as f64 / 1_000_000_000.0 * 10.0).round() / 10.0;
+    format!("{g:.1}G")
 }
 
 /// Fleet/session cache cell: absolute cache-read tokens plus optional ratio.
 ///
 /// - No usage observations yet → `n/a`
-/// - Otherwise → `{count} · {pct}%` so zero reads stay visible as `0 · 0%`
+/// - Otherwise → `{count}·{pct}%` (no spaces) so a 64-col strip keeps count and ratio
+///   inside the cache column; zero reads stay visible as `0·0%`
 pub fn format_cache_read_value(cached_input_tokens: u64, ratio: Option<f64>) -> String {
     match ratio {
         None => "n/a".into(),
         Some(ratio) => format!(
-            "{} · {:.0}%",
+            "{}·{:.0}%",
             format_token_count(cached_input_tokens),
             ratio * 100.0
         ),
@@ -83,14 +101,15 @@ impl Widget for MetricsStrip<'_> {
 
         let tok = Metrics::from_snapshot(self.snapshot);
 
-        // Four compact columns on a single content row (bordered strip is height 3).
+        // Cache column is wider: absolute count + ratio (`12.3k·100%`) must fit at the
+        // documented 64-col strip minimum (inner width 62 after borders).
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(25),
-                Constraint::Percentage(25),
-                Constraint::Percentage(25),
-                Constraint::Percentage(25),
+                Constraint::Percentage(20),
+                Constraint::Percentage(18),
+                Constraint::Percentage(24),
+                Constraint::Percentage(38),
             ])
             .split(inner);
 
@@ -173,7 +192,9 @@ fn render_metric(area: Rect, buf: &mut Buffer, cell: MetricCell<'_>) {
     }
     let label = format!(" {} ", cell.label);
     let value = format!("{} ", cell.value);
-    let spark_width = (area.width as usize).saturating_sub(label.len() + value.len());
+    // Display columns, not UTF-8 bytes — `·` is 2 bytes but 1 terminal cell.
+    let spark_width =
+        (area.width as usize).saturating_sub(display_width(&label) + display_width(&value));
     let spark = match cell.fixed_max {
         Some(max) => sparkline_chars_scaled(cell.spark_values, spark_width, Some(max)),
         None => sparkline_chars(cell.spark_values, spark_width),
@@ -285,8 +306,8 @@ fn sparkline_chars_scaled(values: &[f64], width: usize, fixed_max: Option<f64>) 
 /// Whether the metrics strip should be drawn for this frame size.
 pub fn should_show_metrics(area_width: u16, area_height: u16) -> bool {
     // Full dashboard needs header(3)+metrics(3)+body(min 6)+footer(3) ≈ 15;
-    // require a bit more so body panels stay usable. At least 64 columns leaves
-    // one spark cell after the longest cold-start metric prefix.
+    // require a bit more so body panels stay usable. At least 64 columns keeps the
+    // widened cache column (absolute count + ratio) fully visible after borders.
     area_width >= 64 && area_height >= 18
 }
 
@@ -390,7 +411,7 @@ mod tests {
         let m = Metrics::from_snapshot(&snap);
         assert_eq!(m.cached_input_tokens, 900);
         assert!((m.cache_read_ratio.unwrap() - 900.0 / 1_010.0).abs() < 1e-12);
-        assert_eq!(m.cache_cell_value(), "900 · 89%");
+        assert_eq!(m.cache_cell_value(), "900·89%");
     }
 
     #[test]
@@ -409,7 +430,7 @@ mod tests {
             cell.starts_with('0'),
             "zero cache reads must show absolute 0, got {cell}"
         );
-        assert_eq!(cell, "0 · 0%");
+        assert_eq!(cell, "0·0%");
     }
 
     #[test]
@@ -427,7 +448,61 @@ mod tests {
         assert_eq!(format_token_count(1_234), "1.2k");
         assert_eq!(format_token_count(12_300), "12.3k");
         assert_eq!(format_token_count(2_500_000), "2.5M");
-        assert_eq!(format_cache_read_value(12_300, Some(0.91)), "12.3k · 91%");
+        assert_eq!(format_cache_read_value(12_300, Some(0.91)), "12.3k·91%");
+    }
+
+    #[test]
+    fn format_token_count_promotes_at_unit_boundaries() {
+        // One-decimal k that would print 1000.0k must become 1.0M (shorter, not longer).
+        assert_eq!(format_token_count(999_949), "999.9k");
+        assert_eq!(format_token_count(999_950), "1.0M");
+        assert_eq!(format_token_count(999_999), "1.0M");
+        assert_eq!(format_token_count(1_000_000), "1.0M");
+        // Same promotion at the M → G boundary.
+        assert_eq!(format_token_count(999_949_999), "999.9M");
+        assert_eq!(format_token_count(999_950_000), "1.0G");
+        assert_eq!(format_token_count(1_000_000_000), "1.0G");
+        // Compact cache cell stays short at the awkward boundary.
+        assert_eq!(format_cache_read_value(999_999, Some(0.5)), "1.0M·50%");
+        assert!(
+            display_width(&format_token_count(999_999)) < display_width("1000.0k"),
+            "promoted form must be shorter than unpromoted 1000.0k"
+        );
+    }
+
+    #[test]
+    fn display_width_counts_columns_not_bytes() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("·"), 1);
+        assert_eq!("·".len(), 2, "middle dot is multi-byte UTF-8");
+        assert_eq!(display_width("900·89%"), 7);
+        assert!(
+            display_width("900·89%") < "900·89%".len(),
+            "display width must not use byte length for spark budget"
+        );
+    }
+
+    #[test]
+    fn cache_cell_fits_minimum_64_col_strip_column() {
+        // Documented minimum: outer width 64 → bordered inner 62 → cache column 38% ≈ 23.
+        // Guarantee label + value (with trailing space) still fit without clipping.
+        let cases = [
+            format_cache_read_value(900, Some(0.89)),
+            format_cache_read_value(0, Some(0.0)),
+            format_cache_read_value(12_300, Some(0.91)),
+            format_cache_read_value(999_999, Some(1.0)),
+            format_cache_read_value(0, None),
+        ];
+        let cache_col = (62.0_f64 * 0.38).floor() as usize; // matches Percentage(38) floor share
+        for value in cases {
+            let label = format!(" {} ", "cache");
+            let painted = format!("{value} ");
+            let needed = display_width(&label) + display_width(&painted);
+            assert!(
+                needed <= cache_col,
+                "cache cell {value:?} needs {needed} cols > cache column {cache_col}"
+            );
+        }
     }
 
     #[test]

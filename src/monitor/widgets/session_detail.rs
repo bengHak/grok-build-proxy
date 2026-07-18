@@ -470,6 +470,10 @@ mod tests {
             line.contains("900") && line.contains("cache") && line.contains("89%"),
             "nonzero cache reads missing absolute count: {line}"
         );
+        assert!(
+            line.contains("cache 900·89%"),
+            "session tokens line should use compact count·ratio: {line}"
+        );
         assert!(line.contains("40 out"), "output count missing: {line}");
 
         let cold = Session {
@@ -483,7 +487,7 @@ mod tests {
         };
         let line = format_session_tokens_line(&cold);
         assert!(
-            line.contains("cache 0 · 0%"),
+            line.contains("cache 0·0%"),
             "zero cache reads must stay visible: {line}"
         );
 

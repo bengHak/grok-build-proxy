@@ -942,7 +942,7 @@ mod tests {
         assert_eq!(snap.cached_input_tokens, 900);
         // Fleet ratio is weighted across both sessions: 900 / (1010+500) ≈ 59.6%.
         let fleet_cell = format_cache_read_value(snap.cached_input_tokens, snap.cache_read_ratio());
-        assert_eq!(fleet_cell, "900 · 60%");
+        assert_eq!(fleet_cell, "900·60%");
 
         let mut app = App::new();
         app.selected_session_key = Some("sess-abc".into());
@@ -957,14 +957,25 @@ mod tests {
             "fleet metrics should render absolute count + ratio ({fleet_cell}):\n{text}"
         );
         assert!(
-            text.contains("cache 900 · 89%"),
+            text.contains("cache 900·89%"),
             "selected session tokens line must show absolute cache reads:\n{text}"
+        );
+
+        // Documented minimum width: full count·ratio must survive clipping.
+        let text_64 = render_test(64, 24, &snap, "127.0.0.1:1", "0.0.15", &app);
+        assert!(
+            should_show_metrics(64, 24),
+            "64×24 is the supported metrics strip minimum"
+        );
+        assert!(
+            text_64.contains(&fleet_cell),
+            "64-col metrics strip must keep full cache count·ratio ({fleet_cell}):\n{text_64}"
         );
 
         app.selected_session_key = Some("sess-cold".into());
         let text = render_test(120, 28, &snap, "127.0.0.1:1", "0.0.15", &app);
         assert!(
-            text.contains("cache 0 · 0%"),
+            text.contains("cache 0·0%"),
             "zero-cache session must show absolute 0 reads:\n{text}"
         );
     }
