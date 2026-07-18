@@ -33,6 +33,8 @@ pub use crate::events::{
 pub const DEFAULT_CODEX_COMPATIBILITY_VERSION: &str = "0.144.0";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
 
+const LITE_TOOL_BATCHING_INSTRUCTION: &str = "Minimize model-tool round trips. When multiple independent files must be read, use one shell command to read them together instead of issuing separate file-read calls. Batch independent read-only operations into a single shell call.";
+
 static REQUEST_FINGERPRINT_STATE: OnceLock<RandomState> = OnceLock::new();
 
 #[derive(Clone)]
@@ -47,6 +49,7 @@ pub struct ProxyConfig {
     pub version: String,
     pub compatibility_version: String,
     pub responses_compat: CompatMode,
+    pub lite_tool_batching: bool,
     pub observer: Option<Arc<dyn Observer>>,
     pub max_body_bytes: usize,
 }
@@ -621,6 +624,15 @@ pub fn transform_request(
     catalog: &Catalog,
     mappings: &ModelMap,
 ) -> Result<TransformedRequest> {
+    transform_request_with_options(raw, catalog, mappings, false)
+}
+
+fn transform_request_with_options(
+    raw: &[u8],
+    catalog: &Catalog,
+    mappings: &ModelMap,
+    lite_tool_batching: bool,
+) -> Result<TransformedRequest> {
     if raw.iter().all(u8::is_ascii_whitespace) {
         bail!("request body is empty")
     }
@@ -660,6 +672,9 @@ pub fn transform_request(
     if model.provider == Provider::Kimi {
         object.remove("service_tier");
     } else if model.responses_lite {
+        if lite_tool_batching {
+            append_lite_tool_batching_instruction(object);
+        }
         apply_responses_lite(object)
     } else {
         object.entry("parallel_tool_calls").or_insert(true.into());
@@ -681,6 +696,22 @@ pub fn transform_request(
         input_item_count,
         request_fingerprint,
     })
+}
+
+fn append_lite_tool_batching_instruction(body: &mut Map<String, Value>) {
+    let existing = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let separator = if existing.trim().is_empty() {
+        ""
+    } else {
+        "\n\n"
+    };
+    body.insert(
+        "instructions".into(),
+        format!("{existing}{separator}{LITE_TOOL_BATCHING_INSTRUCTION}").into(),
+    );
 }
 fn apply_responses_lite(body: &mut Map<String, Value>) {
     body.insert("parallel_tool_calls".into(), false.into());
@@ -763,7 +794,12 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         }
     };
     let session_context = extract_session_context(&body, &incoming_headers);
-    let mut transformed = match transform_request(&body, &s.0.catalog, &s.0.model_map) {
+    let mut transformed = match transform_request_with_options(
+        &body,
+        &s.0.catalog,
+        &s.0.model_map,
+        s.0.lite_tool_batching,
+    ) {
         Ok(v) => v,
         Err(e) => {
             return with_request_id(
@@ -2009,6 +2045,30 @@ mod tests {
     }
 
     #[test]
+    fn opt_in_lite_tool_batching_appends_a_developer_instruction() {
+        let transformed = transform_request_with_options(
+            br#"{"model":"gpt-5.6-sol","input":"inspect","instructions":"existing"}"#,
+            &Catalog::default(),
+            &ModelMap::default(),
+            true,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(&transformed.body).unwrap();
+        let developer_text = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["role"] == "developer")
+            .filter_map(|item| item.pointer("/content/0/text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(developer_text.contains("existing"));
+        assert!(developer_text.contains("Batch independent read-only operations"));
+        assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
     fn extracts_latest_user_prompt_and_metadata_cwd() {
         let headers = HeaderMap::new();
         let context = extract_session_context(
@@ -2251,6 +2311,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 4096,
         })
@@ -2308,6 +2369,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 1024,
         })
@@ -2375,6 +2437,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 1024,
         })
@@ -2435,6 +2498,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 4096,
         })
@@ -2509,6 +2573,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: Some(observer.clone()),
             max_body_bytes: 4096,
         })
@@ -2633,6 +2698,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 4096,
         })
@@ -2956,6 +3022,7 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: Some(obs.clone()),
             max_body_bytes: 1024,
         };

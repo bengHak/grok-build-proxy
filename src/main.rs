@@ -76,6 +76,8 @@ struct ServeArgs {
     client_token: String,
     #[arg(long, env = "GROK_BUILD_PROXY_LOG_FORMAT", default_value = "text")]
     log_format: String,
+    #[arg(long, env = "GROK_BUILD_PROXY_LITE_TOOL_BATCHING")]
+    lite_tool_batching: bool,
     #[arg(long)]
     no_monitor: bool,
     #[arg(long)]
@@ -387,6 +389,7 @@ async fn serve(a: ServeArgs) -> Result<()> {
         version: VERSION.into(),
         compatibility_version: a.codex_compat_version,
         responses_compat: CompatMode::from_env()?,
+        lite_tool_batching: a.lite_tool_batching,
         observer,
         max_body_bytes: DEFAULT_MAX_BODY_BYTES,
     })?;
@@ -397,6 +400,7 @@ async fn serve(a: ServeArgs) -> Result<()> {
         address = a.listen,
         version = VERSION,
         monitor = monitor_enabled,
+        lite_tool_batching = a.lite_tool_batching,
         "proxy listening"
     );
     let server = axum::serve(listener, app)

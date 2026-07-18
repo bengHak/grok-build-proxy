@@ -308,6 +308,22 @@ Canonical catalog routes, configured model-map aliases, and eligible generated
 `-fast` routes inherit their target's capability. Unknown or unsupported models
 omit the capability fields.
 
+## Responses Lite tool batching
+
+Responses Lite requires `parallel_tool_calls = false`, so independent Grok
+file reads otherwise tend to become separate model/tool turns. Enable the
+opt-in batching instruction to encourage one read-only shell call for multiple
+independent files:
+
+```sh
+grok-build-proxy serve --lite-tool-batching
+# or: GROK_BUILD_PROXY_LITE_TOOL_BATCHING=true grok-build-proxy serve
+```
+
+This does not execute tools in the proxy, enable parallel tool calls, or bypass
+Grok permissions. It only appends a developer instruction for Responses Lite
+models; dependent operations and non-Lite providers are unchanged.
+
 ## Prompt cache efficiency
 
 The proxy keeps Grok thread identity separate from prompt-cache routing. A valid
@@ -528,6 +544,7 @@ sources, self-maps, and cycles are rejected before the server starts.
 | `--model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | empty |
 | `--codex-compat-version` | `GROK_BUILD_PROXY_CODEX_COMPAT_VERSION` | `0.144.0` |
 | — | `GROK_BUILD_PROXY_RESPONSES_COMPAT` | `full` (`full`, `text`, or `off`) |
+| `--lite-tool-batching` | `GROK_BUILD_PROXY_LITE_TOOL_BATCHING` | `false` |
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
 | — | `GROK_BUILD_PROXY_FAILURE_CAP` | `200`; positive integer limiting in-memory failure records |

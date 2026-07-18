@@ -31,6 +31,9 @@ tokens on macOS. Treat every upstream credential as a password.
   phases, and a short randomized fingerprint that is comparable only within
   the current proxy process; the source request is never retained to compute a
   stable cross-process digest.
+- `--lite-tool-batching` only adds a model instruction. Batched shell commands
+  remain subject to Grok's normal permission and sandbox checks; review the
+  resulting command before approval in interactive modes.
 
 ## Credential handling
 
