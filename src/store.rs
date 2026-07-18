@@ -60,6 +60,10 @@ pub struct Session {
     pub active: u64,
     pub output_tokens: u64,
     pub last_model: String,
+    /// Latest non-empty user prompt preview observed for this session.
+    pub last_prompt: String,
+    /// Latest workspace/current-working-directory path observed for this session.
+    pub cwd: String,
     pub errors: u64,
     pub last_failure_kind: Option<FailureKind>,
     pub updated_at: Option<DateTime<Utc>>,
@@ -221,6 +225,27 @@ impl Dashboard {
             .filter(|f| kind.is_none_or(|k| f.kind == k))
             .cloned()
             .collect()
+    }
+
+    fn apply_session_context(&self, session_key: &str, last_prompt: &str, cwd: &str) {
+        if last_prompt.trim().is_empty() && cwd.trim().is_empty() {
+            return;
+        }
+        let mut state = lock_state(&self.inner);
+        let session = state
+            .sessions
+            .entry(session_key.to_owned())
+            .or_insert_with(|| Session {
+                id: sanitize_id(session_key),
+                ..Default::default()
+            });
+        if !last_prompt.trim().is_empty() {
+            session.last_prompt = sanitize(last_prompt);
+        }
+        if !cwd.trim().is_empty() {
+            session.cwd = sanitize(cwd);
+        }
+        session.updated_at = Some(Utc::now());
     }
 
     fn apply(&self, event: RequestEvent) {
@@ -406,6 +431,10 @@ impl Dashboard {
 impl Observer for Dashboard {
     fn observe(&self, event: RequestEvent) {
         self.apply(event)
+    }
+
+    fn observe_session_context(&self, session_id: &str, last_prompt: &str, cwd: &str) {
+        self.apply_session_context(session_id, last_prompt, cwd)
     }
 }
 
@@ -607,6 +636,17 @@ mod tests {
             "tok/s ring is 1 Hz fleet avg, not per-request"
         );
         assert_eq!(d.snapshot().metrics_completed, vec![1.0]);
+    }
+
+    #[test]
+    fn session_context_keeps_latest_non_empty_values() {
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        d.observe_session_context("session", "first prompt", "/tmp/first");
+        d.observe_session_context("session", "", "/tmp/second");
+        let snapshot = d.snapshot();
+        assert_eq!(snapshot.sessions[0].last_prompt, "first prompt");
+        assert_eq!(snapshot.sessions[0].cwd, "/tmp/second");
     }
 
     #[test]

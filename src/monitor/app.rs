@@ -83,6 +83,8 @@ pub struct App {
     pub failure_filter: FailureFilter,
     /// Pinned session key for the session-detail panel (stable across list churn).
     pub selected_session_key: Option<String>,
+    /// Whether the pinned key currently resolves in the full session store.
+    pub selected_session_available: bool,
     /// Stable identity for a turn detail overlay.
     pub detail_turn_key: Option<String>,
     /// Stable identity for Failure detail overlay (avoids index shift on push_front).
@@ -135,10 +137,24 @@ impl App {
         }
     }
 
+    /// Refresh whether the pinned session still exists in the full store.
+    pub fn refresh_selected_session_availability(&mut self, sessions: &[Session]) {
+        self.selected_session_available = self
+            .selected_session_key
+            .as_ref()
+            .is_some_and(|key| sessions.iter().any(|session| session.id == *key));
+    }
+
     /// Keep the selected active session stable when the list is re-sorted.
     pub fn sync_selected_session(&mut self, active: &[&Session]) {
+        if (matches!(self.focus, Focus::SessionDetail) || self.mode == Mode::Detail)
+            && self.selected_session_available
+        {
+            return;
+        }
         if active.is_empty() {
             self.selected_session_key = None;
+            self.selected_session_available = false;
             if self.focus == Focus::Sessions {
                 self.selected = 0;
             }
@@ -151,6 +167,7 @@ impl App {
             if self.focus == Focus::Sessions {
                 self.selected = index;
             }
+            self.selected_session_available = true;
             return;
         }
 
@@ -163,16 +180,19 @@ impl App {
             self.selected = index;
         }
         self.selected_session_key = Some(active[index].id.clone());
+        self.selected_session_available = true;
     }
 
     /// Pin session key from the active list at `selected` (Sessions navigation).
     pub fn pin_session_from_selection(&mut self, active: &[&Session]) {
         if active.is_empty() {
             self.selected_session_key = None;
+            self.selected_session_available = false;
             return;
         }
         let idx = self.selected.min(active.len() - 1);
         self.selected_session_key = Some(active[idx].id.clone());
+        self.selected_session_available = true;
     }
 
     /// Restore Sessions `selected` to the pinned session when tabbing back.
@@ -181,6 +201,7 @@ impl App {
             && let Some(i) = active.iter().position(|session| session.id == *key)
         {
             self.selected = i;
+            self.selected_session_available = true;
             return;
         }
         self.selected = 0;
@@ -274,8 +295,7 @@ impl App {
                     // Session detail can open on the pinned session even when it has
                     // no turns yet (summary-only inspector).
                     let open = count > 0
-                        || (self.focus == Focus::SessionDetail
-                            && self.selected_session_key.is_some());
+                        || (self.focus == Focus::SessionDetail && self.selected_session_available);
                     if open {
                         self.mode = Mode::Detail;
                         // Caller pins the selected row's stable identity.
@@ -413,6 +433,18 @@ mod tests {
     }
 
     #[test]
+    fn sync_preserves_idle_full_store_pin_for_session_detail() {
+        let idle = sess("idle", 0);
+        let mut app = App::new();
+        app.focus = Focus::SessionDetail;
+        app.selected_session_key = Some("idle".into());
+        app.refresh_selected_session_availability(std::slice::from_ref(&idle));
+        app.sync_selected_session(&[]);
+        assert_eq!(app.selected_session_key.as_deref(), Some("idle"));
+        assert!(app.selected_session_available);
+    }
+
+    #[test]
     fn sync_clears_when_no_active_sessions() {
         let mut app = App::new();
         app.selected_session_key = Some("gone".into());
@@ -527,8 +559,10 @@ mod tests {
     fn enter_opens_session_detail_without_turns() {
         let mut app = App::new();
         app.focus = Focus::SessionDetail;
+        let session = sess("sess-x", 0);
         app.selected_session_key = Some("sess-x".into());
-        // No turn rows, but a pinned session should still open the inspector overlay.
+        app.refresh_selected_session_availability(std::slice::from_ref(&session));
+        // No turn rows, but a full-store session pin should open the inspector overlay.
         app.handle(key(KeyCode::Enter), 0, 0, 0);
         assert_eq!(app.mode, Mode::Detail);
 

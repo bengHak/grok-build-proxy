@@ -79,6 +79,10 @@ pub struct RequestEvent {
 
 pub trait Observer: Send + Sync {
     fn observe(&self, event: RequestEvent);
+
+    /// Record monitor-only session context discovered in an incoming request.
+    /// Implementations that do not expose a session inspector may ignore it.
+    fn observe_session_context(&self, _session_id: &str, _last_prompt: &str, _cwd: &str) {}
 }
 
 impl RequestEvent {

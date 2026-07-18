@@ -92,11 +92,12 @@ When standard input and output are attached to a terminal, `grok-build-proxy
 serve` (and the default `grok-build-proxy` command) opens an interactive monitor
 instead of scrolling logs. It shows **active sessions** only (in-flight
 requests), a **session detail** inspector for the session selected on the left
-(identity, counters, tok/s, last failure, plus that session's active and recent
-turns), a metrics strip (`tok/s` = mean of per-session lifetime rates with a
+(identity, counters, tok/s, last failure, workspace path, latest user-prompt
+preview, plus that session's active and recent turns), a metrics strip (`tok/s` = mean of per-session lifetime rates with a
 1 Hz sparkline history; rolling `fail%` and completion-outcome sparklines —
 distinct from the header `err●N` failure-ring count), and a failures panel
-classified from real proxy traffic.
+classified from real proxy traffic. Prompt/path previews are sanitized, capped at
+256 characters, and kept only in the in-memory monitor store.
 
 **Keybindings**
 

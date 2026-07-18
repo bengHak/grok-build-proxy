@@ -144,22 +144,24 @@ impl Widget for SessionDetailPanel<'_> {
 
 impl SessionDetailPanel<'_> {
     fn render_inspector(self, area: Rect, buf: &mut Buffer, session: &Session) {
-        // Summary needs ~6 content lines + 1 blank; remainder is the turn list.
-        let summary_h = 7u16.min(area.height.saturating_sub(2).max(1));
+        // Six summary lines; preserve at least a turns header + one list/empty row.
+        let summary_h = 6u16.min(area.height.saturating_sub(2).max(1));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(summary_h), Constraint::Min(1)])
             .split(area);
-
         self.render_summary(chunks[0], buf, session);
         self.render_turns(chunks[1], buf);
     }
 
     fn render_summary(&self, area: Rect, buf: &mut Buffer, session: &Session) {
-        let last = session.last_failure_kind.map(|k| k.as_str()).unwrap_or("-");
+        let last = session
+            .last_failure_kind
+            .map(|kind| kind.as_str())
+            .unwrap_or("-");
         let updated = session
             .updated_at
-            .map(|t| t.format("%H:%M:%S").to_string())
+            .map(|time| time.format("%H:%M:%S").to_string())
             .unwrap_or_else(|| "-".into());
         let fail_n = Self::session_failures(self.snapshot, self.session_id).len();
         let model = if session.last_model.is_empty() {
@@ -167,27 +169,32 @@ impl SessionDetailPanel<'_> {
         } else {
             session.last_model.as_str()
         };
-
+        let cwd = if session.cwd.is_empty() {
+            "-"
+        } else {
+            session.cwd.as_str()
+        };
+        let prompt = if session.last_prompt.is_empty() {
+            "-"
+        } else {
+            session.last_prompt.as_str()
+        };
+        let value_width = area.width.saturating_sub(8) as usize;
+        let identity = format!(
+            "{} · model {}",
+            truncate(&session.id, 16),
+            truncate(model, value_width.saturating_sub(12))
+        );
         let lines = vec![
             Line::from(vec![
                 Span::styled("id      ", self.theme.muted),
-                Span::styled(
-                    truncate(&session.id, area.width.saturating_sub(8) as usize),
-                    self.theme.header,
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled("model   ", self.theme.muted),
-                Span::styled(
-                    truncate(model, area.width.saturating_sub(8) as usize),
-                    self.theme.header,
-                ),
+                Span::styled(truncate(&identity, value_width), self.theme.header),
             ]),
             Line::from(vec![
                 Span::styled("reqs    ", self.theme.muted),
                 Span::styled(
                     format!(
-                        "{:<5}  active {:<4}  errs {}",
+                        "{:<5} active {:<4} errs {}",
                         session.requests, session.active, session.errors
                     ),
                     if session.errors > 0 {
@@ -203,7 +210,7 @@ impl SessionDetailPanel<'_> {
                 Span::styled("tokens  ", self.theme.muted),
                 Span::styled(
                     format!(
-                        "{:<5}  {:.1} t/s",
+                        "{:<5} {:.1} t/s",
                         session.output_tokens,
                         session.tokens_per_second()
                     ),
@@ -220,14 +227,17 @@ impl SessionDetailPanel<'_> {
                         self.theme.ok
                     },
                 ),
-                Span::styled(format!("  fail-ring {fail_n}"), self.theme.muted),
+                Span::styled(format!(" ring {fail_n} · upd {updated}"), self.theme.muted),
             ]),
             Line::from(vec![
-                Span::styled("updated ", self.theme.muted),
-                Span::styled(updated, self.theme.muted),
+                Span::styled("cwd     ", self.theme.muted),
+                Span::styled(truncate(cwd, value_width), self.theme.header),
+            ]),
+            Line::from(vec![
+                Span::styled("prompt  ", self.theme.muted),
+                Span::styled(truncate(prompt, value_width), self.theme.header),
             ]),
         ];
-
         Paragraph::new(lines).render(area, buf);
     }
 
@@ -381,6 +391,8 @@ mod tests {
             requests: 3,
             output_tokens: 40,
             last_model: "gpt".into(),
+            last_prompt: "inspect this".into(),
+            cwd: "/tmp/project".into(),
             errors: 1,
             last_failure_kind: Some(FailureKind::UpstreamHttp),
             updated_at: Some(Utc::now()),
