@@ -20,6 +20,10 @@ Treat the Codex authentication file as a password.
   implement its own OAuth callback flow.
 - `grok-build-proxy doctor` reports only redacted account metadata and never
   prints access or refresh token values.
+- Serve-monitor failure reports (`y`/`Y` clipboard, `w`/`W` under
+  `~/.grok/proxy-reports/`) include only `FailureRecord` metadata (kind, status,
+  sanitized error summary, attempt, timing, session/request ids). They omit
+  request bodies, response bodies, and credentials.
 
 ## Credential handling
 

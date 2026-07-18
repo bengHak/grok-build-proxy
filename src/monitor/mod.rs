@@ -1,4 +1,4 @@
-//! Interactive serve monitor (ratatui panels: header / sessions / active / failures / footer).
+//! Interactive serve monitor (ratatui panels: header / metrics / sessions / active / failures / footer).
 
 mod app;
 mod theme;
@@ -25,8 +25,12 @@ use std::{
 };
 use theme::Theme;
 use widgets::{
-    ActivePanel, FailuresPanel, Footer, Header, HelpOverlay, SessionsPanel, TurnKind, truncate,
+    ActivePanel, FailuresPanel, Footer, Header, HelpOverlay, MetricsStrip, SessionsPanel, TurnKind,
+    should_show_metrics, truncate,
 };
+
+/// Below this width, panels stack as a single focused "tab" instead of side-by-side.
+const NARROW_WIDTH: u16 = 80;
 
 use crate::report::{self, ReportMeta};
 pub use crate::store::{Dashboard, FailureRecord, Request, Session, Snapshot};
@@ -169,14 +173,35 @@ fn draw(
         }
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // header
-            Constraint::Min(5),    // body (sessions|active + failures)
-            Constraint::Length(3), // footer
-        ])
-        .split(area);
+    let show_metrics = should_show_metrics(area.width, area.height);
+    let narrow = area.width < NARROW_WIDTH;
+
+    let chunks = if show_metrics {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // header
+                Constraint::Length(3), // metrics sparklines
+                Constraint::Min(5),    // body
+                Constraint::Length(3), // footer
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // header
+                Constraint::Min(5),    // body
+                Constraint::Length(3), // footer
+            ])
+            .split(area)
+    };
+
+    let (header_area, metrics_area, body_area, footer_area) = if show_metrics {
+        (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+    } else {
+        (chunks[0], None, chunks[1], chunks[2])
+    };
 
     Header {
         snapshot,
@@ -185,54 +210,98 @@ fn draw(
         uptime_secs: app.uptime_secs(),
         theme,
     }
-    .render(chunks[0], buf);
+    .render(header_area, buf);
 
-    // Body: top row sessions|active, bottom full-width failures.
-    let body = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(chunks[1]);
-
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(body[0]);
-
-    SessionsPanel {
-        snapshot,
-        selected: app.selected,
-        focused: app.focus == Focus::Sessions && app.mode == Mode::Dashboard,
-        theme,
+    if let Some(metrics) = metrics_area {
+        MetricsStrip { snapshot, theme }.render(metrics, buf);
     }
-    .render(top[0], buf);
 
-    ActivePanel {
-        snapshot,
-        selected: app.selected,
-        focused: app.focus == Focus::Active && app.mode == Mode::Dashboard,
-        theme,
-    }
-    .render(top[1], buf);
+    if narrow {
+        // Single focused panel (tab-like): Tab still cycles Sessions → Active → Failures.
+        draw_focused_panel(body_area, buf, snapshot, app, theme);
+    } else {
+        // Body: top row sessions|active, bottom full-width failures.
+        let body = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(body_area);
 
-    FailuresPanel {
-        snapshot,
-        selected: app.selected,
-        focused: app.focus == Focus::Failures && app.mode == Mode::Dashboard,
-        filter: app.failure_filter,
-        theme,
+        let top = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(body[0]);
+
+        SessionsPanel {
+            snapshot,
+            selected: app.selected,
+            focused: app.focus == Focus::Sessions && app.mode == Mode::Dashboard,
+            theme,
+        }
+        .render(top[0], buf);
+
+        ActivePanel {
+            snapshot,
+            selected: app.selected,
+            focused: app.focus == Focus::Active && app.mode == Mode::Dashboard,
+            theme,
+        }
+        .render(top[1], buf);
+
+        FailuresPanel {
+            snapshot,
+            selected: app.selected,
+            focused: app.focus == Focus::Failures && app.mode == Mode::Dashboard,
+            filter: app.failure_filter,
+            theme,
+        }
+        .render(body[1], buf);
     }
-    .render(body[1], buf);
 
     Footer {
         theme,
         toast: app.toast_message(),
     }
-    .render(chunks[2], buf);
+    .render(footer_area, buf);
 
     match app.mode {
         Mode::Help => HelpOverlay { theme }.render(area, buf),
         Mode::Detail => draw_detail(area, buf, snapshot, app, theme),
         Mode::Dashboard => {}
+    }
+}
+
+/// Narrow terminal: only the focused panel fills the body (Tab cycles).
+fn draw_focused_panel(
+    area: Rect,
+    buf: &mut ratatui::buffer::Buffer,
+    snapshot: &Snapshot,
+    app: &App,
+    theme: Theme,
+) {
+    let dash = app.mode == Mode::Dashboard;
+    match app.focus {
+        Focus::Sessions => SessionsPanel {
+            snapshot,
+            selected: app.selected,
+            focused: dash,
+            theme,
+        }
+        .render(area, buf),
+        Focus::Active => ActivePanel {
+            snapshot,
+            selected: app.selected,
+            focused: dash,
+            theme,
+        }
+        .render(area, buf),
+        Focus::Failures => FailuresPanel {
+            snapshot,
+            selected: app.selected,
+            focused: dash,
+            filter: app.failure_filter,
+            theme,
+        }
+        .render(area, buf),
     }
 }
 
@@ -545,6 +614,86 @@ mod tests {
         assert!(
             text.contains(" y ") || text.contains("copy") || text.contains(" w "),
             "footer missing export bindings:\n{text}"
+        );
+        assert!(
+            text.contains("metrics"),
+            "metrics strip title missing on tall/wide terminal:\n{text}"
+        );
+        assert!(
+            text.contains("tok/s") && text.contains("err") && text.contains("done"),
+            "metrics strip labels missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn narrow_terminal_shows_only_focused_panel() {
+        let snap = fixture_dashboard().snapshot();
+        let mut app = App::new();
+        // Width < 80 → single focused panel (sessions by default).
+        let text = render_test(60, 24, &snap, "127.0.0.1:1", "0.0.12", &app);
+        assert!(
+            text.contains("sessions"),
+            "narrow should show focused sessions panel:\n{text}"
+        );
+        assert!(
+            !text.contains("active / recent"),
+            "narrow should hide non-focused active panel:\n{text}"
+        );
+        assert!(
+            !text.contains("failures ["),
+            "narrow should hide non-focused failures panel:\n{text}"
+        );
+
+        app.focus = Focus::Failures;
+        let text = render_test(60, 24, &snap, "127.0.0.1:1", "0.0.12", &app);
+        assert!(
+            text.contains("failures"),
+            "narrow failures focus should show failures:\n{text}"
+        );
+        assert!(
+            !text.contains("sessions"),
+            "narrow failures focus should hide sessions title:\n{text}"
+        );
+    }
+
+    #[test]
+    fn short_terminal_hides_metrics_strip() {
+        let snap = fixture_dashboard().snapshot();
+        let app = App::new();
+        // height 16 < 18 threshold → no metrics strip, but body still renders.
+        let text = render_test(100, 16, &snap, "127.0.0.1:1", "0.0.12", &app);
+        assert!(
+            !text.contains(" metrics "),
+            "metrics strip should hide when height is short:\n{text}"
+        );
+        assert!(
+            text.contains("sessions") || text.contains("header"),
+            "short layout should still draw core chrome:\n{text}"
+        );
+    }
+
+    #[test]
+    fn metrics_strip_reflects_store_samples() {
+        let snap = fixture_dashboard().snapshot();
+        assert!(
+            !snap.metrics_completed.is_empty(),
+            "fixture should record completed samples"
+        );
+        assert!(
+            !snap.metrics_tok_per_s.is_empty(),
+            "fixture should record tok/s samples"
+        );
+        let app = App::new();
+        let text = render_test(120, 28, &snap, "127.0.0.1:1", "0.0.12", &app);
+        // Error rate label: 2 fails + 1 ok → ~67%
+        assert!(
+            text.contains("err")
+                && (text.contains("67%") || text.contains("66%") || text.contains("%")),
+            "error rate meter missing:\n{text}"
+        );
+        assert!(
+            text.contains("ok/") || text.contains("done"),
+            "done activity label missing:\n{text}"
         );
     }
 
