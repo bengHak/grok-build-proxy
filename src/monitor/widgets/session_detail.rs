@@ -1,4 +1,4 @@
-//! Right panel: active + recent turns (id, model, duration/status).
+//! Right panel: turns for the selected (pinned) session — active then recent.
 
 use super::truncate;
 use crate::monitor::theme::Theme;
@@ -17,37 +17,53 @@ pub enum TurnKind {
     Recent,
 }
 
-pub struct ActivePanel<'a> {
+pub struct SessionDetailPanel<'a> {
     pub snapshot: &'a Snapshot,
+    /// Pinned session id from the sessions panel; `None` → empty list.
+    pub session_id: Option<&'a str>,
     pub selected: usize,
     pub focused: bool,
     pub theme: Theme,
 }
 
-impl ActivePanel<'_> {
-    /// Flattened active + recent list length.
-    pub fn row_count(snapshot: &Snapshot) -> usize {
-        snapshot.active.len() + snapshot.recent.len()
+impl SessionDetailPanel<'_> {
+    pub fn row_count(snapshot: &Snapshot, session_id: Option<&str>) -> usize {
+        Self::rows(snapshot, session_id).len()
     }
 
-    pub fn rows(snapshot: &Snapshot) -> Vec<(TurnKind, &Request)> {
-        let mut out = Vec::with_capacity(Self::row_count(snapshot));
+    /// Active turns for `session_id`, then matching recent (store order).
+    pub fn rows<'s>(
+        snapshot: &'s Snapshot,
+        session_id: Option<&str>,
+    ) -> Vec<(TurnKind, &'s Request)> {
+        let Some(sid) = session_id else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
         for r in &snapshot.active {
-            out.push((TurnKind::Active, r));
+            if r.session_id == sid {
+                out.push((TurnKind::Active, r));
+            }
         }
         for r in &snapshot.recent {
-            out.push((TurnKind::Recent, r));
+            if r.session_id == sid {
+                out.push((TurnKind::Recent, r));
+            }
         }
         out
     }
 }
 
-impl Widget for ActivePanel<'_> {
+impl Widget for SessionDetailPanel<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let title_style = if self.focused {
             self.theme.highlight
         } else {
             self.theme.title
+        };
+        let title = match self.session_id {
+            Some(id) => format!(" session detail {} ", truncate(id, 12)),
+            None => " session detail ".to_owned(),
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -57,9 +73,9 @@ impl Widget for ActivePanel<'_> {
                 self.theme.border
             })
             .border_type(ratatui::widgets::BorderType::Rounded)
-            .title(Span::styled(" active / recent ", title_style));
+            .title(Span::styled(title, title_style));
 
-        let rows = Self::rows(self.snapshot);
+        let rows = Self::rows(self.snapshot, self.session_id);
         let items: Vec<ListItem> = rows
             .iter()
             .map(|(kind, r)| {
@@ -125,5 +141,53 @@ impl Widget for ActivePanel<'_> {
             buf,
             &mut state,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Request;
+    use std::time::Instant;
+
+    fn req(id: &str, session: &str) -> Request {
+        Request {
+            id: id.into(),
+            session_id: session.into(),
+            requested_model: "m".into(),
+            model: "m".into(),
+            status: 200,
+            error: String::new(),
+            error_type: String::new(),
+            failure_kind: None,
+            output_tokens: 0,
+            started_at: Instant::now(),
+            ended_at: None,
+            duration_ms: 0,
+            response_id: String::new(),
+            mapped: false,
+            lite: false,
+            fast: false,
+            auth_retried: false,
+            attempt: 1,
+            output_count: 0,
+            capture_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn rows_scoped_to_session() {
+        let snap = Snapshot {
+            active: vec![req("a1", "s1"), req("a2", "s2")],
+            recent: vec![req("r1", "s1"), req("r2", "s2"), req("r3", "s1")],
+            ..Default::default()
+        };
+        let rows = SessionDetailPanel::rows(&snap, Some("s1"));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].1.id, "a1");
+        assert_eq!(rows[1].1.id, "r1");
+        assert_eq!(rows[2].1.id, "r3");
+        assert!(SessionDetailPanel::rows(&snap, None).is_empty());
+        assert!(SessionDetailPanel::rows(&snap, Some("missing")).is_empty());
     }
 }

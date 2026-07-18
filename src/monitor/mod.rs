@@ -1,4 +1,4 @@
-//! Interactive serve monitor (ratatui panels: header / metrics / sessions / active / failures / footer).
+//! Interactive serve monitor (ratatui panels: header / metrics / sessions / session detail / failures / footer).
 
 mod app;
 mod theme;
@@ -26,8 +26,8 @@ use std::{
 };
 use theme::Theme;
 use widgets::{
-    ActivePanel, FailuresPanel, Footer, Header, HelpOverlay, MetricsStrip, SessionsPanel, TurnKind,
-    should_show_metrics, truncate,
+    FailuresPanel, Footer, Header, HelpOverlay, MetricsStrip, SessionDetailPanel, SessionsPanel,
+    TurnKind, active_sessions, fleet_avg_tok_s, should_show_metrics, truncate,
 };
 
 /// Below this width, panels stack as a single focused "tab" instead of side-by-side.
@@ -71,11 +71,20 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
 
     loop {
         let snapshot = dashboard.snapshot();
-        let sessions_len = snapshot.sessions.len();
-        let active_len = ActivePanel::row_count(&snapshot);
+        let active = active_sessions(&snapshot);
+        let sessions_len = active.len();
         let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
         app.tick_toast();
-        app.clamp_selection(sessions_len, active_len, failures_len);
+        app.sync_selected_session(&active);
+        let detail_len =
+            SessionDetailPanel::row_count(&snapshot, app.selected_session_id.as_deref());
+        app.clamp_selection(sessions_len, detail_len, failures_len);
+
+        // 1 Hz fleet-average tok/s sample for the metrics sparkline.
+        if app.should_sample_tok_s() {
+            dashboard.push_tok_s_sample(fleet_avg_tok_s(&snapshot));
+            app.mark_tok_sampled();
+        }
 
         terminal.draw(|frame| {
             draw(
@@ -96,8 +105,17 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
                 if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
-                if app.handle(key, sessions_len, active_len, failures_len) {
+                let prev_focus = app.focus;
+                if app.handle(key, sessions_len, detail_len, failures_len) {
                     return Ok(());
+                }
+                // After Tab into Sessions, restore selection to the pinned session.
+                if app.focus == Focus::Sessions && prev_focus != Focus::Sessions {
+                    app.restore_session_selection(&active);
+                }
+                // Sessions navigation updates the detail pin.
+                if app.focus == Focus::Sessions {
+                    app.pin_session_from_selection(&active);
                 }
                 // Report export: filtered failures → clipboard (y/Y) or file (w/W).
                 if let Some(outcome) = try_export(key.code, &snapshot, &app, address, version) {
@@ -116,7 +134,9 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
                 }
                 // Filter cycle (`f`) may shrink the list; re-clamp with new filter length.
                 let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
-                app.clamp_selection(sessions_len, active_len, failures_len);
+                let detail_len =
+                    SessionDetailPanel::row_count(&snapshot, app.selected_session_id.as_deref());
+                app.clamp_selection(sessions_len, detail_len, failures_len);
             }
         }
         tokio::task::yield_now().await;
@@ -234,7 +254,7 @@ fn draw(
         // Single focused panel (tab-like): Tab still cycles Sessions → Active → Failures.
         draw_focused_panel(body_area, buf, snapshot, app, theme);
     } else {
-        // Body: top row sessions|active, bottom full-width failures.
+        // Body: top row sessions|session detail, bottom full-width failures.
         let body = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -253,10 +273,11 @@ fn draw(
         }
         .render(top[0], buf);
 
-        ActivePanel {
+        SessionDetailPanel {
             snapshot,
+            session_id: app.selected_session_id.as_deref(),
             selected: app.selected,
-            focused: app.focus == Focus::Active && app.mode == Mode::Dashboard,
+            focused: app.focus == Focus::SessionDetail && app.mode == Mode::Dashboard,
             theme,
         }
         .render(top[1], buf);
@@ -301,8 +322,9 @@ fn draw_focused_panel(
             theme,
         }
         .render(area, buf),
-        Focus::Active => ActivePanel {
+        Focus::SessionDetail => SessionDetailPanel {
             snapshot,
+            session_id: app.selected_session_id.as_deref(),
             selected: app.selected,
             focused: dash,
             theme,
@@ -356,7 +378,8 @@ fn draw_detail(
 fn detail_text(snapshot: &Snapshot, app: &App) -> String {
     match app.focus {
         Focus::Sessions => {
-            if let Some(s) = snapshot.sessions.get(app.selected) {
+            let sessions = active_sessions(snapshot);
+            if let Some(s) = sessions.get(app.selected) {
                 let last = s.last_failure_kind.map(|k| k.as_str()).unwrap_or("-");
                 format!(
                     "Session {}\n  model: {}\n  requests: {}  active: {}  errors: {}\n  tokens: {}  tok/s: {:.1}\n  last_failure: {last}",
@@ -372,8 +395,9 @@ fn detail_text(snapshot: &Snapshot, app: &App) -> String {
                 "No session selected".into()
             }
         }
-        Focus::Active => {
-            let rows = ActivePanel::rows(snapshot);
+        Focus::SessionDetail => {
+            let rows =
+                SessionDetailPanel::rows(snapshot, app.selected_session_id.as_deref());
             if let Some((kind, r)) = rows.get(app.selected) {
                 let kind_label = match kind {
                     TurnKind::Active => "active",
@@ -574,7 +598,9 @@ mod tests {
     #[test]
     fn render_header_sessions_failures_footer() {
         let snap = fixture_dashboard().snapshot();
-        let app = App::new();
+        let mut app = App::new();
+        let active = active_sessions(&snap);
+        app.sync_selected_session(&active);
         let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(
             text.contains("grok-build-proxy"),
@@ -597,8 +623,8 @@ mod tests {
             "sessions panel title missing:\n{text}"
         );
         assert!(
-            text.contains("active / recent"),
-            "active panel title missing:\n{text}"
+            text.contains("session detail"),
+            "session detail panel title missing:\n{text}"
         );
         assert!(
             text.contains("failures"),
@@ -645,6 +671,8 @@ mod tests {
 
         let snap = fixture_dashboard().snapshot();
         let mut app = App::new();
+        let active = active_sessions(&snap);
+        app.sync_selected_session(&active);
         // Width < 80 → single focused panel (sessions by default).
         let text = render_test(60, 24, &snap, "127.0.0.1:1", "0.0.12", &app);
         assert!(
@@ -652,8 +680,8 @@ mod tests {
             "narrow should show focused sessions panel:\n{text}"
         );
         assert!(
-            !text.contains("active / recent"),
-            "narrow should hide non-focused active panel:\n{text}"
+            !text.contains("session detail"),
+            "narrow should hide non-focused session detail panel:\n{text}"
         );
         assert!(
             !text.contains("failures ["),
@@ -663,23 +691,23 @@ mod tests {
         // Tab advances focus under the real key path; re-render at narrow width.
         app.handle(
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-            snap.sessions.len(),
-            ActivePanel::row_count(&snap),
+            active.len(),
+            SessionDetailPanel::row_count(&snap, app.selected_session_id.as_deref()),
             FailuresPanel::row_count(&snap, app.failure_filter),
         );
-        assert_eq!(app.focus, Focus::Active);
+        assert_eq!(app.focus, Focus::SessionDetail);
         let text = render_test(60, 24, &snap, "127.0.0.1:1", "0.0.12", &app);
         assert!(
-            text.contains("active / recent"),
-            "narrow active focus should show active panel:\n{text}"
+            text.contains("session detail"),
+            "narrow session-detail focus should show session detail panel:\n{text}"
         );
         assert!(
             !text.contains("sessions"),
-            "narrow active focus should hide sessions title:\n{text}"
+            "narrow session-detail focus should hide sessions title:\n{text}"
         );
         assert!(
             !text.contains("failures ["),
-            "narrow active focus should hide failures title:\n{text}"
+            "narrow session-detail focus should hide failures title:\n{text}"
         );
 
         app.focus = Focus::Failures;
@@ -712,14 +740,20 @@ mod tests {
 
     #[test]
     fn metrics_strip_reflects_store_samples() {
-        let snap = fixture_dashboard().snapshot();
+        let d = fixture_dashboard();
+        let snap = d.snapshot();
         assert!(
             !snap.metrics_completed.is_empty(),
             "fixture should record completed samples"
         );
+        // tok/s spark ring is 1 Hz fleet avg (not per-completion); push one sample.
+        let avg = fleet_avg_tok_s(&snap);
+        assert!(avg > 0.0, "fixture sessions should have a positive fleet avg");
+        d.push_tok_s_sample(avg);
+        let snap = d.snapshot();
         assert!(
-            !snap.metrics_tok_per_s.is_empty(),
-            "fixture should record tok/s samples"
+            !snap.metrics_tok_s.is_empty(),
+            "push_tok_s_sample should fill metrics_tok_s"
         );
         // Fixture: 1 Completed + 2 Failed → fail% 67%, done 1ok/2f.
         assert_eq!(
@@ -740,10 +774,10 @@ mod tests {
             text.contains("1ok/2f"),
             "done activity should show 1ok/2f:\n{text}"
         );
-        // Non-zero tok/s from the completed turn (output_tokens / duration).
+        // Live fleet-average tok/s from session lifetime rates.
         assert!(
             text.contains("tok/s") && !text.contains("tok/s 0.0"),
-            "tok/s should be non-zero from fixture samples:\n{text}"
+            "tok/s should be non-zero from fixture session rates:\n{text}"
         );
     }
 
@@ -885,8 +919,10 @@ mod tests {
     fn detail_overlay_renders_turn_fields() {
         let snap = fixture_dashboard().snapshot();
         let mut app = App::new();
-        app.focus = Focus::Active;
-        app.selected = 0; // req-live (active first)
+        let active = active_sessions(&snap);
+        app.sync_selected_session(&active);
+        app.focus = Focus::SessionDetail;
+        app.selected = 0; // req-live (active first for pinned session)
         app.mode = Mode::Detail;
         let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(text.contains("detail"), "detail title missing:\n{text}");
@@ -909,6 +945,8 @@ mod tests {
     fn detail_overlay_renders_session_fields() {
         let snap = fixture_dashboard().snapshot();
         let mut app = App::new();
+        let active = active_sessions(&snap);
+        app.sync_selected_session(&active);
         app.focus = Focus::Sessions;
         app.selected = 0;
         app.mode = Mode::Detail;

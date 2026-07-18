@@ -32,7 +32,7 @@ impl Widget for HelpOverlay {
             Line::from(Span::styled("Monitor help", self.theme.highlight)),
             Line::from(""),
             Line::from("  ↑/k  ↓/j     move selection"),
-            Line::from("  Tab/Shift-Tab cycle panels (sessions → active → failures)"),
+            Line::from("  Tab/Shift-Tab cycle panels (sessions → session detail → failures)"),
             Line::from("  Enter        open details"),
             Line::from("  f            cycle failure filter"),
             Line::from("               All / ProxyAssemble / Upstream / Auth / Stream"),

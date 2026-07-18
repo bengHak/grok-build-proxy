@@ -1,6 +1,7 @@
-//! View state: mode, panel focus, selection, failure filter.
+//! View state: mode, panel focus, selection, failure filter, session pin.
 
 use crate::events::FailureKind;
+use crate::store::{Session, Snapshot};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -15,7 +16,7 @@ pub enum Mode {
 pub enum Focus {
     #[default]
     Sessions,
-    Active,
+    SessionDetail,
     Failures,
 }
 
@@ -80,10 +81,14 @@ pub struct App {
     pub focus: Focus,
     pub selected: usize,
     pub failure_filter: FailureFilter,
+    /// Pinned session for the session-detail panel (stable across list churn).
+    pub selected_session_id: Option<String>,
     /// Stable identity for Failure detail overlay (avoids index shift on push_front).
     pub detail_request_id: Option<String>,
     /// Wall-clock start of the monitor loop (for uptime).
     pub started_at: Option<std::time::Instant>,
+    /// Last time a fleet tok/s sample was pushed (1 Hz).
+    pub last_tok_sample_at: Option<std::time::Instant>,
     /// Transient footer status (export path / clipboard result).
     pub toast: Option<String>,
     toast_set_at: Option<std::time::Instant>,
@@ -128,11 +133,82 @@ impl App {
         }
     }
 
+    /// Keep `selected_session_id` aligned with the active-session list.
+    ///
+    /// When focus is Sessions, pin follows `selected`. Otherwise, if the pin
+    /// left the active set, re-pin to the clamped index or clear.
+    pub fn sync_selected_session(&mut self, active: &[&Session]) {
+        if active.is_empty() {
+            self.selected_session_id = None;
+            if self.focus == Focus::Sessions {
+                self.selected = 0;
+            }
+            return;
+        }
+        match self.focus {
+            Focus::Sessions => {
+                if self.selected >= active.len() {
+                    self.selected = active.len() - 1;
+                }
+                self.selected_session_id = Some(active[self.selected].id.clone());
+            }
+            Focus::SessionDetail | Focus::Failures => {
+                let still = self
+                    .selected_session_id
+                    .as_ref()
+                    .is_some_and(|id| active.iter().any(|s| s.id == *id));
+                if !still {
+                    let idx = self.selected.min(active.len() - 1);
+                    self.selected_session_id = Some(active[idx].id.clone());
+                }
+            }
+        }
+    }
+
+    /// Pin session id from the active list at `selected` (Sessions navigation).
+    pub fn pin_session_from_selection(&mut self, active: &[&Session]) {
+        if active.is_empty() {
+            self.selected_session_id = None;
+            return;
+        }
+        let idx = self.selected.min(active.len() - 1);
+        self.selected_session_id = Some(active[idx].id.clone());
+    }
+
+    /// Restore Sessions `selected` to the pinned session when tabbing back.
+    pub fn restore_session_selection(&mut self, active: &[&Session]) {
+        if let Some(id) = &self.selected_session_id {
+            if let Some(i) = active.iter().position(|s| s.id == *id) {
+                self.selected = i;
+                return;
+            }
+        }
+        self.selected = 0;
+        self.pin_session_from_selection(active);
+    }
+
+    /// True when at least one second has passed since the last tok/s sample.
+    pub fn should_sample_tok_s(&self) -> bool {
+        match self.last_tok_sample_at {
+            None => true,
+            Some(t) => t.elapsed().as_secs() >= 1,
+        }
+    }
+
+    pub fn mark_tok_sampled(&mut self) {
+        self.last_tok_sample_at = Some(std::time::Instant::now());
+    }
+
     /// Clamp selection into the focused panel's row count.
-    pub fn clamp_selection(&mut self, sessions_len: usize, active_len: usize, failures_len: usize) {
+    pub fn clamp_selection(
+        &mut self,
+        sessions_len: usize,
+        detail_len: usize,
+        failures_len: usize,
+    ) {
         let count = match self.focus {
             Focus::Sessions => sessions_len,
-            Focus::Active => active_len,
+            Focus::SessionDetail => detail_len,
             Focus::Failures => failures_len,
         };
         if count == 0 {
@@ -145,12 +221,12 @@ impl App {
     fn focus_count(
         focus: Focus,
         sessions_len: usize,
-        active_len: usize,
+        detail_len: usize,
         failures_len: usize,
     ) -> usize {
         match focus {
             Focus::Sessions => sessions_len,
-            Focus::Active => active_len,
+            Focus::SessionDetail => detail_len,
             Focus::Failures => failures_len,
         }
     }
@@ -165,11 +241,14 @@ impl App {
     /// On `f` with Failures focused, selection is reset to 0 and the in-handle clamp
     /// is skipped so callers must re-clamp with the **post-filter** `failures_len`
     /// (see `run` loop). Other keys clamp with the lengths passed here.
+    ///
+    /// After navigation that changes Sessions selection, the caller should call
+    /// [`Self::pin_session_from_selection`] with the current active-session list.
     pub fn handle(
         &mut self,
         key: KeyEvent,
         sessions_len: usize,
-        active_len: usize,
+        detail_len: usize,
         failures_len: usize,
     ) -> bool {
         match key.code {
@@ -191,7 +270,7 @@ impl App {
             KeyCode::Enter => {
                 if self.mode == Mode::Dashboard {
                     let count =
-                        Self::focus_count(self.focus, sessions_len, active_len, failures_len);
+                        Self::focus_count(self.focus, sessions_len, detail_len, failures_len);
                     if count > 0 {
                         self.mode = Mode::Detail;
                         // Failures: caller pins request_id via `pin_failure_detail`.
@@ -203,8 +282,8 @@ impl App {
             KeyCode::Tab => {
                 if self.mode == Mode::Dashboard {
                     self.focus = match self.focus {
-                        Focus::Sessions => Focus::Active,
-                        Focus::Active => Focus::Failures,
+                        Focus::Sessions => Focus::SessionDetail,
+                        Focus::SessionDetail => Focus::Failures,
                         Focus::Failures => Focus::Sessions,
                     };
                     self.selected = 0;
@@ -214,8 +293,8 @@ impl App {
                 if self.mode == Mode::Dashboard {
                     self.focus = match self.focus {
                         Focus::Sessions => Focus::Failures,
-                        Focus::Active => Focus::Sessions,
-                        Focus::Failures => Focus::Active,
+                        Focus::SessionDetail => Focus::Sessions,
+                        Focus::Failures => Focus::SessionDetail,
                     };
                     self.selected = 0;
                 }
@@ -234,15 +313,22 @@ impl App {
                 self.selected = self.selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') if self.mode == Mode::Dashboard => {
-                let count = Self::focus_count(self.focus, sessions_len, active_len, failures_len);
+                let count = Self::focus_count(self.focus, sessions_len, detail_len, failures_len);
                 if self.selected + 1 < count {
                     self.selected += 1;
                 }
             }
             _ => {}
         }
-        self.clamp_selection(sessions_len, active_len, failures_len);
+        self.clamp_selection(sessions_len, detail_len, failures_len);
         false
+    }
+
+    /// Convenience: pin from snapshot's active sessions (for tests).
+    #[cfg(test)]
+    pub fn sync_from_snapshot(&mut self, snapshot: &Snapshot) {
+        let ids: Vec<&Session> = snapshot.sessions.iter().filter(|s| s.active > 0).collect();
+        self.sync_selected_session(&ids);
     }
 }
 
@@ -250,9 +336,18 @@ impl App {
 mod tests {
     use super::*;
     use crate::events::FailureKind;
+    use crate::store::Session;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn sess(id: &str, active: u64) -> Session {
+        Session {
+            id: id.into(),
+            active,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -274,7 +369,7 @@ mod tests {
         let mut app = App::new();
         app.selected = 2;
         app.handle(key(KeyCode::Tab), 3, 5, 4);
-        assert_eq!(app.focus, Focus::Active);
+        assert_eq!(app.focus, Focus::SessionDetail);
         assert_eq!(app.selected, 0);
         app.handle(key(KeyCode::Tab), 3, 5, 4);
         assert_eq!(app.focus, Focus::Failures);
@@ -289,9 +384,40 @@ mod tests {
         app.handle(key(KeyCode::BackTab), 3, 5, 4);
         assert_eq!(app.focus, Focus::Failures);
         app.handle(key(KeyCode::BackTab), 3, 5, 4);
-        assert_eq!(app.focus, Focus::Active);
+        assert_eq!(app.focus, Focus::SessionDetail);
         app.handle(key(KeyCode::BackTab), 3, 5, 4);
         assert_eq!(app.focus, Focus::Sessions);
+    }
+
+    #[test]
+    fn sync_pin_follows_sessions_selection() {
+        let a = sess("a", 1);
+        let b = sess("b", 1);
+        let list = vec![&a, &b];
+        let mut app = App::new();
+        app.focus = Focus::Sessions;
+        app.selected = 1;
+        app.sync_selected_session(&list);
+        assert_eq!(app.selected_session_id.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn sync_clears_when_no_active_sessions() {
+        let mut app = App::new();
+        app.selected_session_id = Some("gone".into());
+        app.sync_selected_session(&[]);
+        assert!(app.selected_session_id.is_none());
+    }
+
+    #[test]
+    fn sync_repins_when_pin_leaves_active_set() {
+        let a = sess("a", 1);
+        let list = vec![&a];
+        let mut app = App::new();
+        app.focus = Focus::SessionDetail;
+        app.selected_session_id = Some("gone".into());
+        app.sync_selected_session(&list);
+        assert_eq!(app.selected_session_id.as_deref(), Some("a"));
     }
 
     #[test]
@@ -397,5 +523,11 @@ mod tests {
         assert_eq!(app.toast_message(), Some("copied 1 failure"));
         app.tick_toast();
         assert_eq!(app.toast_message(), Some("copied 1 failure"));
+    }
+
+    #[test]
+    fn should_sample_tok_s_initially() {
+        let app = App::new();
+        assert!(app.should_sample_tok_s());
     }
 }

@@ -1,13 +1,36 @@
 //! Metrics mid-strip: tok/s, error rate, and completed outcome sparklines.
 
 use crate::monitor::theme::Theme;
-use crate::store::Snapshot;
+use crate::store::{Session, Snapshot};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Widget},
 };
+
+/// Mean of per-session lifetime tok/s over sessions that have a defined rate.
+///
+/// Sessions with `sample_seconds == 0` (no completed output yet) are excluded.
+/// Used for the live metrics/header number; the sparkline uses 1 Hz samples of
+/// this same value pushed by the monitor loop.
+pub fn fleet_avg_tok_s(snapshot: &Snapshot) -> f64 {
+    fleet_avg_tok_s_from_sessions(&snapshot.sessions)
+}
+
+/// Testable core of [`fleet_avg_tok_s`].
+pub fn fleet_avg_tok_s_from_sessions(sessions: &[Session]) -> f64 {
+    let mut total = 0.0;
+    let mut n = 0usize;
+    for s in sessions {
+        let rate = s.tokens_per_second();
+        if rate > 0.0 {
+            total += rate;
+            n += 1;
+        }
+    }
+    if n == 0 { 0.0 } else { total / n as f64 }
+}
 
 /// Unicode block levels for a one-row sparkline (▁…█).
 const SPARK_LEVELS: &[char] = &['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
@@ -139,12 +162,9 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn from_snapshot(snapshot: &Snapshot) -> Self {
-        let tok_samples = snapshot.metrics_tok_per_s.clone();
-        let avg_tok_s = if tok_samples.is_empty() {
-            0.0
-        } else {
-            tok_samples.iter().sum::<f64>() / tok_samples.len() as f64
-        };
+        // Live number = fleet mean; sparkline = 1 Hz history ring.
+        let avg_tok_s = fleet_avg_tok_s(snapshot);
+        let tok_samples = snapshot.metrics_tok_s.clone();
 
         let completed = &snapshot.metrics_completed;
         let completed_ok = completed.iter().filter(|&&v| v >= 0.5).count();
@@ -261,17 +281,51 @@ mod tests {
     #[test]
     fn metrics_from_completed_samples() {
         let snap = Snapshot {
-            metrics_tok_per_s: vec![10.0, 20.0, 30.0],
+            metrics_tok_s: vec![10.0, 20.0, 30.0],
             metrics_completed: vec![1.0, 1.0, 0.0, 1.0], // 1 fail / 4
+            sessions: vec![
+                Session {
+                    id: "a".into(),
+                    output_tokens: 20,
+                    sample_seconds: 2.0, // 10 tok/s
+                    ..Default::default()
+                },
+                Session {
+                    id: "b".into(),
+                    output_tokens: 30,
+                    sample_seconds: 1.0, // 30 tok/s
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
         let m = Metrics::from_snapshot(&snap);
+        // Live avg = mean of session rates (10 + 30) / 2 = 20; spark ring is separate.
         assert!((m.avg_tok_s - 20.0).abs() < 1e-9);
+        assert_eq!(m.tok_samples, vec![10.0, 20.0, 30.0]);
         assert_eq!(m.completed_ok, 3);
         assert_eq!(m.completed_fail, 1);
         assert!((m.error_rate - 0.25).abs() < 1e-9);
         assert_eq!(m.error_samples, vec![0.0, 0.0, 1.0, 0.0]);
         assert_eq!(m.outcome_samples, vec![1.0, 1.0, 0.25, 1.0]);
+    }
+
+    #[test]
+    fn fleet_avg_excludes_zero_rate_sessions() {
+        assert!((fleet_avg_tok_s_from_sessions(&[]) - 0.0).abs() < 1e-9);
+        let sessions = vec![
+            Session {
+                id: "cold".into(),
+                ..Default::default()
+            },
+            Session {
+                id: "hot".into(),
+                output_tokens: 100,
+                sample_seconds: 4.0, // 25 tok/s
+                ..Default::default()
+            },
+        ];
+        assert!((fleet_avg_tok_s_from_sessions(&sessions) - 25.0).abs() < 1e-9);
     }
 
     #[test]

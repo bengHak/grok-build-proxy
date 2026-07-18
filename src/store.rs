@@ -63,7 +63,8 @@ pub struct Session {
     pub errors: u64,
     pub last_failure_kind: Option<FailureKind>,
     pub updated_at: Option<DateTime<Utc>>,
-    sample_seconds: f64,
+    /// Sum of completed-turn durations (seconds) used for lifetime tok/s.
+    pub(crate) sample_seconds: f64,
 }
 
 impl Session {
@@ -107,7 +108,8 @@ pub struct Snapshot {
     /// Legacy alias for failures (monitor UI).
     pub errors: Vec<Request>,
     pub failures: Vec<FailureRecord>,
-    pub metrics_tok_per_s: Vec<f64>,
+    /// 1 Hz fleet-average session tok/s samples (monitor pushes; not per-request).
+    pub metrics_tok_s: Vec<f64>,
     pub metrics_completed: Vec<f64>,
 }
 
@@ -120,7 +122,8 @@ struct State {
     completed: HashSet<String>,
     session_failure_counts: HashMap<String, u32>,
     failure_cap: usize,
-    metrics_tok_per_s: VecDeque<f64>,
+    /// Rolling 1 Hz fleet-average tok/s (filled by [`Dashboard::push_tok_s_sample`]).
+    metrics_tok_s: VecDeque<f64>,
     metrics_completed: VecDeque<f64>,
 }
 
@@ -135,7 +138,7 @@ impl Default for State {
             completed: HashSet::new(),
             session_failure_counts: HashMap::new(),
             failure_cap: failure_cap_from_env(),
-            metrics_tok_per_s: VecDeque::new(),
+            metrics_tok_s: VecDeque::new(),
             metrics_completed: VecDeque::new(),
         }
     }
@@ -186,9 +189,21 @@ impl Dashboard {
             recent: state.recent.iter().cloned().collect(),
             errors: state.errors.iter().cloned().collect(),
             failures: state.failures.iter().cloned().collect(),
-            metrics_tok_per_s: state.metrics_tok_per_s.iter().copied().collect(),
+            metrics_tok_s: state.metrics_tok_s.iter().copied().collect(),
             metrics_completed: state.metrics_completed.iter().copied().collect(),
         }
+    }
+
+    /// Append one fleet-average tok/s sample (call at most ~1 Hz from the monitor).
+    pub fn push_tok_s_sample(&self, tok_s: f64) {
+        let mut state = lock_state(&self.inner);
+        let v = if tok_s.is_finite() && tok_s >= 0.0 {
+            tok_s
+        } else {
+            0.0
+        };
+        state.metrics_tok_s.push_back(v);
+        state.metrics_tok_s.truncate(METRICS_CAP);
     }
 
     /// Failures for later report export (newest first). Optional kind filter.
@@ -308,7 +323,6 @@ impl Dashboard {
 
                 let duration_secs = request.duration().as_secs_f64();
                 let failed = event.kind == RequestEventKind::Failed;
-                let tok_s = request.tokens_per_second();
 
                 state.recent.push_front(request.clone());
                 state.recent.truncate(RECENT_CAP);
@@ -354,15 +368,11 @@ impl Dashboard {
                     state.failures.truncate(cap);
                 }
 
-                // Rolling metrics samples
+                // Rolling outcome samples for fail%/done sparklines (tok/s is 1 Hz fleet avg).
                 state
                     .metrics_completed
                     .push_back(if failed { 0.0 } else { 1.0 });
                 state.metrics_completed.truncate(METRICS_CAP);
-                if event.output_tokens > 0 {
-                    state.metrics_tok_per_s.push_back(tok_s);
-                    state.metrics_tok_per_s.truncate(METRICS_CAP);
-                }
 
                 let session = state
                     .sessions
@@ -531,6 +541,28 @@ mod tests {
         assert!(s.active[0].auth_retried);
         assert_eq!(s.sessions[0].requests, 1); // not double-counted
         assert_eq!(s.sessions[0].active, 1);
+    }
+
+    #[test]
+    fn push_tok_s_sample_fills_ring() {
+        let d = Dashboard::new();
+        assert!(d.snapshot().metrics_tok_s.is_empty());
+        d.push_tok_s_sample(12.5);
+        d.push_tok_s_sample(-1.0); // clamped to 0
+        let s = d.snapshot();
+        assert_eq!(s.metrics_tok_s, vec![12.5, 0.0]);
+    }
+
+    #[test]
+    fn completion_does_not_push_tok_s_ring() {
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        d.observe(base_event(RequestEventKind::Completed));
+        assert!(
+            d.snapshot().metrics_tok_s.is_empty(),
+            "tok/s ring is 1 Hz fleet avg, not per-request"
+        );
+        assert_eq!(d.snapshot().metrics_completed, vec![1.0]);
     }
 
     #[test]

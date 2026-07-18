@@ -1,8 +1,8 @@
-//! Left panel: session list (id, model, requests, errors, tok/s).
+//! Left panel: active sessions only (id, model, requests, errors, tok/s).
 
 use super::truncate;
 use crate::monitor::theme::Theme;
-use crate::store::Snapshot;
+use crate::store::{Session, Snapshot};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -11,11 +11,22 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, StatefulWidget, Widget},
 };
 
+/// Sessions with at least one in-flight request (`active > 0`), store order preserved.
+pub fn active_sessions(snapshot: &Snapshot) -> Vec<&Session> {
+    snapshot.sessions.iter().filter(|s| s.active > 0).collect()
+}
+
 pub struct SessionsPanel<'a> {
     pub snapshot: &'a Snapshot,
     pub selected: usize,
     pub focused: bool,
     pub theme: Theme,
+}
+
+impl SessionsPanel<'_> {
+    pub fn row_count(snapshot: &Snapshot) -> usize {
+        active_sessions(snapshot).len()
+    }
 }
 
 impl Widget for SessionsPanel<'_> {
@@ -35,9 +46,8 @@ impl Widget for SessionsPanel<'_> {
             .border_type(ratatui::widgets::BorderType::Rounded)
             .title(Span::styled(" sessions ", title_style));
 
-        let items: Vec<ListItem> = self
-            .snapshot
-            .sessions
+        let sessions = active_sessions(self.snapshot);
+        let items: Vec<ListItem> = sessions
             .iter()
             .map(|s| {
                 let err_tag = s
@@ -67,8 +77,8 @@ impl Widget for SessionsPanel<'_> {
             .collect();
 
         let mut state = ListState::default();
-        if self.focused && !self.snapshot.sessions.is_empty() {
-            state.select(Some(self.selected.min(self.snapshot.sessions.len() - 1)));
+        if self.focused && !sessions.is_empty() {
+            state.select(Some(self.selected.min(sessions.len() - 1)));
         }
 
         StatefulWidget::render(
@@ -80,5 +90,36 @@ impl Widget for SessionsPanel<'_> {
             buf,
             &mut state,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Session;
+
+    #[test]
+    fn active_sessions_filters_idle() {
+        let snap = Snapshot {
+            sessions: vec![
+                Session {
+                    id: "idle".into(),
+                    active: 0,
+                    requests: 3,
+                    ..Default::default()
+                },
+                Session {
+                    id: "live".into(),
+                    active: 2,
+                    requests: 5,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let list = active_sessions(&snap);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "live");
+        assert_eq!(SessionsPanel::row_count(&snap), 1);
     }
 }
