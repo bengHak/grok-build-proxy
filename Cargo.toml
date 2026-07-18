@@ -2,7 +2,7 @@
 name = "grok-build-proxy"
 version = "0.0.12"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A local Grok Build to ChatGPT Codex proxy for macOS"
 license = "MIT"
 repository = "https://github.com/bengHak/grok-build-proxy"
