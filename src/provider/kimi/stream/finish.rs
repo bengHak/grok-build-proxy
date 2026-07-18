@@ -129,7 +129,7 @@ impl Translator {
             .collect()
     }
 
-    pub(super) fn fail(&mut self, error: &Value) -> Vec<u8> {
+    pub fn fail(&mut self, error: &Value) -> Vec<u8> {
         let mut output = self.start();
         self.terminal = true;
         let mut response = self.response("failed", Vec::new());

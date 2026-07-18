@@ -206,3 +206,112 @@ async fn kimi_upstream(
         ),
     )
 }
+
+#[tokio::test]
+async fn kimi_non_success_is_mapped_to_responses_error_contract() {
+    let capture = Capture::default();
+    let upstream = Router::new()
+        .route("/chat/completions", post(kimi_error_upstream))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    let directory = tempfile::tempdir().unwrap();
+    let auth_path = directory.path().join("auth.json");
+    tokio::fs::write(
+        &auth_path,
+        br#"{"access":"kimi-token","refresh":"refresh","expires":4102444800000,"userId":"user-1"}"#,
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(directory.path().join("device_id"), "device-1\n")
+        .await
+        .unwrap();
+
+    let app = router(ProxyConfig {
+        upstream_url: "http://127.0.0.1:9/responses".into(),
+        credentials: Arc::new(CodexCredentials),
+        kimi: Some(KimiConfig {
+            upstream_url: format!("http://{address}/chat/completions"),
+            credentials: Arc::new(KimiStore::new(&auth_path, "http://127.0.0.1:9").unwrap()),
+        }),
+        catalog: Catalog::default(),
+        model_map: ModelMap::default(),
+        client: reqwest::Client::new(),
+        client_token: String::new(),
+        version: "test".into(),
+        compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+        responses_compat: CompatMode::Full,
+        observer: None,
+        max_body_bytes: 4096,
+    })
+    .unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"kimi-k2.6","input":"hello","stream":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["message"], "too many requests");
+    // Must not leak Chat Completions-shaped fields as the top-level payload.
+    assert!(body.get("choices").is_none());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"model":"kimi-k2.6","input":"hello","stream":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/event-stream; charset=utf-8"
+    );
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("response.failed"));
+    assert!(body.contains("rate_limit_error"));
+    assert!(body.contains("too many requests"));
+    assert!(body.contains("data: [DONE]"));
+    assert!(!body.contains("\"choices\""));
+}
+
+async fn kimi_error_upstream(
+    State(capture): State<Capture>,
+    headers: HeaderMap,
+    Json(request): Json<Value>,
+) -> impl IntoResponse {
+    capture.0.lock().await.push((headers, request));
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":{"type":"rate_limit_error","message":"too many requests"},"choices":[]}"#,
+    )
+}

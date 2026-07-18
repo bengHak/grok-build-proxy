@@ -572,6 +572,62 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let headers = upstream.headers().clone();
+    let observer = s.0.observer.clone();
+    // Kimi non-2xx: never pass Chat Completions error bodies through to Responses clients.
+    if transformed.provider == Provider::Kimi && !status.is_success() {
+        let upstream_body = match upstream.bytes().await {
+            Ok(body) => body,
+            Err(upstream_error) => {
+                observe_failure(
+                    &s.0,
+                    &base_event,
+                    FailureKind::StreamIo,
+                    "stream_io",
+                    upstream_error.to_string(),
+                    StatusCode::BAD_GATEWAY,
+                );
+                return with_request_id(
+                    error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_error",
+                        upstream_error.to_string(),
+                    ),
+                    &request_id,
+                );
+            }
+        };
+        let (error_type, message) = kimi_upstream_error(&upstream_body, status);
+        if transformed.stream {
+            let mut translator = kimi::stream::Translator::new(&request_id, kimi::WIRE_MODEL);
+            let capture = translator.fail(&json!({
+                "type": error_type,
+                "message": message,
+            }));
+            observe_stream_end(&observer, base_event.clone(), status, &capture, None);
+            let mut response = Response::builder()
+                .status(status)
+                .body(Body::from(capture))
+                .unwrap();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream; charset=utf-8"),
+            );
+            response.headers_mut().insert(
+                "x-grok-build-proxy-version",
+                HeaderValue::from_str(&s.0.version).unwrap_or(HeaderValue::from_static("dev")),
+            );
+            return with_request_id(response, &request_id);
+        }
+        let payload = json!({"error":{"type":error_type,"message":message.clone()}});
+        let capture = serde_json::to_vec(&payload).unwrap_or_default();
+        observe_stream_end(&observer, base_event.clone(), status, &capture, None);
+        let mut response = with_request_id(error(status, &error_type, message), &request_id);
+        response.headers_mut().insert(
+            "x-grok-build-proxy-version",
+            HeaderValue::from_str(&s.0.version).unwrap_or(HeaderValue::from_static("dev")),
+        );
+        return response;
+    }
     let is_sse = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -581,7 +637,6 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         && status.is_success()
         && (is_sse || transformed.stream);
     let translate_kimi = transformed.provider == Provider::Kimi && status.is_success();
-    let observer = s.0.observer.clone();
     let body = if translate_kimi && transformed.stream {
         let mut source = upstream.bytes_stream();
         let mut translator = kimi::stream::Translator::new(&request_id, kimi::WIRE_MODEL);
@@ -599,9 +654,17 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
                         }
                     }
                     Err(error) => {
+                        // Emit a Responses terminal so clients already mid-stream are fail-closed.
                         let message = error.to_string();
-                        guard.finish(Some(message.clone()));
-                        yield Err(std::io::Error::other(message));
+                        let output = translator.fail(&json!({
+                            "type": "upstream_error",
+                            "message": message,
+                        }));
+                        capture_tail(&mut guard.capture, &output);
+                        guard.finish(None);
+                        if !output.is_empty() {
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(output));
+                        }
                         return;
                     }
                 }
@@ -740,6 +803,38 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     );
     response
 }
+/// Map a Kimi Chat Completions error body into Responses-style type/message fields.
+fn kimi_upstream_error(body: &[u8], status: StatusCode) -> (String, String) {
+    let value: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let error = value.get("error");
+    let error_type = error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("upstream_error")
+        .to_owned();
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            error
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("upstream HTTP {}", status.as_u16()));
+    (error_type, message)
+}
+
 fn capture_tail(buffer: &mut Vec<u8>, chunk: &[u8]) {
     const LIMIT: usize = 256 << 10;
     if chunk.len() >= LIMIT {

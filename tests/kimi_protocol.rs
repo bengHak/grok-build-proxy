@@ -299,6 +299,37 @@ fn kimi_tool_item_is_added_once_when_the_first_argument_fragment_is_empty() {
 }
 
 #[test]
+fn kimi_stream_fail_emits_terminal_after_partial_output() {
+    let mut translator = Translator::new("resp_kimi", "kimi-for-coding");
+    let partial = translator.push(
+        br#"data: {"choices":[{"delta":{"content":"hello"}}]}
+
+"#,
+    );
+    assert!(!partial.is_empty());
+    let failed = translator.fail(&serde_json::json!({
+        "type": "upstream_error",
+        "message": "upstream chunk error",
+    }));
+    let parsed = events(&failed);
+    let kinds: Vec<_> = parsed
+        .iter()
+        .filter_map(|event| event["type"].as_str())
+        .collect();
+    assert!(kinds.contains(&"response.failed"));
+    assert!(!kinds.contains(&"response.completed"));
+    assert_eq!(
+        parsed
+            .iter()
+            .find(|event| event["type"] == "response.failed")
+            .unwrap()["response"]["error"]["message"],
+        "upstream chunk error"
+    );
+    // A second fail/finish must not emit another terminal.
+    assert!(translator.finish().is_empty());
+}
+
+#[test]
 fn kimi_credential_endpoints_reject_untrusted_origins() {
     assert!(Store::new("auth.json", "https://auth.kimi.com").is_ok());
     assert!(Store::new("auth.json", "http://127.0.0.1:3000").is_ok());
