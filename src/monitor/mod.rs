@@ -32,6 +32,8 @@ use widgets::{
 
 /// Below this width, panels stack as a single focused "tab" instead of side-by-side.
 const NARROW_WIDTH: u16 = 80;
+/// Below this height, use the focused-panel layout so inspector fields are not clipped.
+const SHORT_HEIGHT: u16 = 28;
 
 use crate::report::{self, ReportMeta};
 pub use crate::store::{Dashboard, FailureRecord, Request, Session, Snapshot};
@@ -75,6 +77,7 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
         let sessions_len = SessionsPanel::row_count(&snapshot);
         let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
         app.tick_toast();
+        app.refresh_selected_session_availability(&snapshot.sessions);
         app.sync_selected_session(&active);
         let detail_len =
             SessionDetailPanel::row_count(&snapshot, app.selected_session_key.as_deref());
@@ -218,7 +221,7 @@ fn draw(
     }
 
     let show_metrics = should_show_metrics(area.width, area.height);
-    let narrow = area.width < NARROW_WIDTH;
+    let narrow = area.width < NARROW_WIDTH || area.height < SHORT_HEIGHT;
 
     let chunks = if show_metrics {
         Layout::default()
@@ -315,7 +318,7 @@ fn draw(
     }
 }
 
-/// Narrow terminal: only the focused panel fills the body (Tab cycles).
+/// Narrow or short terminal: only the focused panel fills the body (Tab cycles).
 fn draw_focused_panel(
     area: Rect,
     buf: &mut ratatui::buffer::Buffer,
@@ -389,25 +392,61 @@ fn detail_text(snapshot: &Snapshot, app: &App) -> String {
     match app.focus {
         Focus::Sessions => {
             let sessions = active_sessions(snapshot);
-            if let Some(s) = sessions.get(app.selected) {
-                let last = s.last_failure_kind.map(|k| k.as_str()).unwrap_or("-");
-                format!(
-                    "Session {}\n  model: {}\n  requests: {}  active: {}  errors: {}\n  tokens: {}  tok/s: {:.1}\n  last_failure: {last}",
-                    s.id,
-                    s.last_model,
-                    s.requests,
-                    s.active,
-                    s.errors,
-                    s.output_tokens,
-                    s.tokens_per_second(),
-                )
-            } else {
-                "No session selected".into()
+            match sessions.get(app.selected) {
+                Some(s) => session_detail_text(s, snapshot),
+                None => "No session selected".into(),
             }
         }
-        Focus::SessionDetail => turn_detail_text(snapshot, app),
+        Focus::SessionDetail => {
+            // Prefer a selected/pinned turn; fall back to the session summary when
+            // the inspector has no turn rows yet.
+            let turn_rows =
+                SessionDetailPanel::row_count(snapshot, app.selected_session_key.as_deref());
+            if app.detail_turn_key.is_some() || turn_rows > 0 {
+                turn_detail_text(snapshot, app)
+            } else {
+                match SessionDetailPanel::session(snapshot, app.selected_session_key.as_deref()) {
+                    Some(s) => session_detail_text(s, snapshot),
+                    None => "No session selected".into(),
+                }
+            }
+        }
         Focus::Failures => failure_detail_text(snapshot, app),
     }
+}
+
+fn session_detail_text(session: &Session, snapshot: &Snapshot) -> String {
+    let last = session.last_failure_kind.map(|k| k.as_str()).unwrap_or("-");
+    let updated = session
+        .updated_at
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| "-".into());
+    let fail_n = SessionDetailPanel::session_failures(snapshot, Some(session.id.as_str())).len();
+    let turns = SessionDetailPanel::row_count(snapshot, Some(session.id.as_str()));
+    let cwd = if session.cwd.is_empty() {
+        "-"
+    } else {
+        session.cwd.as_str()
+    };
+    let prompt = if session.last_prompt.is_empty() {
+        "-"
+    } else {
+        session.last_prompt.as_str()
+    };
+    format!(
+        "Session {}\n  model: {}\n  requests: {}  active: {}  errors: {}\n  tokens: {}  tok/s: {:.1}\n  last_failure: {last}\n  fail_ring: {fail_n}  turns_visible: {turns}\n  updated: {updated}\n  cwd: {cwd}\n  last_prompt: {prompt}",
+        session.id,
+        if session.last_model.is_empty() {
+            "-"
+        } else {
+            session.last_model.as_str()
+        },
+        session.requests,
+        session.active,
+        session.errors,
+        session.output_tokens,
+        session.tokens_per_second(),
+    )
 }
 
 fn turn_detail_text(snapshot: &Snapshot, app: &App) -> String {
@@ -598,6 +637,7 @@ mod tests {
     fn fixture_dashboard() -> Dashboard {
         let d = Dashboard::new();
         d.observe(base_event(RequestEventKind::Started));
+        d.observe_session_context("sess-abc", "inspect this session", "/tmp/grok-project");
         d.observe(base_event(RequestEventKind::Completed));
         let mut fail = base_event(RequestEventKind::Started);
         fail.request_id = "req-2".into();
@@ -660,6 +700,18 @@ mod tests {
         assert!(
             text.contains("session detail"),
             "session detail panel title missing:\n{text}"
+        );
+        assert!(
+            text.contains("reqs")
+                && text.contains("tokens")
+                && text.contains("last")
+                && text.contains("cwd")
+                && text.contains("prompt"),
+            "session detail summary fields missing:\n{text}"
+        );
+        assert!(
+            text.contains("turns") && (text.contains("active") || text.contains("recent")),
+            "session detail turns subheader missing:\n{text}"
         );
         assert!(
             text.contains("failures"),
@@ -754,6 +806,33 @@ mod tests {
         assert!(
             !text.contains("sessions"),
             "narrow failures focus should hide sessions title:\n{text}"
+        );
+    }
+
+    #[test]
+    fn standard_80x24_session_detail_keeps_all_summary_fields() {
+        let snap = fixture_dashboard().snapshot();
+        let mut app = App::new();
+        let active = active_sessions(&snap);
+        app.sync_selected_session(&active);
+        app.focus = Focus::SessionDetail;
+        let text = render_test(80, 24, &snap, "127.0.0.1:1", "0.0.12", &app);
+        for field in ["reqs", "tokens", "last", "upd", "cwd", "prompt", "turns"] {
+            assert!(
+                text.contains(field),
+                "missing {field} at 80x24:
+{text}"
+            );
+        }
+        assert!(
+            text.contains("/tmp/grok-project"),
+            "cwd value missing:
+{text}"
+        );
+        assert!(
+            text.contains("inspect this session"),
+            "prompt value missing:
+{text}"
         );
     }
 

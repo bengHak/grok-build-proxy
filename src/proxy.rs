@@ -246,6 +246,124 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
     Json(json!({"object":"list","data":data})).into_response()
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SessionContext {
+    last_prompt: String,
+    cwd: String,
+}
+
+fn extract_session_context(raw: &[u8], headers: &HeaderMap) -> SessionContext {
+    let Ok(value) = serde_json::from_slice::<Value>(raw) else {
+        return SessionContext::default();
+    };
+    let last_prompt = value
+        .get("input")
+        .and_then(last_user_prompt)
+        .map(|text| sanitize(&text))
+        .unwrap_or_default();
+    let cwd = ["x-grok-workspace-path", "x-codex-cwd", "x-workspace-path"]
+        .iter()
+        .filter_map(|key| headers.get(*key)?.to_str().ok())
+        .find(|value| valid_header(value))
+        .map(str::to_owned)
+        .or_else(|| client_metadata_path(&value))
+        .or_else(|| {
+            value
+                .get("instructions")
+                .and_then(cwd_from_value)
+                .or_else(|| value.get("input").and_then(cwd_from_value))
+        })
+        .map(|path| sanitize(&path))
+        .unwrap_or_default();
+    SessionContext { last_prompt, cwd }
+}
+
+fn last_user_prompt(input: &Value) -> Option<String> {
+    match input {
+        Value::String(text) => non_empty(text),
+        Value::Array(items) => items.iter().rev().find_map(|item| {
+            if item.get("role").and_then(Value::as_str) != Some("user") {
+                return None;
+            }
+            message_text(item)
+        }),
+        _ => None,
+    }
+}
+
+fn message_text(item: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_text(item.get("content").unwrap_or(item), &mut parts);
+    non_empty(&parts.join("\n"))
+}
+
+fn collect_text(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(text) = non_empty(text) {
+                parts.push(text);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_text(value, parts);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(text) = object.get("text").and_then(Value::as_str)
+                && let Some(text) = non_empty(text)
+            {
+                parts.push(text);
+            } else if let Some(content) = object.get("content") {
+                collect_text(content, parts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value.to_owned())
+}
+
+fn client_metadata_path(value: &Value) -> Option<String> {
+    let metadata = value.get("client_metadata")?.as_object()?;
+    for key in [
+        "cwd",
+        "current_working_directory",
+        "working_directory",
+        "workspace_root",
+        "project_path",
+        "repository_path",
+    ] {
+        if let Some(path) = metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(non_empty)
+        {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn cwd_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => cwd_tag(text),
+        Value::Array(values) => values.iter().find_map(cwd_from_value),
+        Value::Object(object) => object.values().find_map(cwd_from_value),
+        _ => None,
+    }
+}
+
+fn cwd_tag(text: &str) -> Option<String> {
+    let start = text.find("<cwd>")? + "<cwd>".len();
+    let rest = &text[start..];
+    let end = rest.find("</cwd>")?;
+    non_empty(&rest[..end])
+}
+
 #[derive(Debug)]
 pub struct TransformedRequest {
     pub body: Vec<u8>,
@@ -385,6 +503,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             );
         }
     };
+    let session_context = extract_session_context(&body, &incoming_headers);
     let transformed = match transform_request(&body, &s.0.catalog, &s.0.model_map) {
         Ok(v) => v,
         Err(e) => {
@@ -434,6 +553,11 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     };
     if let Some(observer) = &s.0.observer {
         observer.observe(base_event.clone());
+        observer.observe_session_context(
+            &session_id,
+            &session_context.last_prompt,
+            &session_context.cwd,
+        );
     }
     let mut upstream =
         match send_upstream(&s.0, &transformed, &incoming_headers, &session_id, false).await {
@@ -1175,6 +1299,43 @@ mod tests {
         assert_eq!(v["input"][1]["role"], "developer");
         assert_eq!(v["input"][2]["role"], "user");
     }
+
+    #[test]
+    fn extracts_latest_user_prompt_and_metadata_cwd() {
+        let headers = HeaderMap::new();
+        let context = extract_session_context(
+  br#"{
+      "client_metadata":{"cwd":"/tmp/project"},
+      "input":[
+          {"role":"user","content":[{"type":"input_text","text":"older"}]},
+          {"role":"assistant","content":[{"type":"output_text","text":"answer"}]},
+          {"role":"user","content":[{"type":"input_text","text":"latest"},{"type":"input_text","text":"prompt"}]}
+      ]
+  }"#,
+  &headers,
+        );
+        assert_eq!(context.last_prompt, "latest prompt");
+        assert_eq!(context.cwd, "/tmp/project");
+    }
+
+    #[test]
+    fn extracts_environment_cwd_with_header_precedence() {
+        let raw = br#"{
+  "model":"gpt-5.6-sol",
+  "input":[
+      {"role":"developer","content":[{"type":"input_text","text":"<environment_context><cwd>/from/body</cwd></environment_context>"}]},
+      {"role":"user","content":[{"type":"input_text","text":"hello"}]}
+  ]
+        }"#;
+        let body_context = extract_session_context(raw, &HeaderMap::new());
+        assert_eq!(body_context.cwd, "/from/body");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-cwd", HeaderValue::from_static("/from/header"));
+        let header_context = extract_session_context(raw, &headers);
+        assert_eq!(header_context.cwd, "/from/header");
+    }
+
     #[test]
     fn normalizes_terminal() {
         let input=b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n";

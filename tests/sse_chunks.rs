@@ -32,6 +32,7 @@ fn normalization_is_invariant_to_network_chunk_boundaries() {
     let input=b"event: response.created\r\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_chunks\"}}\r\n\r\nevent: keepalive\r\ndata: {\"type\":\"keepalive\"}\r\n\r\nevent: response.output_text.delta\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"chunk safe\"}\r\n\r\ndata: [DONE]\r\n\r\n";
     let expected = normalize_sse(input, CompatMode::Full, "gpt-5.6-sol", "chunks");
     assert!(!String::from_utf8_lossy(&expected).contains("keepalive"));
+    let expected = stable_sse_bytes(&expected);
     for size in 1..=input.len() {
         let mut normalizer = StreamNormalizer::new(CompatMode::Full, "gpt-5.6-sol", "chunks");
         let mut actual = Vec::new();
@@ -39,6 +40,26 @@ fn normalization_is_invariant_to_network_chunk_boundaries() {
             actual.extend(normalizer.push(chunk));
         }
         actual.extend(normalizer.finish());
-        assert_eq!(actual, expected, "chunk size {size}");
+        assert_eq!(stable_sse_bytes(&actual), expected, "chunk size {size}");
     }
+}
+
+/// Zero wall-clock `created_at` values so comparisons are not flaky across second
+/// boundaries (normalize injects `Utc::now()` when the field is missing).
+fn stable_sse_bytes(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_ref();
+    let marker = "\"created_at\":";
+    while let Some(index) = rest.find(marker) {
+        out.push_str(&rest[..index]);
+        out.push_str(marker);
+        out.push('0');
+        rest = &rest[index + marker.len()..];
+        while rest.chars().next().is_some_and(|ch| ch.is_ascii_digit()) {
+            rest = &rest[1..];
+        }
+    }
+    out.push_str(rest);
+    out.into_bytes()
 }
