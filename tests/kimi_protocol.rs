@@ -232,6 +232,11 @@ fn kimi_stream_fails_closed_on_truncated_or_invalid_tool_calls() {
             "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":["
         ),
+        concat!(
+            "data: {\"choices\":[{\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n"
+        ),
     ] {
         let parsed = events(&translate_stream(upstream.as_bytes(), upstream.len()));
         let kinds: Vec<_> = parsed

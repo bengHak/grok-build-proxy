@@ -149,6 +149,16 @@ impl Translator {
         if let Some(error) = chunk.get("error") {
             return self.fail(error);
         }
+        let choice = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first());
+        if self.finish_reason.is_some() && choice.is_some() {
+            return self.fail(&json!({
+                "type":"upstream_error",
+                "message":"Kimi returned output after finish_reason"
+            }));
+        }
         let mut output = self.start();
         if let Some(usage) = chunk.get("usage") {
             self.usage = json!({
@@ -166,11 +176,7 @@ impl Translator {
                 }),
             });
         }
-        let Some(choice) = chunk
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|v| v.first())
-        else {
+        let Some(choice) = choice else {
             return output;
         };
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
