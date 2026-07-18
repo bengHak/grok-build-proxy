@@ -793,7 +793,7 @@ impl StreamNormalizer {
                 lines.push(value.strip_prefix(' ').unwrap_or(value).to_owned())
             }
         }
-        if name.as_deref() == Some("response.metadata") {
+        if matches!(name.as_deref(), Some("response.metadata" | "keepalive")) {
             return Vec::new();
         }
         if lines.is_empty() {
@@ -811,6 +811,9 @@ impl StreamNormalizer {
         let Ok(event) = serde_json::from_str::<Value>(&data) else {
             return frame.to_vec();
         };
+        if event.get("type").and_then(Value::as_str) == Some("keepalive") {
+            return Vec::new();
+        }
         match self
             .assembler
             .normalize(event, name.as_deref().unwrap_or(""))
@@ -964,6 +967,36 @@ data: {"type":"response.completed","response":{"id":"resp_text","output":[]}}
         let out = String::from_utf8(normalize_sse(stream.as_bytes(), CompatMode::Full, "m", "r"))
             .unwrap();
         assert!(!out.contains("secret"));
+        assert!(out.contains("response.completed"));
+        assert!(out.contains("ok"));
+    }
+    #[test]
+    fn keepalive_events_are_dropped() {
+        let stream = r#"event: keepalive
+data: {"type":"keepalive"}
+
+event: keepalive
+
+event: ping
+data: {"type":"keepalive"}
+
+event: response.created
+data: {"type":"response.created","response":{}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"ok"}
+
+data: [DONE]
+
+"#;
+        let out = String::from_utf8(normalize_sse(
+            stream.as_bytes(),
+            CompatMode::Full,
+            "model",
+            "request",
+        ))
+        .unwrap();
+        assert!(!out.contains("keepalive"));
         assert!(out.contains("response.completed"));
         assert!(out.contains("ok"));
     }
