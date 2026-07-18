@@ -86,8 +86,9 @@ that can use the selected Codex model.
 When standard input and output are attached to a terminal, `grok-build-proxy
 serve` (and the default `grok-build-proxy` command) opens an interactive monitor
 instead of scrolling logs. It shows sessions, active and recent requests, a
-metrics strip (tok/s, error rate, completed activity sparklines from store
-samples), and a failures panel classified from real proxy traffic.
+metrics strip (tok/s, rolling `fail%`, completed activity sparklines from store
+samples — distinct from the header `err●N` failure-ring count), and a failures
+panel classified from real proxy traffic.
 
 **Keybindings**
 
@@ -111,9 +112,8 @@ short to keep the body panels usable.
 
 - Path: `~/.grok/proxy-reports/failure-YYYYMMDD-HHMMSS.md` (or `.json` with
   `W` / `Y`). The directory is created with mode `0700` and files with `0600`.
-- Contents: failure metadata only (kind, status, sanitized error summary,
-  attempt, session id, timing). Request/response bodies and credentials are
-  never included. See [`SECURITY.md`](SECURITY.md).
+- Contents: `FailureRecord` metadata only (no prompt/response bodies or
+  credentials). See [`SECURITY.md`](SECURITY.md).
 
 **Failure kinds** (filter groups in parentheses)
 

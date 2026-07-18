@@ -620,13 +620,15 @@ mod tests {
             "metrics strip title missing on tall/wide terminal:\n{text}"
         );
         assert!(
-            text.contains("tok/s") && text.contains("err") && text.contains("done"),
+            text.contains("tok/s") && text.contains("fail%") && text.contains("done"),
             "metrics strip labels missing:\n{text}"
         );
     }
 
     #[test]
     fn narrow_terminal_shows_only_focused_panel() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
         let snap = fixture_dashboard().snapshot();
         let mut app = App::new();
         // Width < 80 → single focused panel (sessions by default).
@@ -642,6 +644,28 @@ mod tests {
         assert!(
             !text.contains("failures ["),
             "narrow should hide non-focused failures panel:\n{text}"
+        );
+
+        // Tab advances focus under the real key path; re-render at narrow width.
+        app.handle(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            snap.sessions.len(),
+            ActivePanel::row_count(&snap),
+            FailuresPanel::row_count(&snap, app.failure_filter),
+        );
+        assert_eq!(app.focus, Focus::Active);
+        let text = render_test(60, 24, &snap, "127.0.0.1:1", "0.0.12", &app);
+        assert!(
+            text.contains("active / recent"),
+            "narrow active focus should show active panel:\n{text}"
+        );
+        assert!(
+            !text.contains("sessions"),
+            "narrow active focus should hide sessions title:\n{text}"
+        );
+        assert!(
+            !text.contains("failures ["),
+            "narrow active focus should hide failures title:\n{text}"
         );
 
         app.focus = Focus::Failures;
@@ -683,17 +707,57 @@ mod tests {
             !snap.metrics_tok_per_s.is_empty(),
             "fixture should record tok/s samples"
         );
+        // Fixture: 1 Completed + 2 Failed → fail% 67%, done 1ok/2f.
+        assert_eq!(
+            snap.metrics_completed.iter().filter(|&&v| v >= 0.5).count(),
+            1
+        );
+        assert_eq!(
+            snap.metrics_completed.iter().filter(|&&v| v < 0.5).count(),
+            2
+        );
         let app = App::new();
         let text = render_test(120, 28, &snap, "127.0.0.1:1", "0.0.12", &app);
-        // Error rate label: 2 fails + 1 ok → ~67%
         assert!(
-            text.contains("err")
-                && (text.contains("67%") || text.contains("66%") || text.contains("%")),
-            "error rate meter missing:\n{text}"
+            text.contains("fail%") && text.contains("67%"),
+            "rolling fail% meter should show 67% for fixture (1 ok / 2 fail):\n{text}"
         );
         assert!(
-            text.contains("ok/") || text.contains("done"),
-            "done activity label missing:\n{text}"
+            text.contains("1ok/2f"),
+            "done activity should show 1ok/2f:\n{text}"
+        );
+        // Non-zero tok/s from the completed turn (output_tokens / duration).
+        assert!(
+            text.contains("tok/s") && !text.contains("tok/s 0.0"),
+            "tok/s should be non-zero from fixture samples:\n{text}"
+        );
+    }
+
+    #[test]
+    fn metrics_strip_cold_start_empty_snapshot() {
+        let snap = Snapshot::default();
+        let app = App::new();
+        // Must not panic; strip paints zero meters and empty sparklines.
+        let text = render_test(100, 24, &snap, "127.0.0.1:1", "0.0.12", &app);
+        assert!(
+            text.contains("metrics"),
+            "empty snapshot should still paint metrics strip:\n{text}"
+        );
+        assert!(
+            text.contains("tok/s") && text.contains("0.0"),
+            "cold-start tok/s should be 0.0:\n{text}"
+        );
+        assert!(
+            text.contains("fail%") && text.contains("0%"),
+            "cold-start fail% should be 0%:\n{text}"
+        );
+        assert!(
+            text.contains("0ok/0f"),
+            "cold-start done should be 0ok/0f:\n{text}"
+        );
+        assert!(
+            text.contains('·'),
+            "empty sparklines should paint middot placeholders:\n{text}"
         );
     }
 

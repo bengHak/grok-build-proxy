@@ -64,11 +64,12 @@ impl Widget for MetricsStrip<'_> {
                 spark_style: self.theme.header,
             },
         );
+        // Label "fail%" (not "err") so it is distinct from header err●N (failure ring count).
         render_metric(
             cols[1],
             buf,
             MetricCell {
-                label: "err",
+                label: "fail%",
                 value: format!("{:.0}%", tok.error_rate * 100.0),
                 spark: sparkline_chars(&tok.error_samples, spark_w),
                 value_style: err_style,
@@ -172,7 +173,8 @@ pub fn sparkline_chars(values: &[f64], width: usize) -> String {
         return String::new();
     }
     if values.is_empty() {
-        return "·".repeat(width.min(12));
+        // Same length as a data series so cold-start columns do not jump width.
+        return "·".repeat(width);
     }
     let start = values.len().saturating_sub(width);
     let slice = &values[start..];
@@ -224,6 +226,8 @@ mod tests {
         let empty = sparkline_chars(&[], 5);
         assert_eq!(empty.chars().count(), 5);
         assert!(empty.chars().all(|c| c == '·'));
+        // Empty series uses full width (not capped) so it matches data-path length.
+        assert_eq!(sparkline_chars(&[], 20).chars().count(), 20);
 
         let s = sparkline_chars(&[0.0, 1.0, 2.0, 4.0], 4);
         assert_eq!(s.chars().count(), 4);
