@@ -79,15 +79,22 @@ jobs:
         run: |
           set -euo pipefail
 
+          assets=(
+            dist/grok-build-proxy_Darwin_arm64.tar.gz
+            dist/grok-build-proxy_Darwin_amd64.tar.gz
+            dist/checksums.txt
+          )
+
+          # If the tag/release was created empty (or assets were lost), upload rather
+          # than no-op. --clobber replaces stale archives on re-runs.
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; nothing to do."
+            echo "Release ${TAG} already exists; uploading assets."
+            gh release upload "${TAG}" "${assets[@]}" --clobber
             exit 0
           fi
 
           args=(
-            dist/grok-build-proxy_Darwin_arm64.tar.gz
-            dist/grok-build-proxy_Darwin_amd64.tar.gz
-            dist/checksums.txt
+            "${assets[@]}"
             --generate-notes
             --latest
             --title "${TAG}"
