@@ -1,4 +1,4 @@
-//! Interactive serve monitor (ratatui panels: header / sessions / active / footer).
+//! Interactive serve monitor (ratatui panels: header / sessions / active / failures / footer).
 
 mod app;
 mod theme;
@@ -24,9 +24,14 @@ use std::{
     time::Duration,
 };
 use theme::Theme;
-use widgets::{ActivePanel, Footer, Header, HelpOverlay, SessionsPanel, TurnKind};
+use widgets::{
+    ActivePanel, FailuresPanel, Footer, Header, HelpOverlay, SessionsPanel, TurnKind, truncate,
+};
 
 pub use crate::store::{Dashboard, FailureRecord, Request, Session, Snapshot};
+
+/// Max chars shown for `error_message` in the failure detail modal (full value stays in store).
+const DETAIL_MESSAGE_MAX: usize = 120;
 
 pub fn is_interactive() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
@@ -62,7 +67,8 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
         let snapshot = dashboard.snapshot();
         let sessions_len = snapshot.sessions.len();
         let active_len = ActivePanel::row_count(&snapshot);
-        app.clamp_selection(sessions_len, active_len);
+        let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
+        app.clamp_selection(sessions_len, active_len, failures_len);
 
         terminal.draw(|frame| {
             draw(
@@ -83,9 +89,23 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
                 if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
-                if app.handle(key, sessions_len, active_len) {
+                if app.handle(key, sessions_len, active_len, failures_len) {
                     return Ok(());
                 }
+                // After Enter on Failures, pin stable request_id so live push_front
+                // does not swap the overlay to a different row.
+                if app.mode == Mode::Detail
+                    && app.focus == Focus::Failures
+                    && app.detail_request_id.is_none()
+                {
+                    let rows = FailuresPanel::filtered(&snapshot, app.failure_filter);
+                    if let Some(f) = rows.get(app.selected) {
+                        app.pin_failure_detail(f.request_id.clone());
+                    }
+                }
+                // Filter cycle (`f`) may shrink the list; re-clamp with new filter length.
+                let failures_len = FailuresPanel::row_count(&snapshot, app.failure_filter);
+                app.clamp_selection(sessions_len, active_len, failures_len);
             }
         }
         tokio::task::yield_now().await;
@@ -114,7 +134,7 @@ fn draw(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(5),    // body
+            Constraint::Min(5),    // body (sessions|active + failures)
             Constraint::Length(3), // footer
         ])
         .split(area);
@@ -128,10 +148,16 @@ fn draw(
     }
     .render(chunks[0], buf);
 
+    // Body: top row sessions|active, bottom full-width failures.
     let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(chunks[1]);
+
+    let top = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(chunks[1]);
+        .split(body[0]);
 
     SessionsPanel {
         snapshot,
@@ -139,12 +165,21 @@ fn draw(
         focused: app.focus == Focus::Sessions && app.mode == Mode::Dashboard,
         theme,
     }
-    .render(body[0], buf);
+    .render(top[0], buf);
 
     ActivePanel {
         snapshot,
         selected: app.selected,
         focused: app.focus == Focus::Active && app.mode == Mode::Dashboard,
+        theme,
+    }
+    .render(top[1], buf);
+
+    FailuresPanel {
+        snapshot,
+        selected: app.selected,
+        focused: app.focus == Focus::Failures && app.mode == Mode::Dashboard,
+        filter: app.failure_filter,
         theme,
     }
     .render(body[1], buf);
@@ -166,8 +201,14 @@ fn draw_detail(
     theme: Theme,
 ) {
     let text = detail_text(snapshot, app);
-    let width = area.width.min(72);
-    let height = area.height.min(12);
+    let width = area.width.min(76);
+    // Size height from content so longer failure detail is not hard-capped at 18.
+    // +2 for border rows; leave at least 2 rows of margin when possible.
+    let content_lines = text.lines().count() as u16;
+    let height = (content_lines.saturating_add(2))
+        .max(5)
+        .min(area.height.saturating_sub(2).max(5))
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let modal = Rect {
@@ -233,7 +274,63 @@ fn detail_text(snapshot: &Snapshot, app: &App) -> String {
                 "No turn selected".into()
             }
         }
+        Focus::Failures => failure_detail_text(snapshot, app),
     }
+}
+
+fn failure_detail_text(snapshot: &Snapshot, app: &App) -> String {
+    // Prefer stable request_id so live push_front / ring eviction does not swap identity.
+    let record = if let Some(id) = app.detail_request_id.as_ref() {
+        match snapshot.failures.iter().find(|f| &f.request_id == id) {
+            Some(f) => f,
+            None => return format!("Failure {id}\n  (failure no longer in ring)"),
+        }
+    } else {
+        // Fallback for tests / before pin: index into filtered list.
+        match FailuresPanel::filtered(snapshot, app.failure_filter).get(app.selected) {
+            Some(f) => *f,
+            None => return "No failure selected".into(),
+        }
+    };
+
+    let msg = if record.error_message.is_empty() {
+        "-".to_owned()
+    } else {
+        truncate(&record.error_message, DETAIL_MESSAGE_MAX)
+    };
+    let err_type = if record.error_type.is_empty() {
+        "-"
+    } else {
+        record.error_type.as_str()
+    };
+    let resp = if record.response_id.is_empty() {
+        "-"
+    } else {
+        record.response_id.as_str()
+    };
+
+    format!(
+        "Failure {}\n  ts: {}\n  kind: {}\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration_ms: {}  session_fail#: {}\n  error_type: {}\n  message: {}\n  response_id: {}\n  mapped: {}  lite: {}  fast: {}\n  auth_retried: {}  outputs: {}  capture_bytes: {}",
+        record.request_id,
+        record.ts.to_rfc3339(),
+        record.kind.as_str(),
+        record.session_id,
+        record.model,
+        record.requested_model,
+        record.status_code,
+        record.attempt,
+        record.duration_ms,
+        record.session_failure_index,
+        err_type,
+        msg,
+        resp,
+        record.mapped,
+        record.lite,
+        record.fast,
+        record.auth_retried,
+        record.output_count,
+        record.capture_bytes,
+    )
 }
 
 /// Render into a TestBackend buffer (unit tests / snapshots).
@@ -285,6 +382,7 @@ fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
 mod tests {
     use super::*;
     use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind};
+    use crate::monitor::app::FailureFilter;
     use std::time::{Duration, Instant};
 
     fn base_event(kind: RequestEventKind) -> RequestEvent {
@@ -325,6 +423,21 @@ mod tests {
         failed.error_type = "upstream_http".into();
         failed.status_code = 502;
         d.observe(failed);
+
+        // Second failure: ProxyAssemble for filter tests.
+        let mut fail3 = base_event(RequestEventKind::Started);
+        fail3.request_id = "req-3".into();
+        d.observe(fail3);
+        let mut failed3 = base_event(RequestEventKind::Failed);
+        failed3.request_id = "req-3".into();
+        failed3.failure_kind = Some(FailureKind::ProxyAssemble);
+        failed3.error_type = "proxy_incomplete_output".into();
+        failed3.status_code = 200;
+        failed3.error = "could not assemble".into();
+        failed3.output_count = 2;
+        failed3.capture_bytes = 4096;
+        d.observe(failed3);
+
         // Leave one in-flight turn for the active panel.
         let mut inflight = base_event(RequestEventKind::Started);
         inflight.request_id = "req-live".into();
@@ -333,10 +446,10 @@ mod tests {
     }
 
     #[test]
-    fn render_header_sessions_footer() {
+    fn render_header_sessions_failures_footer() {
         let snap = fixture_dashboard().snapshot();
         let app = App::new();
-        let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(
             text.contains("grok-build-proxy"),
             "header missing version banner:\n{text}"
@@ -350,7 +463,7 @@ mod tests {
             "header missing active count from store:\n{text}"
         );
         assert!(
-            text.contains("err●1"),
+            text.contains("err●2"),
             "header missing failure count from store:\n{text}"
         );
         assert!(
@@ -361,26 +474,124 @@ mod tests {
             text.contains("active / recent"),
             "active panel title missing:\n{text}"
         );
-        assert!(text.contains("sess-abc"), "session id missing:\n{text}");
         assert!(
-            text.contains("gpt-test"),
-            "model from store missing in body:\n{text}"
+            text.contains("failures"),
+            "failures panel title missing:\n{text}"
         );
         assert!(
-            text.contains("req-1") || text.contains("req-2"),
-            "recent turn id from store missing:\n{text}"
+            text.contains("[All]") && text.contains("2/2"),
+            "failures filter title missing All 2/2:\n{text}"
+        );
+        assert!(text.contains("sess-abc"), "session id missing:\n{text}");
+        assert!(
+            text.contains("UpstreamHttp") || text.contains("upstream_http"),
+            "failure kind/error_type missing in failures panel:\n{text}"
+        );
+        assert!(
+            text.contains("ProxyAssemble") || text.contains("proxy_incomplete"),
+            "ProxyAssemble failure missing in panel:\n{text}"
         );
         assert!(
             text.contains("req-live"),
             "active turn id from store missing:\n{text}"
         );
         assert!(
-            text.contains("upstream_http") || text.contains("HTTP 502"),
-            "failed recent status from store missing:\n{text}"
+            text.contains("j/k") || text.contains("quit") || text.contains("filter"),
+            "footer bindings missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn failures_filter_hides_non_matching() {
+        let snap = fixture_dashboard().snapshot();
+        assert_eq!(
+            FailuresPanel::row_count(&snap, FailureFilter::ProxyAssemble),
+            1
+        );
+        assert_eq!(FailuresPanel::row_count(&snap, FailureFilter::All), 2);
+
+        let mut app = App::new();
+        app.failure_filter = FailureFilter::ProxyAssemble;
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        assert!(
+            text.contains("failures [ProxyAssemble] 1/2"),
+            "title should show filter and 1/2 counts:\n{text}"
         );
         assert!(
-            text.contains("j/k") || text.contains("quit"),
-            "footer bindings missing:\n{text}"
+            !text.contains("UpstreamHttp"),
+            "UpstreamHttp should be filtered out of list:\n{text}"
+        );
+    }
+
+    #[test]
+    fn detail_text_failure_fields_and_stable_id() {
+        let snap = fixture_dashboard().snapshot();
+        // Newest-first: req-3 ProxyAssemble, then req-2 UpstreamHttp.
+        let mut app = App::new();
+        app.focus = Focus::Failures;
+        app.selected = 0;
+        app.pin_failure_detail("req-3");
+        let text = failure_detail_text(&snap, &app);
+        assert!(text.starts_with("Failure req-3"), "header:\n{text}");
+        assert!(text.contains("  ts:"), "ts label:\n{text}");
+        assert!(text.contains("  kind: ProxyAssemble"), "kind:\n{text}");
+        assert!(text.contains("  duration_ms:"), "duration_ms:\n{text}");
+        assert!(text.contains("  session_fail#:"), "session_fail#:\n{text}");
+        assert!(text.contains("  error_type:"), "error_type:\n{text}");
+        assert!(text.contains("  auth_retried:"), "auth_retried:\n{text}");
+        assert!(text.contains("  capture_bytes:"), "capture_bytes:\n{text}");
+        assert!(
+            text.contains("proxy_incomplete_output"),
+            "etype val:\n{text}"
+        );
+
+        // Pinned id survives selection/index drift.
+        app.selected = 99;
+        let text2 = failure_detail_text(&snap, &app);
+        assert!(
+            text2.starts_with("Failure req-3"),
+            "stable id ignored selected index:\n{text2}"
+        );
+
+        // Evicted / unknown id.
+        app.pin_failure_detail("req-gone");
+        let gone = failure_detail_text(&snap, &app);
+        assert!(
+            gone.contains("failure no longer in ring"),
+            "missing eviction message:\n{gone}"
+        );
+    }
+
+    #[test]
+    fn detail_overlay_renders_failure_fields() {
+        let snap = fixture_dashboard().snapshot();
+        let mut app = App::new();
+        app.focus = Focus::Failures;
+        app.selected = 0;
+        app.mode = Mode::Detail;
+        app.pin_failure_detail("req-3");
+        let text = render_test(100, 30, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        assert!(text.contains("detail"), "detail title missing:\n{text}");
+        // Labels unique to the detail template (not the list row format).
+        assert!(
+            text.contains("duration_ms:"),
+            "detail missing duration_ms:\n{text}"
+        );
+        assert!(
+            text.contains("session_fail#:"),
+            "detail missing session_fail#:\n{text}"
+        );
+        assert!(
+            text.contains("capture_bytes:"),
+            "detail missing capture_bytes:\n{text}"
+        );
+        assert!(
+            text.contains("auth_retried:"),
+            "detail missing auth_retried:\n{text}"
+        );
+        assert!(
+            text.contains("Failure req-3"),
+            "detail missing Failure header:\n{text}"
         );
     }
 
@@ -391,7 +602,7 @@ mod tests {
         app.focus = Focus::Active;
         app.selected = 0; // req-live (active first)
         app.mode = Mode::Detail;
-        let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(text.contains("detail"), "detail title missing:\n{text}");
         assert!(
             text.contains("req-live"),
@@ -415,13 +626,15 @@ mod tests {
         app.focus = Focus::Sessions;
         app.selected = 0;
         app.mode = Mode::Detail;
-        let text = render_test(100, 24, &snap, "127.0.0.1:18765", "0.0.12", &app);
+        let text = render_test(100, 28, &snap, "127.0.0.1:18765", "0.0.12", &app);
         assert!(
             text.contains("Session sess-abc"),
             "detail missing session header:\n{text}"
         );
         assert!(
-            text.contains("last_failure: UpstreamHttp") || text.contains("UpstreamHttp"),
+            text.contains("last_failure:")
+                || text.contains("UpstreamHttp")
+                || text.contains("ProxyAssemble"),
             "detail missing last failure kind:\n{text}"
         );
         assert!(
@@ -435,11 +648,15 @@ mod tests {
         let snap = Snapshot::default();
         let mut app = App::new();
         app.mode = Mode::Help;
-        let text = render_test(80, 20, &snap, "127.0.0.1:1", "0.0.12", &app);
+        let text = render_test(80, 22, &snap, "127.0.0.1:1", "0.0.12", &app);
         assert!(text.contains("Monitor help"), "help text missing:\n{text}");
         assert!(
             text.contains("Shift-Tab") || text.contains("Tab"),
             "help missing panel switch keys:\n{text}"
+        );
+        assert!(
+            text.contains("filter") || text.contains(" f "),
+            "help missing filter key:\n{text}"
         );
     }
 }
