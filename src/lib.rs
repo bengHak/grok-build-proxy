@@ -6,5 +6,6 @@ pub mod events;
 pub mod modelmap;
 pub mod monitor;
 pub mod proxy;
+pub mod report;
 pub mod sse;
 pub mod store;

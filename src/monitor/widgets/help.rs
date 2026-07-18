@@ -15,8 +15,8 @@ pub struct HelpOverlay {
 impl Widget for HelpOverlay {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Center a modal within the full frame.
-        let width = area.width.min(62);
-        let height = area.height.min(16);
+        let width = area.width.min(66);
+        let height = area.height.min(20);
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let modal = Rect {
@@ -36,12 +36,16 @@ impl Widget for HelpOverlay {
             Line::from("  Enter        open details"),
             Line::from("  f            cycle failure filter"),
             Line::from("               All / ProxyAssemble / Upstream / Auth / Stream"),
+            Line::from("  y            copy filtered failure report (markdown)"),
+            Line::from("  Y            copy filtered failure report (JSON)"),
+            Line::from("  w            write report → ~/.grok/proxy-reports/*.md"),
+            Line::from("  W            write report → ~/.grok/proxy-reports/*.json"),
             Line::from("  Esc/Backspace return"),
             Line::from("  ?            toggle help"),
             Line::from("  q/Q / Ctrl-C stop proxy"),
             Line::from(""),
             Line::from(Span::styled(
-                "  (report export y/w in a later PR)",
+                "  Same session, consecutive fails ≤30s apart: estimated retry",
                 self.theme.muted,
             )),
         ];
