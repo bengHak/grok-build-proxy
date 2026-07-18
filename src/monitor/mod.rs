@@ -20,6 +20,7 @@ use ratatui::{
 };
 use std::{
     io::{self, IsTerminal},
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -127,6 +128,17 @@ fn try_export(
     address: &str,
     version: &str,
 ) -> Option<report::ExportOutcome> {
+    try_export_to(code, snapshot, app, address, version, None)
+}
+
+fn try_export_to(
+    code: event::KeyCode,
+    snapshot: &Snapshot,
+    app: &App,
+    address: &str,
+    version: &str,
+    write_dir: Option<&Path>,
+) -> Option<report::ExportOutcome> {
     use event::KeyCode;
     let json = match code {
         KeyCode::Char('y' | 'w') => false,
@@ -146,6 +158,8 @@ fn try_export(
     let meta = ReportMeta::new(version, address, app.failure_filter.as_str());
     Some(if copy {
         report::export_copy(&records, &meta, json)
+    } else if let Some(dir) = write_dir {
+        report::export_write_to(&records, &meta, json, dir)
     } else {
         report::export_write(&records, &meta, json)
     })
@@ -796,18 +810,20 @@ mod tests {
         use crossterm::event::KeyCode;
         let snap = fixture_dashboard().snapshot();
         let app = App::new();
-        let out = try_export(KeyCode::Char('w'), &snap, &app, "127.0.0.1:1", "0.0.12")
-            .expect("w is export");
+        let dir = tempfile::tempdir().unwrap();
+        let out = try_export_to(
+            KeyCode::Char('w'),
+            &snap,
+            &app,
+            "127.0.0.1:1",
+            "0.0.12",
+            Some(dir.path()),
+        )
+        .expect("w is export");
         match out {
-            report::ExportOutcome::Written {
-                count,
-                json,
-                clipboard_fallback,
-                ..
-            } => {
+            report::ExportOutcome::Written { count, json, .. } => {
                 assert_eq!(count, 2);
                 assert!(!json);
-                assert!(!clipboard_fallback);
             }
             report::ExportOutcome::Copied { .. } => panic!("w should write"),
             report::ExportOutcome::Empty => panic!("expected failures"),
@@ -829,8 +845,16 @@ mod tests {
         // Fixture: req-3 ProxyAssemble + req-2 UpstreamHttp.
         let mut app = App::new();
         app.failure_filter = FailureFilter::ProxyAssemble;
-        let out = try_export(KeyCode::Char('w'), &snap, &app, "127.0.0.1:9", "0.0.12")
-            .expect("w is export");
+        let dir = tempfile::tempdir().unwrap();
+        let out = try_export_to(
+            KeyCode::Char('w'),
+            &snap,
+            &app,
+            "127.0.0.1:9",
+            "0.0.12",
+            Some(dir.path()),
+        )
+        .expect("w is export");
         match out {
             report::ExportOutcome::Written { count, path, .. } => {
                 assert_eq!(count, 1, "only ProxyAssemble should export");
@@ -872,8 +896,9 @@ mod tests {
             "export should no-op in Detail"
         );
         app.mode = Mode::Dashboard;
+        let dir = tempfile::tempdir().unwrap();
         assert!(
-            try_export(KeyCode::Char('w'), &snap, &app, "a", "v").is_some(),
+            try_export_to(KeyCode::Char('w'), &snap, &app, "a", "v", Some(dir.path())).is_some(),
             "export should work on Dashboard"
         );
     }

@@ -1,6 +1,7 @@
 //! Failure report rendering (markdown / JSON) and export helpers.
 //!
-//! Reports never include prompt/body/credentials — only FailureRecord metadata.
+//! Reports omit error messages as well as prompts, bodies, and credentials because upstream
+//! diagnostics can echo request data.
 
 use crate::store::FailureRecord;
 use chrono::{DateTime, Local, Utc};
@@ -47,7 +48,7 @@ pub fn summary_counts(records: &[FailureRecord]) -> BTreeMap<&'static str, usize
     counts
 }
 
-/// Render a markdown failure report (no prompt/body/credentials).
+/// Render a markdown failure report without diagnostic messages, prompts, bodies, or credentials.
 pub fn render_markdown(records: &[FailureRecord], meta: &ReportMeta) -> String {
     let counts = summary_counts(records);
     let mut out = String::new();
@@ -81,7 +82,7 @@ pub fn render_markdown(records: &[FailureRecord], meta: &ReportMeta) -> String {
         }
     }
     out.push('\n');
-    out.push_str("(no prompt/response body included)\n");
+    out.push_str("(no error message, prompt, or response body included)\n");
     out
 }
 
@@ -90,11 +91,6 @@ fn format_failure_md(index: usize, r: &FailureRecord) -> String {
         r.kind.as_str()
     } else {
         r.error_type.as_str()
-    };
-    let msg = if r.error_message.is_empty() {
-        "-"
-    } else {
-        r.error_message.as_str()
     };
     let resp = if r.response_id.is_empty() {
         "-"
@@ -117,8 +113,7 @@ fn format_failure_md(index: usize, r: &FailureRecord) -> String {
          - mapped: {}  lite: {}  fast: {}\n\
          - outputs: {}\n\
          - capture_bytes: {}\n\
-         - error_type: {}\n\
-         - message: {}\n",
+         - error_type: {}\n",
         r.ts.to_rfc3339(),
         r.request_id,
         r.session_id,
@@ -137,11 +132,10 @@ fn format_failure_md(index: usize, r: &FailureRecord) -> String {
         r.output_count,
         r.capture_bytes,
         etype,
-        msg,
     )
 }
 
-/// Render a JSON failure report (no prompt/body/credentials).
+/// Render a JSON failure report without diagnostic messages, prompts, bodies, or credentials.
 pub fn render_json(records: &[FailureRecord], meta: &ReportMeta) -> String {
     let counts = summary_counts(records);
     let mut summary = Map::new();
@@ -175,7 +169,6 @@ fn failure_to_json(r: &FailureRecord) -> Value {
         "duration_ms": r.duration_ms,
         "kind": r.kind.as_str(),
         "error_type": r.error_type,
-        "error_message": r.error_message,
         "response_id": r.response_id,
         "mapped": r.mapped,
         "lite": r.lite,
@@ -192,7 +185,14 @@ fn failure_to_json(r: &FailureRecord) -> Value {
 pub fn default_report_dir() -> io::Result<PathBuf> {
     let home = env::var_os("HOME")
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))?;
-    Ok(PathBuf::from(home).join(".grok").join("proxy-reports"))
+    let home = PathBuf::from(home);
+    if !home.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "HOME must be an absolute path",
+        ));
+    }
+    Ok(home.join(".grok").join("proxy-reports"))
 }
 
 /// Timestamped report filename stem: `failure-YYYYMMDD-HHMMSS`.
@@ -286,13 +286,10 @@ pub enum ExportOutcome {
         count: usize,
         json: bool,
     },
-    /// Deliberate write (`w`/`W`) or clipboard-fallback write after `y`/`Y` failed.
     Written {
         path: PathBuf,
         count: usize,
         json: bool,
-        /// True when this path was written because clipboard copy failed.
-        clipboard_fallback: bool,
     },
     Empty,
     Error(String),
@@ -305,21 +302,9 @@ impl ExportOutcome {
                 let fmt = if *json { "json" } else { "md" };
                 format!("copied {count} failures ({fmt}) to clipboard")
             }
-            Self::Written {
-                path,
-                count,
-                json,
-                clipboard_fallback,
-            } => {
+            Self::Written { path, count, json } => {
                 let fmt = if *json { "json" } else { "md" };
-                if *clipboard_fallback {
-                    format!(
-                        "clipboard failed; wrote {count} failures ({fmt}) → {}",
-                        path.display()
-                    )
-                } else {
-                    format!("wrote {count} failures ({fmt}) → {}", path.display())
-                }
+                format!("wrote {count} failures ({fmt}) → {}", path.display())
             }
             Self::Empty => "no failures to export (current filter)".into(),
             Self::Error(msg) => format!("export failed: {msg}"),
@@ -327,7 +312,7 @@ impl ExportOutcome {
     }
 }
 
-/// Export markdown or JSON: copy to clipboard, falling back to a written file.
+/// Export markdown or JSON to the clipboard without creating a file on failure.
 pub fn export_copy(records: &[FailureRecord], meta: &ReportMeta, json: bool) -> ExportOutcome {
     export_copy_with(records, meta, json, copy_to_clipboard)
 }
@@ -352,18 +337,7 @@ pub(crate) fn export_copy_with(
             count: records.len(),
             json,
         },
-        Err(e) => {
-            // Fallback: write file and surface path in toast.
-            match write_report(meta, json, &body) {
-                Ok(path) => ExportOutcome::Written {
-                    path,
-                    count: records.len(),
-                    json,
-                    clipboard_fallback: true,
-                },
-                Err(werr) => ExportOutcome::Error(format!("clipboard: {e}; write: {werr}")),
-            }
-        }
+        Err(e) => ExportOutcome::Error(format!("clipboard: {e}")),
     }
 }
 
@@ -372,27 +346,37 @@ pub fn export_write(records: &[FailureRecord], meta: &ReportMeta, json: bool) ->
     if records.is_empty() {
         return ExportOutcome::Empty;
     }
+    match default_report_dir() {
+        Ok(dir) => export_write_to(records, meta, json, &dir),
+        Err(e) => ExportOutcome::Error(e.to_string()),
+    }
+}
+
+/// Testable write path that avoids touching the user's report directory.
+pub(crate) fn export_write_to(
+    records: &[FailureRecord],
+    meta: &ReportMeta,
+    json: bool,
+    dir: &Path,
+) -> ExportOutcome {
+    if records.is_empty() {
+        return ExportOutcome::Empty;
+    }
     let body = if json {
         render_json(records, meta)
     } else {
         render_markdown(records, meta)
     };
-    match write_report(meta, json, &body) {
+    let stem = report_filename_stem(meta.generated);
+    let ext = if json { "json" } else { "md" };
+    match write_report_file(dir, &stem, ext, &body) {
         Ok(path) => ExportOutcome::Written {
             path,
             count: records.len(),
             json,
-            clipboard_fallback: false,
         },
         Err(e) => ExportOutcome::Error(e.to_string()),
     }
-}
-
-fn write_report(meta: &ReportMeta, json: bool, body: &str) -> io::Result<PathBuf> {
-    let dir = default_report_dir()?;
-    let stem = report_filename_stem(meta.generated);
-    let ext = if json { "json" } else { "md" };
-    write_report_file(&dir, &stem, ext, body)
 }
 
 #[cfg(test)]
@@ -400,15 +384,6 @@ mod tests {
     use super::*;
     use crate::events::FailureKind;
     use chrono::TimeZone;
-    use std::sync::{Mutex, OnceLock};
-
-    /// Serialize tests that mutate `HOME` (process-wide env).
-    fn home_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
 
     fn sample_record(kind: FailureKind, session: &str, req: &str) -> FailureRecord {
         FailureRecord {
@@ -466,19 +441,20 @@ mod tests {
         assert!(md.contains("duration_ms: 1823"));
         assert!(md.contains("auth_retried: false"));
         assert!(md.contains("capture_bytes: 4096"));
-        assert!(md.contains("(no prompt/response body included)"));
-        // Must not invent body/credentials fields.
-        assert!(!md.to_lowercase().contains("authorization"));
-        assert!(!md.contains("refresh_token"));
-        assert!(!md.contains("access_token"));
-        // Disclaimer may mention "prompt"; field dumps must not.
+        assert!(md.contains("(no error message, prompt, or response body included)"));
+        // The stored diagnostic may contain upstream-echoed secrets; reports must omit it.
+        assert!(!md.contains("could not assemble"));
+        assert!(!md.contains("bad gateway"));
+        assert!(!md.contains("message:"));
         assert!(!md.contains("prompt:"));
         assert!(!md.contains("\"prompt\""));
     }
 
     #[test]
     fn json_round_shape_and_no_secrets() {
-        let records = vec![sample_record(FailureKind::AuthRetryFailed, "s", "r")];
+        let mut record = sample_record(FailureKind::AuthRetryFailed, "s", "r");
+        record.error_message = "upstream echoed access_token=secret".into();
+        let records = vec![record];
         let meta = ReportMeta::new("0.0.12", "127.0.0.1:1", "Auth");
         let s = render_json(&records, &meta);
         let v: Value = serde_json::from_str(&s).expect("valid json");
@@ -487,9 +463,10 @@ mod tests {
         assert_eq!(v["meta"]["summary"]["AuthRetryFailed"], 1);
         assert_eq!(v["failures"][0]["kind"], "AuthRetryFailed");
         assert_eq!(v["failures"][0]["request_id"], "r");
+        assert!(v["failures"][0].get("error_message").is_none());
         let text = s.to_lowercase();
-        assert!(!text.contains("authorization"));
-        assert!(!text.contains("refresh_token"));
+        assert!(!text.contains("access_token"));
+        assert!(!text.contains("secret"));
         assert!(!text.contains("\"prompt\""));
     }
 
@@ -559,89 +536,14 @@ mod tests {
     }
 
     #[test]
-    fn export_copy_fallback_on_clipboard_error() {
-        let _guard = home_lock();
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: serialized via home_lock; restored below.
-        let prev_home = env::var_os("HOME");
-        // env::set_var is unsafe in Rust 2024 / recent rustc.
-        unsafe {
-            env::set_var("HOME", tmp.path());
-        }
-
+    fn export_copy_error_does_not_write_a_file() {
         let records = [sample_record(FailureKind::UpstreamHttp, "s", "r1")];
-        let meta = ReportMeta {
-            version: "0.0.12".into(),
-            listen: "127.0.0.1:1".into(),
-            generated: Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap(),
-            filter: "All".into(),
-        };
+        let meta = ReportMeta::new("0.0.12", "127.0.0.1:1", "All");
         let out = export_copy_with(&records, &meta, false, |_| {
             Err(io::Error::other("forced clipboard failure"))
         });
 
-        match out {
-            ExportOutcome::Written {
-                path,
-                count,
-                json,
-                clipboard_fallback,
-            } => {
-                assert_eq!(count, 1);
-                assert!(!json);
-                assert!(clipboard_fallback);
-                assert!(path.starts_with(tmp.path().join(".grok").join("proxy-reports")));
-                assert!(path.exists());
-                let body = fs::read_to_string(&path).unwrap();
-                assert!(body.contains("UpstreamHttp"));
-                let toast = ExportOutcome::Written {
-                    path: path.clone(),
-                    count: 1,
-                    json: false,
-                    clipboard_fallback: true,
-                }
-                .toast();
-                assert!(
-                    toast.starts_with("clipboard failed; wrote"),
-                    "fallback toast: {toast}"
-                );
-            }
-            other => panic!("expected clipboard fallback write, got {other:?}"),
-        }
-
-        match prev_home {
-            Some(h) => unsafe { env::set_var("HOME", h) },
-            None => unsafe { env::remove_var("HOME") },
-        }
-    }
-
-    #[test]
-    fn export_copy_both_fail_surfaces_error() {
-        let _guard = home_lock();
-        let prev_home = env::var_os("HOME");
-        // Point HOME at a non-creatable path under a file so write fails.
-        let tmp = tempfile::tempdir().unwrap();
-        let file_as_home = tmp.path().join("not-a-dir");
-        fs::write(&file_as_home, b"x").unwrap();
-        unsafe {
-            env::set_var("HOME", &file_as_home);
-        }
-
-        let records = [sample_record(FailureKind::StreamIo, "s", "r")];
-        let meta = ReportMeta::new("0.0.12", "l", "All");
-        let out = export_copy_with(&records, &meta, true, |_| {
-            Err(io::Error::other("no pbcopy"))
-        });
-        assert!(
-            matches!(out, ExportOutcome::Error(_)),
-            "expected dual failure Error, got {out:?}"
-        );
-        let toast = out.toast();
-        assert!(toast.contains("export failed"), "{toast}");
-
-        match prev_home {
-            Some(h) => unsafe { env::set_var("HOME", h) },
-            None => unsafe { env::remove_var("HOME") },
-        }
+        assert!(matches!(out, ExportOutcome::Error(_)), "{out:?}");
+        assert!(out.toast().contains("clipboard"));
     }
 }
