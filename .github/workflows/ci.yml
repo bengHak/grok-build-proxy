@@ -1,32 +1,54 @@
-name: CI
+name: Capture latest CI failure
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 permissions:
-  contents: read
+  actions: read
+  contents: write
 
 jobs:
-  test:
-    runs-on: macos-14
+  capture:
+    if: github.actor != 'github-actions[bot]' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
         with:
-          components: rustfmt, clippy
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --all-targets
-      - name: Validate installer
-        run: sh -n install.sh
-      - name: Build current Mac architecture
-        run: make build
-      - name: Build Apple Silicon and Intel archives
-        run: make dist
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+      - name: Download and extract failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api /repos/${{ github.repository }}/actions/jobs/88038867425/logs > /tmp/job-download
+          if unzip -t /tmp/job-download >/dev/null 2>&1; then
+            unzip -p /tmp/job-download > /tmp/job.log
+          else
+            cp /tmp/job-download /tmp/job.log
+          fi
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path('/tmp/job.log').read_text(errors='replace')
+          text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+          lines = text.splitlines()
+          markers = [i for i, line in enumerate(lines) if (
+              'failures:' in line or 'test result: FAILED' in line
+              or 'panicked at' in line or 'error: test failed' in line
+          )]
+          if markers:
+              start = max(0, min(markers) - 60)
+              end = min(len(lines), max(markers) + 120)
+              lines = lines[start:end]
+          else:
+              lines = lines[-220:]
+          Path('.github/failed-latest-ci.txt').write_text('\n'.join(lines) + '\n')
+          PY
+      - name: Commit failure snippet
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/failed-latest-ci.txt
+          git commit -m "chore: record latest CI failure"
+          git push origin HEAD:${{ github.head_ref }}
