@@ -1,4 +1,4 @@
-use crate::{auth::Store, codexcli, modelmap::ModelMap};
+use crate::{auth::Store, codexcli, grokconfig::GrokConfig, modelmap::ModelMap};
 use anyhow::Result;
 use serde_json::Value;
 use std::{net::SocketAddr, path::Path, time::Duration};
@@ -136,24 +136,30 @@ pub async fn run_full(
         Err(error) => checks.push(Check::fail("ChatGPT auth", error.to_string())),
     }
 
-    match tokio::fs::read_to_string(grok_config).await {
-        Ok(text)
-            if text.contains("api_backend = \"responses\"")
-                && (text.contains("127.0.0.1") || text.contains("localhost")) =>
-        {
-            checks.push(Check::pass(
-                "Grok config",
-                grok_config.display().to_string(),
-            ));
+    match GrokConfig::load(grok_config) {
+        Ok(config) => {
+            let records = config.records();
+            if records.is_empty() {
+                checks.push(Check::fail(
+                    "Grok config",
+                    "no loopback Responses model found",
+                ));
+            } else if records.iter().any(|record| !record.valid) {
+                let invalid = records
+                    .iter()
+                    .filter(|record| !record.valid)
+                    .map(|record| format!("{}: {}", record.alias, record.errors.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                checks.push(Check::fail("Grok config", invalid));
+            } else {
+                checks.push(Check::pass(
+                    "Grok config",
+                    format!("{} ({} proxy models)", grok_config.display(), records.len()),
+                ));
+            }
         }
-        Ok(_) => checks.push(Check::fail(
-            "Grok config",
-            "no loopback Responses model found",
-        )),
-        Err(error) => checks.push(Check::fail(
-            "Grok config",
-            format!("{}: {error}", grok_config.display()),
-        )),
+        Err(error) => checks.push(Check::fail("Grok config", error.to_string())),
     }
 
     let client = match reqwest::Client::builder().timeout(timeout).build() {

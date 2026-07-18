@@ -106,6 +106,11 @@ pub fn normalize_id(id: &str) -> (String, bool) {
     }
 }
 
+pub fn supports_fast(id: &str) -> bool {
+    let (base, _) = normalize_id(id);
+    base.starts_with("gpt-5.6-") || base == "gpt-5.5"
+}
+
 #[derive(Clone, Debug)]
 pub struct Catalog {
     models: HashMap<String, Model>,

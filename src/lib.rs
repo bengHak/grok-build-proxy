@@ -3,6 +3,7 @@ pub mod catalog;
 pub mod codexcli;
 pub mod doctor;
 pub mod events;
+pub mod grokconfig;
 pub mod modelmap;
 pub mod monitor;
 pub mod proxy;

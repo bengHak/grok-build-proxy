@@ -4,13 +4,21 @@ use grok_build_proxy::{
     auth::{DEFAULT_REFRESH_URL, Store},
     catalog::Catalog,
     codexcli, doctor,
+    grokconfig::{self, GrokConfig},
     modelmap::ModelMap,
     monitor,
     proxy::{
         self, CompatMode, DEFAULT_CODEX_COMPATIBILITY_VERSION, DEFAULT_MAX_BODY_BYTES, ProxyConfig,
     },
 };
-use std::{env, future::IntoFuture, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    future::IntoFuture,
+    io::{self, IsTerminal, Write},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 const DEFAULT_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
 const VERSION: &str = env!("GROK_BUILD_PROXY_BUILD_VERSION");
@@ -26,6 +34,7 @@ enum Command {
     Serve(ServeArgs),
     Auth(AuthArgs),
     Doctor(DoctorArgs),
+    Models(ModelsArgs),
     Version,
 }
 #[derive(Args, Clone)]
@@ -104,6 +113,110 @@ struct DoctorArgs {
     timeout: u64,
 }
 
+#[derive(Args)]
+struct ModelsArgs {
+    #[command(subcommand)]
+    action: ModelsAction,
+    #[arg(long, env = "GROK_BUILD_PROXY_GROK_CONFIG", global = true)]
+    grok_config: Option<PathBuf>,
+    #[arg(long, env = "GROK_BUILD_PROXY_LISTEN", global = true)]
+    listen: Option<String>,
+    #[arg(
+        long,
+        env = "GROK_BUILD_PROXY_TOKEN",
+        default_value = "",
+        global = true
+    )]
+    client_token: String,
+    #[arg(
+        long,
+        env = "GROK_BUILD_PROXY_MODELS",
+        default_value = "",
+        global = true
+    )]
+    models: String,
+}
+
+#[derive(Subcommand)]
+enum ModelsAction {
+    Add(ModelAddArgs),
+    Update(ModelUpdateArgs),
+    Remove(ModelRemoveArgs),
+    List(ModelListArgs),
+    Status(ModelStatusArgs),
+    Sync(ModelSyncArgs),
+}
+
+#[derive(Args)]
+struct ModelAddArgs {
+    alias: String,
+    #[arg(long)]
+    model: String,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    fast: bool,
+    #[command(flatten)]
+    write: WriteArgs,
+}
+
+#[derive(Args)]
+struct ModelUpdateArgs {
+    alias: String,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, conflicts_with = "no_fast")]
+    fast: bool,
+    #[arg(long, conflicts_with = "fast")]
+    no_fast: bool,
+    #[command(flatten)]
+    write: WriteArgs,
+}
+
+#[derive(Args)]
+struct ModelRemoveArgs {
+    alias: String,
+    #[command(flatten)]
+    write: WriteArgs,
+}
+
+#[derive(Args)]
+struct ModelListArgs {
+    #[arg(long)]
+    available: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ModelStatusArgs {
+    alias: Option<String>,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, default_value_t = 5)]
+    timeout: u64,
+}
+
+#[derive(Args)]
+struct ModelSyncArgs {
+    #[arg(long)]
+    include_fast: bool,
+    #[arg(long)]
+    prune: bool,
+    #[command(flatten)]
+    write: WriteArgs,
+}
+
+#[derive(Args)]
+struct WriteArgs {
+    #[arg(long)]
+    yes: bool,
+    #[arg(long)]
+    dry_run: bool,
+}
+
 fn home() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -146,7 +259,16 @@ async fn run() -> Result<()> {
         let first = args[1].to_string_lossy();
         let known = matches!(
             first.as_ref(),
-            "serve" | "auth" | "doctor" | "version" | "help" | "--help" | "-h" | "--version" | "-V"
+            "serve"
+                | "auth"
+                | "doctor"
+                | "models"
+                | "version"
+                | "help"
+                | "--help"
+                | "-h"
+                | "--version"
+                | "-V"
         );
         if matches!(first.as_ref(), "--version" | "-V") {
             args[1] = "version".into()
@@ -164,6 +286,7 @@ async fn run() -> Result<()> {
         Command::Serve(a) => serve(a).await,
         Command::Auth(a) => auth_command(a).await,
         Command::Doctor(a) => doctor_command(a).await,
+        Command::Models(a) => models_command(a).await,
         Command::Version => {
             println!("{VERSION}");
             Ok(())
@@ -344,6 +467,243 @@ async fn doctor_command(a: DoctorArgs) -> Result<()> {
     println!("\n{pass} passed, {} failed", checks.len() - pass);
     doctor::ensure_ok(&checks)
 }
+async fn models_command(args: ModelsArgs) -> Result<()> {
+    let path = args
+        .grok_config
+        .unwrap_or(home()?.join(".grok/config.toml"));
+    let listen_explicit = args.listen.is_some();
+    let listen = args.listen.unwrap_or_else(|| "127.0.0.1:18765".into());
+    let catalog = Catalog::new(&args.models);
+    match args.action {
+        ModelsAction::Add(action) => {
+            let mut config = GrokConfig::load(&path)?;
+            let spec = grokconfig::model_spec(
+                &catalog,
+                action.alias,
+                &action.model,
+                action.fast,
+                &listen,
+                &args.client_token,
+                action.name.as_deref(),
+            )?;
+            let changes = config.add(&spec)?;
+            apply_changes(config, changes, action.write)
+        }
+        ModelsAction::Update(action) => {
+            let mut config = GrokConfig::load(&path)?;
+            let current = config.record(&action.alias)?;
+            let (_, existing_fast) = grok_build_proxy::catalog::normalize_id(&current.model);
+            let target = action.model.as_deref().unwrap_or(&current.model);
+            let (base, requested_fast) = grok_build_proxy::catalog::normalize_id(target);
+            let fast = if action.fast {
+                true
+            } else if action.no_fast {
+                false
+            } else if requested_fast {
+                true
+            } else {
+                existing_fast
+            };
+            let api_key = if args.client_token.is_empty() {
+                config
+                    .raw_api_key(&action.alias)
+                    .unwrap_or_else(|_| "unused".into())
+            } else {
+                args.client_token.clone()
+            };
+            let update_listen = if listen_explicit {
+                listen.clone()
+            } else {
+                listen_from_base_url(&current.base_url).unwrap_or_else(|| listen.clone())
+            };
+            let name = action.name.as_deref().unwrap_or(&current.name);
+            let spec = grokconfig::model_spec(
+                &catalog,
+                action.alias,
+                &base,
+                fast,
+                &update_listen,
+                &api_key,
+                Some(name),
+            )?;
+            let changes = config.update(&spec)?;
+            apply_changes(config, changes, action.write)
+        }
+        ModelsAction::Remove(action) => {
+            let mut config = GrokConfig::load(&path)?;
+            let changes = config.remove(&action.alias)?;
+            apply_changes(config, changes, action.write)
+        }
+        ModelsAction::List(action) => {
+            let config = GrokConfig::load(&path)?;
+            if action.available {
+                let available = grokconfig::available_models(&catalog);
+                if action.json {
+                    println!("{}", serde_json::to_string_pretty(&available)?);
+                } else {
+                    println!("MODEL\tNAME\tFAST");
+                    for model in available {
+                        println!(
+                            "{}\t{}\t{}",
+                            model.model,
+                            model.name,
+                            if model.fast { "yes" } else { "no" }
+                        );
+                    }
+                }
+            } else {
+                let records = config.records();
+                if action.json {
+                    println!("{}", serde_json::to_string_pretty(&records)?);
+                } else if records.is_empty() {
+                    println!("No proxy-backed models configured in {}", path.display());
+                } else {
+                    println!("ALIAS\tMODEL\tTIER\tMANAGED\tVALID\tAPI KEY");
+                    for record in records {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            record.alias,
+                            record.model,
+                            record.service_tier,
+                            yes_no(record.managed),
+                            yes_no(record.valid),
+                            record.api_key
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        ModelsAction::Status(action) => {
+            let config = GrokConfig::load(&path)?;
+            let status_listen = if listen_explicit {
+                listen.clone()
+            } else {
+                config
+                    .records()
+                    .first()
+                    .and_then(|record| listen_from_base_url(&record.base_url))
+                    .unwrap_or_else(|| listen.clone())
+            };
+            let statuses = grokconfig::status(
+                &config,
+                action.alias.as_deref(),
+                &status_listen,
+                &args.client_token,
+                Duration::from_secs(action.timeout),
+            )
+            .await?;
+            if action.json {
+                println!("{}", serde_json::to_string_pretty(&statuses)?);
+            } else if statuses.is_empty() {
+                println!("No proxy-backed models configured in {}", path.display());
+            } else {
+                println!("ALIAS\tTIER\tCONFIG\tPROXY\tREADY\tADVERTISED\tMETADATA\tDETAIL");
+                for status in &statuses {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        status.alias,
+                        status.service_tier,
+                        pass_fail(status.configured),
+                        pass_fail(status.proxy),
+                        pass_fail(status.ready),
+                        pass_fail(status.advertised),
+                        pass_fail(status.metadata),
+                        status.detail
+                    );
+                }
+            }
+            if statuses.iter().any(|status| {
+                !status.configured
+                    || !status.proxy
+                    || !status.ready
+                    || !status.advertised
+                    || !status.metadata
+            }) {
+                bail!("one or more model status checks failed")
+            }
+            Ok(())
+        }
+        ModelsAction::Sync(action) => {
+            let mut config = GrokConfig::load(&path)?;
+            let (mut specs, unsupported) =
+                grokconfig::sync_specs(&catalog, &listen, &args.client_token, action.include_fast)?;
+            if args.client_token.is_empty() {
+                let inherited = config
+                    .inherited_api_key(&format!("http://{}/v1", listen.trim_end_matches('/')))?;
+                for spec in &mut specs {
+                    if let Ok(api_key) = config.raw_api_key(&spec.alias) {
+                        spec.api_key = api_key;
+                    } else if let Some(api_key) = &inherited {
+                        spec.api_key = api_key.clone();
+                    }
+                }
+            }
+            let changes = config.sync(&specs, action.prune)?;
+            for model in unsupported {
+                println!("fast unsupported: {model}");
+            }
+            apply_changes(config, changes, action.write)
+        }
+    }
+}
+
+fn apply_changes(
+    config: GrokConfig,
+    changes: grokconfig::ChangeSet,
+    args: WriteArgs,
+) -> Result<()> {
+    if changes.is_empty() {
+        println!("No changes needed.");
+        return Ok(());
+    }
+    println!("Planned changes to {}:", config.path().display());
+    for change in &changes.changes {
+        println!("  - {change}");
+    }
+    if args.dry_run {
+        println!("Dry run; no file was changed.");
+        return Ok(());
+    }
+    if !args.yes {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            bail!("refusing to modify config non-interactively without --yes (or use --dry-run)")
+        }
+        print!("Apply these changes? [y/N] ");
+        io::stdout().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Cancelled; no file was changed.");
+            return Ok(());
+        }
+    }
+    let path = config.path().to_owned();
+    let backup = config.commit()?;
+    println!("Updated {}", path.display());
+    if let Some(backup) = backup {
+        println!("Backup: {}", backup.display());
+    }
+    Ok(())
+}
+
+fn listen_from_base_url(base_url: &str) -> Option<String> {
+    let url = url::Url::parse(base_url).ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn pass_fail(value: bool) -> &'static str {
+    if value { "PASS" } else { "FAIL" }
+}
+
 fn render_config(listen: &str, catalog: &Catalog, mappings: &ModelMap) -> String {
     let mut out="# Add selected blocks to ~/.grok/config.toml\n\n# Optional global default used by the Quick Start:\n# [models]\n# default_reasoning_effort = \"xhigh\"\n\n".to_owned();
     let mut mapped = std::collections::HashSet::new();

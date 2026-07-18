@@ -29,6 +29,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+toml_edit = { version = "0.23", features = ["serde"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 
