@@ -244,7 +244,8 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
         for entry in s.0.model_map.entries() {
             let resolved = s.0.model_map.resolve(&entry.source);
             let (m, _) = s.0.catalog.lookup(&resolved.model);
-            let effective = resolved.effective_model_id();
+            let fast = resolved.fast && m.provider == Provider::Codex;
+            let effective = format!("{}{}", resolved.model, if fast { "-fast" } else { "" });
             push(Route {
                 id: entry.source.clone(),
                 target: resolved.model,
@@ -252,7 +253,7 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
                     "{} via {}{}",
                     entry.source,
                     m.display_name,
-                    if resolved.fast { " (Fast)" } else { "" }
+                    if fast { " (Fast)" } else { "" }
                 ),
                 description: format!(
                     "Maps {} to {} through {}.",
@@ -261,7 +262,7 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
                     m.provider.owned_by()
                 ),
                 context: m.context_window,
-                fast: resolved.fast,
+                fast,
                 reasoning: m.reasoning,
                 provider: m.provider,
             });
@@ -281,7 +282,11 @@ async fn models(State(s): State<AppState>, method: Method, headers: HeaderMap) -
     }
     let base = routes.clone();
     for r in base {
-        if !r.fast && !r.id.ends_with("-fast") && crate::catalog::supports_fast(&r.target) {
+        if r.provider == Provider::Codex
+            && !r.fast
+            && !r.id.ends_with("-fast")
+            && crate::catalog::supports_fast(&r.target)
+        {
             let route = Route {
                 id: format!("{}-fast", r.id),
                 target: r.target,
@@ -1462,6 +1467,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(allowed.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mapped_kimi_fast_suffix_is_advertised_as_standard() {
+        use crate::auth::Credentials;
+        use tower::ServiceExt;
+
+        struct Creds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for Creds {
+            async fn get(&self, _: bool) -> Result<Credentials> {
+                Ok(Credentials {
+                    access_token: "x".into(),
+                    account_id: String::new(),
+                    expires_at: None,
+                })
+            }
+        }
+
+        let app = router(ProxyConfig {
+            upstream_url: "http://127.0.0.1:9/responses".into(),
+            credentials: Arc::new(Creds),
+            kimi: None,
+            catalog: Catalog::default(),
+            model_map: ModelMap::parse("alias-fast=kimi-for-coding").unwrap(),
+            client: reqwest::Client::new(),
+            client_token: String::new(),
+            version: "test".into(),
+            compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+            responses_compat: CompatMode::Full,
+            observer: None,
+            max_body_bytes: 1024,
+        })
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 << 10)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let model = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["id"] == "alias-fast")
+            .unwrap();
+        assert_eq!(model["owned_by"], "kimi");
+        assert_eq!(model["target_model"], "kimi-for-coding");
+        assert!(model.get("service_tier").is_none());
+        assert!(!model["name"].as_str().unwrap().contains("Fast"));
     }
 
     #[tokio::test]

@@ -7,25 +7,91 @@ impl Translator {
         if self.terminal {
             return Vec::new();
         }
-        let slot = tool.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let Some(slot) = tool
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return self.fail(&json!({
+                "type": "invalid_tool_call",
+                "message": "Kimi returned a function call without a valid index"
+            }));
+        };
+        let call_id = match tool.get("id") {
+            None => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+            Some(_) => {
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi returned a function call with an invalid id"
+                }));
+            }
+        };
+        let function = match tool.get("function") {
+            None => None,
+            Some(Value::Object(value)) => Some(value),
+            Some(_) => {
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi returned an invalid function call payload"
+                }));
+            }
+        };
+        let name = match function.and_then(|value| value.get("name")) {
+            None => None,
+            Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+            Some(_) => {
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi returned a function call with an invalid name"
+                }));
+            }
+        };
+        let arguments = match function.and_then(|value| value.get("arguments")) {
+            None => None,
+            Some(Value::String(value)) => Some(value.as_str()),
+            Some(_) => {
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi returned non-string function arguments"
+                }));
+            }
+        };
         let index = if let Some(index) = self.tool_indexes.get(&slot) {
+            let Some(Output::Tool {
+                call_id: expected_call_id,
+                name: expected_name,
+                ..
+            }) = self.outputs.get(index)
+            else {
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi returned an invalid function call index"
+                }));
+            };
+            if call_id.is_some_and(|value| value != expected_call_id)
+                || name.is_some_and(|value| value != expected_name)
+            {
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi changed a function call id or name mid-stream"
+                }));
+            }
+            if call_id.is_none() && name.is_none() && arguments.is_none() {
+                return self.fail(&json!({
+                    "type": "invalid_tool_call",
+                    "message": "Kimi returned an empty function call fragment"
+                }));
+            }
             *index
         } else {
-            let Some(call_id) = tool
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            else {
+            let Some(call_id) = call_id else {
                 return self.fail(&json!({
                     "type": "invalid_tool_call",
                     "message": "Kimi returned a function call without an id"
                 }));
             };
-            let Some(name) = tool
-                .pointer("/function/name")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            else {
+            let Some(name) = name else {
                 return self.fail(&json!({
                     "type": "invalid_tool_call",
                     "message": "Kimi returned a function call without a name"
@@ -41,10 +107,7 @@ impl Translator {
             self.tool_indexes.insert(slot, index);
             index
         };
-        let arguments = tool
-            .pointer("/function/arguments")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let arguments = arguments.unwrap_or("");
         let mut output = Vec::new();
         let item_id = match self.outputs.get_mut(&index) {
             Some(Output::Tool {

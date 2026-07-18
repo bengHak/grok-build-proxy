@@ -115,6 +115,12 @@ impl Translator {
     pub fn finish(&mut self) -> Vec<u8> {
         if self.terminal {
             Vec::new()
+        } else if self.buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            self.buffer.clear();
+            self.fail(&json!({
+                "type":"upstream_error",
+                "message":"Kimi stream ended with an incomplete SSE frame"
+            }))
         } else {
             self.terminal()
         }

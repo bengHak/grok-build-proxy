@@ -521,6 +521,7 @@ pub async fn status(
                     _ => None,
                 })
                 .unwrap_or(catalog_model.provider);
+            let fast = fast && provider == Provider::Codex;
             let ready = match provider {
                 Provider::Codex => endpoint.codex_ready,
                 Provider::Kimi => endpoint.kimi_ready,
@@ -560,7 +561,7 @@ pub async fn status(
             ModelStatus {
                 alias: record.alias,
                 model: record.model,
-                service_tier: record.service_tier,
+                service_tier: tier(fast).to_owned(),
                 configured,
                 proxy: endpoint.proxy,
                 ready,
@@ -1010,7 +1011,13 @@ mod tests {
                             "target_model": "gpt-5.6-sol-fast"
                         },
                         {"id":"kimi-for-coding"},
-                        {"id":"mapped-kimi","owned_by":"kimi","context_window":256000}
+                        {"id":"mapped-kimi","owned_by":"kimi","context_window":256000},
+                        {
+                            "id":"mapped-kimi-fast",
+                            "owned_by":"kimi",
+                            "context_window":256000,
+                            "target_model":"kimi-for-coding"
+                        }
                     ]}))
                 }),
             );
@@ -1057,6 +1064,20 @@ mod tests {
                 reasoning_efforts: Vec::new(),
             })
             .unwrap();
+        config
+            .add(&ModelSpec {
+                alias: "mapped-kimi-fast".into(),
+                base_model: "mapped-kimi-fast".into(),
+                effective_model: "mapped-kimi-fast".into(),
+                fast: false,
+                name: "Mapped Kimi Fast Source".into(),
+                description: "Mapped Kimi fast-suffixed source".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: "unused".into(),
+                context_window: 256_000,
+                reasoning_efforts: Vec::new(),
+            })
+            .unwrap();
         let statuses = status(
             &config,
             None,
@@ -1066,7 +1087,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(statuses.len(), 3);
+        assert_eq!(statuses.len(), 4);
         let status = statuses
             .iter()
             .find(|status| status.alias == "codex-sol-fast")
@@ -1093,6 +1114,14 @@ mod tests {
         assert!(!mapped.ready);
         assert!(mapped.advertised);
         assert!(mapped.metadata);
+        let mapped_fast = statuses
+            .iter()
+            .find(|status| status.alias == "mapped-kimi-fast")
+            .unwrap();
+        assert_eq!(mapped_fast.service_tier, "standard");
+        assert!(!mapped_fast.ready);
+        assert!(mapped_fast.advertised);
+        assert!(mapped_fast.metadata);
         assert!(mapped.detail.contains("kimi provider is not ready"));
     }
 
