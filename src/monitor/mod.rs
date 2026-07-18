@@ -118,7 +118,8 @@ pub async fn run(dashboard: Arc<Dashboard>, address: &str, version: &str) -> io:
     }
 }
 
-/// Handle y/Y (copy) and w/W (write). Returns `None` for unrelated keys.
+/// Handle y/Y (copy) and w/W (write). Returns `None` for unrelated keys
+/// or when an overlay (Help/Detail) is open — export is Dashboard-only.
 fn try_export(
     code: event::KeyCode,
     snapshot: &Snapshot,
@@ -132,6 +133,10 @@ fn try_export(
         KeyCode::Char('Y' | 'W') => true,
         _ => return None,
     };
+    // Avoid accidental clipboard/file writes while reading help or detail.
+    if app.mode != Mode::Dashboard {
+        return None;
+    }
     let copy = matches!(code, KeyCode::Char('y' | 'Y'));
     // Export the currently filtered set (group display order for readability).
     let records: Vec<FailureRecord> = FailuresPanel::ordered(snapshot, app.failure_filter)
@@ -794,9 +799,15 @@ mod tests {
         let out = try_export(KeyCode::Char('w'), &snap, &app, "127.0.0.1:1", "0.0.12")
             .expect("w is export");
         match out {
-            report::ExportOutcome::Written { count, json, .. } => {
+            report::ExportOutcome::Written {
+                count,
+                json,
+                clipboard_fallback,
+                ..
+            } => {
                 assert_eq!(count, 2);
                 assert!(!json);
+                assert!(!clipboard_fallback);
             }
             report::ExportOutcome::Copied { .. } => panic!("w should write"),
             report::ExportOutcome::Empty => panic!("expected failures"),
@@ -808,5 +819,62 @@ mod tests {
         let empty_out =
             try_export(KeyCode::Char('y'), &empty, &app, "a", "v").expect("y is export");
         assert!(matches!(empty_out, report::ExportOutcome::Empty));
+    }
+
+    #[test]
+    fn try_export_respects_failure_filter() {
+        use crossterm::event::KeyCode;
+        use std::fs;
+        let snap = fixture_dashboard().snapshot();
+        // Fixture: req-3 ProxyAssemble + req-2 UpstreamHttp.
+        let mut app = App::new();
+        app.failure_filter = FailureFilter::ProxyAssemble;
+        let out = try_export(KeyCode::Char('w'), &snap, &app, "127.0.0.1:9", "0.0.12")
+            .expect("w is export");
+        match out {
+            report::ExportOutcome::Written { count, path, .. } => {
+                assert_eq!(count, 1, "only ProxyAssemble should export");
+                let body = fs::read_to_string(&path).expect("read report");
+                assert!(
+                    body.contains("filter: ProxyAssemble"),
+                    "meta filter label missing:\n{body}"
+                );
+                assert!(
+                    body.contains("ProxyAssemble") || body.contains("proxy_incomplete"),
+                    "ProxyAssemble content missing:\n{body}"
+                );
+                assert!(
+                    !body.contains("UpstreamHttp"),
+                    "filtered-out kind leaked into report:\n{body}"
+                );
+                assert!(
+                    body.contains("| ProxyAssemble | 1 |"),
+                    "summary should only count filtered kind:\n{body}"
+                );
+            }
+            other => panic!("expected write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_export_ignored_when_overlay_open() {
+        use crossterm::event::KeyCode;
+        let snap = fixture_dashboard().snapshot();
+        let mut app = App::new();
+        app.mode = Mode::Help;
+        assert!(
+            try_export(KeyCode::Char('w'), &snap, &app, "a", "v").is_none(),
+            "export should no-op in Help"
+        );
+        app.mode = Mode::Detail;
+        assert!(
+            try_export(KeyCode::Char('y'), &snap, &app, "a", "v").is_none(),
+            "export should no-op in Detail"
+        );
+        app.mode = Mode::Dashboard;
+        assert!(
+            try_export(KeyCode::Char('w'), &snap, &app, "a", "v").is_some(),
+            "export should work on Dashboard"
+        );
     }
 }

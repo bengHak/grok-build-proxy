@@ -201,12 +201,58 @@ pub fn report_filename_stem(when: DateTime<Utc>) -> String {
     format!("failure-{}", local.format("%Y%m%d-%H%M%S"))
 }
 
-/// Write report body to `dir/stem.ext`, creating parent dirs as needed.
+/// Write report body to `dir/stem.ext` (or `stem-N.ext` if taken), creating parent dirs.
+///
+/// On Unix, the directory is `0o700` and files are `0o600` (create-new, no silent overwrite).
 pub fn write_report_file(dir: &Path, stem: &str, ext: &str, body: &str) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
-    let path = dir.join(format!("{stem}.{ext}"));
-    fs::write(&path, body)?;
-    Ok(path)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+
+    for n in 0..1000u32 {
+        let name = if n == 0 {
+            format!("{stem}.{ext}")
+        } else {
+            format!("{stem}-{n}.{ext}")
+        };
+        let path = dir.join(name);
+        match write_new_private(&path, body.as_bytes()) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::other(
+        "could not allocate unique report filename after 1000 attempts",
+    ))
+}
+
+fn write_new_private(path: &Path, body: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(body)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        if path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "report file exists",
+            ));
+        }
+        fs::write(path, body)
+    }
 }
 
 /// Copy text to the macOS clipboard via `pbcopy`.
@@ -240,10 +286,13 @@ pub enum ExportOutcome {
         count: usize,
         json: bool,
     },
+    /// Deliberate write (`w`/`W`) or clipboard-fallback write after `y`/`Y` failed.
     Written {
         path: PathBuf,
         count: usize,
         json: bool,
+        /// True when this path was written because clipboard copy failed.
+        clipboard_fallback: bool,
     },
     Empty,
     Error(String),
@@ -256,9 +305,21 @@ impl ExportOutcome {
                 let fmt = if *json { "json" } else { "md" };
                 format!("copied {count} failures ({fmt}) to clipboard")
             }
-            Self::Written { path, count, json } => {
+            Self::Written {
+                path,
+                count,
+                json,
+                clipboard_fallback,
+            } => {
                 let fmt = if *json { "json" } else { "md" };
-                format!("wrote {count} failures ({fmt}) → {}", path.display())
+                if *clipboard_fallback {
+                    format!(
+                        "clipboard failed; wrote {count} failures ({fmt}) → {}",
+                        path.display()
+                    )
+                } else {
+                    format!("wrote {count} failures ({fmt}) → {}", path.display())
+                }
             }
             Self::Empty => "no failures to export (current filter)".into(),
             Self::Error(msg) => format!("export failed: {msg}"),
@@ -268,6 +329,16 @@ impl ExportOutcome {
 
 /// Export markdown or JSON: copy to clipboard, falling back to a written file.
 pub fn export_copy(records: &[FailureRecord], meta: &ReportMeta, json: bool) -> ExportOutcome {
+    export_copy_with(records, meta, json, copy_to_clipboard)
+}
+
+/// Testable export-copy path: `copy` is injected (production uses [`copy_to_clipboard`]).
+pub(crate) fn export_copy_with(
+    records: &[FailureRecord],
+    meta: &ReportMeta,
+    json: bool,
+    copy: impl FnOnce(&str) -> io::Result<()>,
+) -> ExportOutcome {
     if records.is_empty() {
         return ExportOutcome::Empty;
     }
@@ -276,7 +347,7 @@ pub fn export_copy(records: &[FailureRecord], meta: &ReportMeta, json: bool) -> 
     } else {
         render_markdown(records, meta)
     };
-    match copy_to_clipboard(&body) {
+    match copy(&body) {
         Ok(()) => ExportOutcome::Copied {
             count: records.len(),
             json,
@@ -288,6 +359,7 @@ pub fn export_copy(records: &[FailureRecord], meta: &ReportMeta, json: bool) -> 
                     path,
                     count: records.len(),
                     json,
+                    clipboard_fallback: true,
                 },
                 Err(werr) => ExportOutcome::Error(format!("clipboard: {e}; write: {werr}")),
             }
@@ -310,6 +382,7 @@ pub fn export_write(records: &[FailureRecord], meta: &ReportMeta, json: bool) ->
             path,
             count: records.len(),
             json,
+            clipboard_fallback: false,
         },
         Err(e) => ExportOutcome::Error(e.to_string()),
     }
@@ -327,6 +400,15 @@ mod tests {
     use super::*;
     use crate::events::FailureKind;
     use chrono::TimeZone;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serialize tests that mutate `HOME` (process-wide env).
+    fn home_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     fn sample_record(kind: FailureKind, session: &str, req: &str) -> FailureRecord {
         FailureRecord {
@@ -430,6 +512,26 @@ mod tests {
         let path = write_report_file(nested.as_path(), "failure-test", "md", "# hi\n").unwrap();
         assert!(path.exists());
         assert_eq!(fs::read_to_string(&path).unwrap(), "# hi\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "report file should be user-only");
+            let dmode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dmode, 0o700, "report dir should be user-only");
+        }
+    }
+
+    #[test]
+    fn write_report_file_disambiguates_same_stem() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = write_report_file(dir.path(), "failure-dup", "md", "one").unwrap();
+        let b = write_report_file(dir.path(), "failure-dup", "md", "two").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.file_name().unwrap(), "failure-dup.md");
+        assert_eq!(b.file_name().unwrap(), "failure-dup-1.md");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "one");
+        assert_eq!(fs::read_to_string(&b).unwrap(), "two");
     }
 
     #[test]
@@ -454,5 +556,92 @@ mod tests {
             export_write(&[], &meta, true),
             ExportOutcome::Empty
         ));
+    }
+
+    #[test]
+    fn export_copy_fallback_on_clipboard_error() {
+        let _guard = home_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: serialized via home_lock; restored below.
+        let prev_home = env::var_os("HOME");
+        // env::set_var is unsafe in Rust 2024 / recent rustc.
+        unsafe {
+            env::set_var("HOME", tmp.path());
+        }
+
+        let records = [sample_record(FailureKind::UpstreamHttp, "s", "r1")];
+        let meta = ReportMeta {
+            version: "0.0.12".into(),
+            listen: "127.0.0.1:1".into(),
+            generated: Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap(),
+            filter: "All".into(),
+        };
+        let out = export_copy_with(&records, &meta, false, |_| {
+            Err(io::Error::other("forced clipboard failure"))
+        });
+
+        match out {
+            ExportOutcome::Written {
+                path,
+                count,
+                json,
+                clipboard_fallback,
+            } => {
+                assert_eq!(count, 1);
+                assert!(!json);
+                assert!(clipboard_fallback);
+                assert!(path.starts_with(tmp.path().join(".grok").join("proxy-reports")));
+                assert!(path.exists());
+                let body = fs::read_to_string(&path).unwrap();
+                assert!(body.contains("UpstreamHttp"));
+                let toast = ExportOutcome::Written {
+                    path: path.clone(),
+                    count: 1,
+                    json: false,
+                    clipboard_fallback: true,
+                }
+                .toast();
+                assert!(
+                    toast.starts_with("clipboard failed; wrote"),
+                    "fallback toast: {toast}"
+                );
+            }
+            other => panic!("expected clipboard fallback write, got {other:?}"),
+        }
+
+        match prev_home {
+            Some(h) => unsafe { env::set_var("HOME", h) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn export_copy_both_fail_surfaces_error() {
+        let _guard = home_lock();
+        let prev_home = env::var_os("HOME");
+        // Point HOME at a non-creatable path under a file so write fails.
+        let tmp = tempfile::tempdir().unwrap();
+        let file_as_home = tmp.path().join("not-a-dir");
+        fs::write(&file_as_home, b"x").unwrap();
+        unsafe {
+            env::set_var("HOME", &file_as_home);
+        }
+
+        let records = [sample_record(FailureKind::StreamIo, "s", "r")];
+        let meta = ReportMeta::new("0.0.12", "l", "All");
+        let out = export_copy_with(&records, &meta, true, |_| {
+            Err(io::Error::other("no pbcopy"))
+        });
+        assert!(
+            matches!(out, ExportOutcome::Error(_)),
+            "expected dual failure Error, got {out:?}"
+        );
+        let toast = out.toast();
+        assert!(toast.contains("export failed"), "{toast}");
+
+        match prev_home {
+            Some(h) => unsafe { env::set_var("HOME", h) },
+            None => unsafe { env::remove_var("HOME") },
+        }
     }
 }

@@ -410,6 +410,51 @@ mod tests {
     }
 
     #[test]
+    fn gap_exactly_30s_forms_estimated_group() {
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+        let failures = [
+            rec_at(FailureKind::ProxyAssemble, "s", "a", t0),
+            rec_at(
+                FailureKind::UpstreamHttp,
+                "s",
+                "b",
+                t0 + Duration::seconds(RETRY_GROUP_WINDOW_SECS),
+            ),
+        ];
+        let refs: Vec<&FailureRecord> = failures.iter().collect();
+        let groups = group_failures(&refs);
+        assert_eq!(groups.len(), 1, "gap == 30s is inclusive");
+        assert!(groups[0].estimated());
+        assert_eq!(groups[0].span_secs(), RETRY_GROUP_WINDOW_SECS);
+    }
+
+    #[test]
+    fn chained_gaps_extend_group_beyond_30s_span() {
+        // Consecutive gaps ≤30s chain: t=0,25,50 → one group with span 50s.
+        let t0 = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
+        let failures = [
+            rec_at(FailureKind::ProxyAssemble, "s", "a", t0),
+            rec_at(
+                FailureKind::ProxyAssemble,
+                "s",
+                "b",
+                t0 + Duration::seconds(25),
+            ),
+            rec_at(
+                FailureKind::UpstreamHttp,
+                "s",
+                "c",
+                t0 + Duration::seconds(50),
+            ),
+        ];
+        let refs: Vec<&FailureRecord> = failures.iter().collect();
+        let groups = group_failures(&refs);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members.len(), 3);
+        assert_eq!(groups[0].span_secs(), 50);
+    }
+
+    #[test]
     fn ordered_newest_group_first() {
         let t0 = Utc.with_ymd_and_hms(2026, 7, 18, 12, 0, 0).unwrap();
         let snap = Snapshot {

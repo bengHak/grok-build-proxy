@@ -45,7 +45,7 @@ impl Widget for HelpOverlay {
             Line::from("  q/Q / Ctrl-C stop proxy"),
             Line::from(""),
             Line::from(Span::styled(
-                "  Failures with same session within 30s: estimated retry group",
+                "  Same session, consecutive fails ≤30s apart: estimated retry",
                 self.theme.muted,
             )),
         ];
