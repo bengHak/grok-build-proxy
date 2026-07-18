@@ -7,6 +7,10 @@ use grok_build_proxy::{
     grokconfig::{self, GrokConfig},
     modelmap::ModelMap,
     monitor,
+    provider::kimi::auth::{
+        DEFAULT_OAUTH_HOST as DEFAULT_KIMI_OAUTH_HOST, DEFAULT_UPSTREAM as DEFAULT_KIMI_UPSTREAM,
+        Store as KimiStore,
+    },
     proxy::{
         self, CompatMode, DEFAULT_CODEX_COMPATIBILITY_VERSION, DEFAULT_MAX_BODY_BYTES, ProxyConfig,
     },
@@ -20,11 +24,13 @@ use std::{
     time::Duration,
 };
 
+mod kimi_cli;
+
 const DEFAULT_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
 const VERSION: &str = env!("GROK_BUILD_PROXY_BUILD_VERSION");
 
 #[derive(Parser)]
-#[command(name="grok-build-proxy",version=VERSION,about="Local Grok Build to ChatGPT Codex proxy")]
+#[command(name="grok-build-proxy",version=VERSION,about="Local Grok Build proxy for ChatGPT Codex and Kimi")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -33,6 +39,7 @@ struct Cli {
 enum Command {
     Serve(ServeArgs),
     Auth(AuthArgs),
+    Kimi(kimi_cli::KimiArgs),
     Doctor(DoctorArgs),
     Models(ModelsArgs),
     Version,
@@ -51,6 +58,14 @@ struct ServeArgs {
     upstream: String,
     #[arg(long,env="GROK_BUILD_PROXY_REFRESH_URL",default_value=DEFAULT_REFRESH_URL)]
     refresh_url: String,
+    #[arg(long, env = "GROK_BUILD_PROXY_KIMI_AUTH_FILE")]
+    kimi_auth_file: Option<PathBuf>,
+    #[arg(long, env = "GROK_BUILD_PROXY_KIMI_API_KEY", default_value = "")]
+    kimi_api_key: String,
+    #[arg(long,env="GROK_BUILD_PROXY_KIMI_UPSTREAM",default_value=DEFAULT_KIMI_UPSTREAM)]
+    kimi_upstream: String,
+    #[arg(long,env="GROK_BUILD_PROXY_KIMI_OAUTH_HOST",default_value=DEFAULT_KIMI_OAUTH_HOST)]
+    kimi_oauth_host: String,
     #[arg(long, env = "GROK_BUILD_PROXY_MODELS", default_value = "")]
     models: String,
     #[arg(long, env = "GROK_BUILD_PROXY_MODEL_MAP", default_value = "")]
@@ -93,6 +108,10 @@ struct DoctorArgs {
     codex_home: Option<PathBuf>,
     #[arg(long, env = "GROK_BUILD_PROXY_AUTH_FILE")]
     auth_file: Option<PathBuf>,
+    #[arg(long, env = "GROK_BUILD_PROXY_KIMI_AUTH_FILE")]
+    kimi_auth_file: Option<PathBuf>,
+    #[arg(long, env = "GROK_BUILD_PROXY_KIMI_API_KEY", default_value = "")]
+    kimi_api_key: String,
     #[arg(long, env = "GROK_BUILD_PROXY_GROK_CONFIG")]
     grok_config: Option<PathBuf>,
     #[arg(long, env = "GROK_BUILD_PROXY_CODEX_BINARY", default_value = "codex")]
@@ -263,6 +282,7 @@ async fn run() -> Result<()> {
                 | "auth"
                 | "doctor"
                 | "models"
+                | "kimi"
                 | "version"
                 | "help"
                 | "--help"
@@ -285,6 +305,10 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Serve(a) => serve(a).await,
         Command::Auth(a) => auth_command(a).await,
+        Command::Kimi(a) => {
+            require_macos()?;
+            kimi_cli::run(a).await
+        }
         Command::Doctor(a) => doctor_command(a).await,
         Command::Models(a) => models_command(a).await,
         Command::Version => {
@@ -330,9 +354,15 @@ async fn serve(a: ServeArgs) -> Result<()> {
             .with_writer(std::io::stderr)
             .init()
     }
-    let home = codex_home(None)?;
-    let auth_path = a.auth_file.unwrap_or_else(|| home.join("auth.json"));
+    let codex_home_path = codex_home(None)?;
+    let auth_path = a
+        .auth_file
+        .unwrap_or_else(|| codex_home_path.join("auth.json"));
     let store = Arc::new(Store::new(auth_path, a.refresh_url)?);
+    let kimi_auth_path = a
+        .kimi_auth_file
+        .unwrap_or(home()?.join(".grok-build-proxy/kimi/auth.json"));
+    let kimi_store = Arc::new(KimiStore::new(kimi_auth_path, a.kimi_oauth_host)?);
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(20)
         .build()?;
@@ -345,6 +375,11 @@ async fn serve(a: ServeArgs) -> Result<()> {
     let app = proxy::router(ProxyConfig {
         upstream_url: a.upstream,
         credentials: store,
+        kimi: Some(proxy::KimiConfig {
+            upstream_url: a.kimi_upstream,
+            credentials: kimi_store,
+            api_key: a.kimi_api_key.trim().to_owned(),
+        }),
         catalog,
         model_map: mappings,
         client,
@@ -436,9 +471,14 @@ async fn doctor_command(a: DoctorArgs) -> Result<()> {
     let auth = a
         .auth_file
         .unwrap_or_else(|| codex_home_path.join("auth.json"));
+    let kimi_auth = a
+        .kimi_auth_file
+        .unwrap_or(home()?.join(".grok-build-proxy/kimi/auth.json"));
     let config = a.grok_config.unwrap_or(home()?.join(".grok/config.toml"));
     let checks = doctor::run_full(
         &auth,
+        Some(&kimi_auth),
+        &a.kimi_api_key,
         &config,
         &codex_home_path,
         &a.listen,
@@ -714,7 +754,12 @@ fn render_config(listen: &str, catalog: &Catalog, mappings: &ModelMap) -> String
         out.push_str(&config_block(
             &e.source,
             &e.source,
-            &format!("{} via Codex {}", display_id(&e.source), m.display_name),
+            &format!(
+                "{} via {} {}",
+                display_id(&e.source),
+                m.provider.owned_by(),
+                m.display_name
+            ),
             listen,
             m.context_window,
             m.reasoning.as_ref(),
@@ -723,9 +768,17 @@ fn render_config(listen: &str, catalog: &Catalog, mappings: &ModelMap) -> String
     for m in catalog.models() {
         if !mapped.contains(&m.id) {
             out.push_str(&config_block(
-                &format!("codex-{}", m.id.replace(['.', '_', '/'], "-")),
+                &format!(
+                    "{}-{}",
+                    m.provider.as_str(),
+                    m.id.replace(['.', '_', '/'], "-")
+                ),
                 &m.id,
-                &format!("Codex {}", m.display_name),
+                &if m.provider == grok_build_proxy::provider::Provider::Kimi {
+                    m.display_name.clone()
+                } else {
+                    format!("Codex {}", m.display_name)
+                },
                 listen,
                 m.context_window,
                 m.reasoning.as_ref(),

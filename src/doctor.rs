@@ -1,4 +1,12 @@
-use crate::{auth::Store, codexcli, grokconfig::GrokConfig, modelmap::ModelMap};
+use crate::{
+    auth::Store,
+    catalog::{Catalog, normalize_id},
+    codexcli,
+    grokconfig::GrokConfig,
+    modelmap::ModelMap,
+    provider::Provider,
+    provider::kimi::auth::{DEFAULT_OAUTH_HOST as DEFAULT_KIMI_OAUTH_HOST, Store as KimiStore},
+};
 use anyhow::Result;
 use serde_json::Value;
 use std::{net::SocketAddr, path::Path, time::Duration};
@@ -40,6 +48,8 @@ impl Check {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_full(
     auth_file: &Path,
+    kimi_auth_file: Option<&Path>,
+    kimi_api_key: &str,
     grok_config: &Path,
     codex_home: &Path,
     listen: &str,
@@ -66,17 +76,23 @@ pub async fn run_full(
         ));
     }
 
-    match ModelMap::parse(model_map) {
-        Ok(map) => checks.push(Check::pass(
-            "Model substitutions",
-            if map.is_empty() {
-                "none".into()
-            } else {
-                map.stable_string()
-            },
-        )),
-        Err(error) => checks.push(Check::fail("Model substitutions", error.to_string())),
-    }
+    let mappings = match ModelMap::parse(model_map) {
+        Ok(map) => {
+            checks.push(Check::pass(
+                "Model substitutions",
+                if map.is_empty() {
+                    "none".into()
+                } else {
+                    map.stable_string()
+                },
+            ));
+            Some(map)
+        }
+        Err(error) => {
+            checks.push(Check::fail("Model substitutions", error.to_string()));
+            None
+        }
+    };
     for (name, binary) in [("Codex CLI", codex_binary), ("Grok Build CLI", grok_binary)] {
         match codexcli::find_binary(binary) {
             Some(path) => checks.push(Check::pass(name, path.display().to_string())),
@@ -136,9 +152,65 @@ pub async fn run_full(
         Err(error) => checks.push(Check::fail("ChatGPT auth", error.to_string())),
     }
 
+    if !kimi_api_key.trim().is_empty() {
+        checks.push(Check::pass("Kimi auth", "API key configured"));
+    } else if let Some(path) = kimi_auth_file {
+        match KimiStore::new(path, DEFAULT_KIMI_OAUTH_HOST) {
+            Ok(store) => match store.inspect().await {
+                Ok(status) => {
+                    #[cfg(unix)]
+                    let secure = status.file_mode & 0o077 == 0;
+                    #[cfg(not(unix))]
+                    let secure = true;
+                    if secure {
+                        let now = chrono::Utc::now();
+                        if status.expires_at <= now && !status.has_refresh_token {
+                            checks.push(Check::fail(
+                                "Kimi auth",
+                                "credential is expired and has no refresh token; run `grok-build-proxy kimi auth login`",
+                            ));
+                        } else {
+                            checks
+                                .push(Check::pass("Kimi auth", status.path.display().to_string()));
+                            if !status.has_refresh_token {
+                                checks.push(Check::warn(
+                                    "Kimi refresh token",
+                                    "missing; login may need to be repeated when the access token expires",
+                                ));
+                            }
+                        }
+                    } else {
+                        checks.push(Check::fail(
+                            "Kimi auth",
+                            "credential file is group/world accessible",
+                        ));
+                    }
+                }
+                Err(error) => checks.push(Check::fail("Kimi auth", error.to_string())),
+            },
+            Err(error) => checks.push(Check::fail("Kimi auth", error.to_string())),
+        }
+    }
+
+    let mut required_codex = true;
+    let mut required_kimi = true;
     match GrokConfig::load(grok_config) {
         Ok(config) => {
             let records = config.records();
+            let catalog = Catalog::default();
+            required_codex = records.is_empty();
+            required_kimi = records.is_empty();
+            for record in &records {
+                let resolved = mappings
+                    .as_ref()
+                    .map(|map| map.resolve(&record.model).model)
+                    .unwrap_or_else(|| record.model.clone());
+                let (model, _) = normalize_id(&resolved);
+                match catalog.lookup(&model).0.provider {
+                    Provider::Codex => required_codex = true,
+                    Provider::Kimi => required_kimi = true,
+                }
+            }
             if records.is_empty() {
                 checks.push(Check::fail(
                     "Grok config",
@@ -162,6 +234,19 @@ pub async fn run_full(
         Err(error) => checks.push(Check::fail("Grok config", error.to_string())),
     }
 
+    for check in &mut checks {
+        let unused_provider = (!required_codex
+            && matches!(
+                check.name,
+                "Codex CLI" | "Codex credential configuration" | "ChatGPT auth"
+            ))
+            || (!required_kimi && check.name == "Kimi auth");
+        if unused_provider && !check.ok && !check.detail.contains("group/world") {
+            check.ok = true;
+            check.warning = true;
+        }
+    }
+
     let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(client) => client,
         Err(error) => {
@@ -173,19 +258,55 @@ pub async fn run_full(
     match client.get(format!("{base}/healthz")).send().await {
         Ok(response) => match response.json::<Value>().await {
             Ok(body) if body.get("service").and_then(Value::as_str) == Some("grok-build-proxy") => {
-                let mut request = client.get(format!("{base}/readyz"));
-                if !client_token.trim().is_empty() {
-                    request = request.bearer_auth(client_token.trim());
+                let mut providers = Vec::new();
+                if required_codex {
+                    providers.push("codex");
                 }
-                match request.send().await {
-                    Ok(response) if response.status().is_success() => {
-                        checks.push(Check::pass("Proxy readiness", format!("ready at {base}")))
+                if required_kimi {
+                    providers.push("kimi");
+                }
+                if providers.is_empty() {
+                    providers.push("");
+                }
+                let mut failures = Vec::new();
+                for provider in &providers {
+                    let url = if provider.is_empty() {
+                        format!("{base}/readyz")
+                    } else {
+                        format!("{base}/readyz?provider={provider}")
+                    };
+                    let mut request = client.get(url);
+                    if !client_token.trim().is_empty() {
+                        request = request.bearer_auth(client_token.trim());
                     }
-                    Ok(response) => checks.push(Check::fail(
+                    match request.send().await {
+                        Ok(response) if response.status().is_success() => {}
+                        Ok(response) => failures.push(format!(
+                            "{} readiness returned HTTP {}",
+                            if provider.is_empty() {
+                                "proxy"
+                            } else {
+                                provider
+                            },
+                            response.status()
+                        )),
+                        Err(error) => failures.push(format!(
+                            "{} readiness: {error}",
+                            if provider.is_empty() {
+                                "proxy"
+                            } else {
+                                provider
+                            }
+                        )),
+                    }
+                }
+                if failures.is_empty() {
+                    checks.push(Check::pass(
                         "Proxy readiness",
-                        format!("readiness returned HTTP {}", response.status()),
-                    )),
-                    Err(error) => checks.push(Check::fail("Proxy readiness", error.to_string())),
+                        format!("ready at {base} ({})", providers.join(", ")),
+                    ));
+                } else {
+                    checks.push(Check::fail("Proxy readiness", failures.join("; ")));
                 }
             }
             _ => checks.push(Check::fail(
@@ -219,6 +340,8 @@ pub async fn run_full(
 pub async fn run(auth_file: &Path, grok_config: &Path, codex_home: &Path) -> Vec<Check> {
     run_full(
         auth_file,
+        None,
+        "",
         grok_config,
         codex_home,
         "127.0.0.1:18765",
@@ -262,5 +385,268 @@ mod tests {
                 .iter()
                 .any(|check| check.detail.contains("access_token"))
         );
+    }
+
+    #[tokio::test]
+    async fn unusable_grok_config_keeps_kimi_auth_required() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-grok.toml");
+        let empty = directory.path().join("empty-grok.toml");
+        tokio::fs::write(&empty, "").await.unwrap();
+
+        for grok_config in [&missing, &empty] {
+            let checks = run_full(
+                &directory.path().join("missing-codex.json"),
+                Some(&directory.path().join("missing-kimi.json")),
+                "",
+                grok_config,
+                directory.path(),
+                "127.0.0.1:0",
+                "",
+                "missing-codex",
+                "missing-grok",
+                "",
+                Duration::from_millis(50),
+            )
+            .await;
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| { check.name == "Kimi auth" && !check.ok && !check.warning })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn kimi_api_key_satisfies_auth_check_without_exposing_the_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let grok_config = directory.path().join("grok.toml");
+        tokio::fs::write(
+            &grok_config,
+            "[model.kimi]\nmodel = \"k3\"\nname = \"Kimi K3\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n",
+        )
+        .await
+        .unwrap();
+
+        let secret = "secret-kimi-api-key";
+        let checks = run_full(
+            &directory.path().join("missing-codex.json"),
+            Some(&directory.path().join("missing-kimi.json")),
+            secret,
+            &grok_config,
+            directory.path(),
+            "127.0.0.1:0",
+            "",
+            "missing-codex",
+            "missing-grok",
+            "",
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(checks.iter().any(|check| {
+            check.name == "Kimi auth" && check.ok && check.detail == "API key configured"
+        }));
+        assert!(!checks.iter().any(|check| check.detail.contains(secret)));
+    }
+
+    #[tokio::test]
+    async fn kimi_credentials_make_missing_codex_setup_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        let kimi_auth = directory.path().join("kimi-auth.json");
+        let grok_config = directory.path().join("grok.toml");
+        tokio::fs::write(
+            &kimi_auth,
+            br#"{"access":"token","refresh":"refresh","expires":4102444800000}"#,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&kimi_auth, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            &grok_config,
+            "[model.kimi]\nmodel = \"mapped-kimi\"\nname = \"Mapped Kimi\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n",
+        )
+        .await
+        .unwrap();
+
+        let checks = run_full(
+            &directory.path().join("missing-codex-auth.json"),
+            Some(&kimi_auth),
+            "",
+            &grok_config,
+            directory.path(),
+            "127.0.0.1:0",
+            "",
+            "missing-codex",
+            "missing-grok",
+            "mapped-kimi=kimi-for-coding",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.name == "Kimi auth" && check.ok)
+        );
+        for name in [
+            "Codex CLI",
+            "Codex credential configuration",
+            "ChatGPT auth",
+        ] {
+            assert!(
+                checks
+                    .iter()
+                    .any(|check| { check.name == name && check.ok && check.warning })
+            );
+        }
+
+        tokio::fs::write(
+            &grok_config,
+            "[model.kimi]\nmodel = \"mapped-kimi\"\nname = \"Mapped Kimi\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n\n[model.codex]\nmodel = \"gpt-5.6-sol\"\nname = \"Codex Sol\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 372000\n",
+        )
+        .await
+        .unwrap();
+        let mixed_checks = run_full(
+            &directory.path().join("missing-codex-auth.json"),
+            Some(&kimi_auth),
+            "",
+            &grok_config,
+            directory.path(),
+            "127.0.0.1:0",
+            "",
+            "missing-codex",
+            "missing-grok",
+            "mapped-kimi=kimi-for-coding",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            mixed_checks
+                .iter()
+                .any(|check| check.name == "ChatGPT auth" && !check.ok)
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_kimi_credentials_without_refresh_fail_doctor() {
+        let directory = tempfile::tempdir().unwrap();
+        let kimi_auth = directory.path().join("kimi-auth.json");
+        let grok_config = directory.path().join("grok.toml");
+        tokio::fs::write(
+            &kimi_auth,
+            br#"{"access":"expired","refresh":"","expires":1}"#,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&kimi_auth, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            &grok_config,
+            "[model.kimi]\nmodel = \"kimi-for-coding\"\nname = \"Kimi\"\nbase_url = \"http://127.0.0.1:18765/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n",
+        )
+        .await
+        .unwrap();
+
+        let checks = run_full(
+            &directory.path().join("missing-codex.json"),
+            Some(&kimi_auth),
+            "",
+            &grok_config,
+            directory.path(),
+            "127.0.0.1:0",
+            "",
+            "missing-codex",
+            "missing-grok",
+            "",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(checks.iter().any(|check| {
+            check.name == "Kimi auth"
+                && !check.ok
+                && check.detail.contains("expired")
+                && check.detail.contains("no refresh token")
+        }));
+    }
+
+    #[tokio::test]
+    async fn mapped_kimi_doctor_checks_live_kimi_readiness() {
+        use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
+        use serde_json::json;
+        use std::collections::HashMap;
+
+        let app = Router::new()
+            .route(
+                "/healthz",
+                get(|| async { Json(json!({"service":"grok-build-proxy"})) }),
+            )
+            .route(
+                "/readyz",
+                get(|Query(query): Query<HashMap<String, String>>| async move {
+                    let status = if query.get("provider").map(String::as_str) == Some("kimi") {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    };
+                    (status, Json(json!({"ok":status.is_success()})))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let kimi_auth = directory.path().join("kimi-auth.json");
+        let grok_config = directory.path().join("grok.toml");
+        tokio::fs::write(
+            &kimi_auth,
+            br#"{"access":"token","refresh":"refresh","expires":4102444800000}"#,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&kimi_auth, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            &grok_config,
+            format!(
+                "[model.kimi]\nmodel = \"mapped-kimi\"\nname = \"Mapped Kimi\"\nbase_url = \"http://{address}/v1\"\napi_backend = \"responses\"\napi_key = \"unused\"\ncontext_window = 256000\n"
+            ),
+        )
+        .await
+        .unwrap();
+
+        let checks = run_full(
+            &directory.path().join("missing-codex.json"),
+            Some(&kimi_auth),
+            "",
+            &grok_config,
+            directory.path(),
+            &address.to_string(),
+            "",
+            "missing-codex",
+            "missing-grok",
+            "mapped-kimi=kimi-for-coding",
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(checks.iter().any(|check| {
+            check.name == "Proxy readiness" && !check.ok && check.detail.contains("kimi readiness")
+        }));
     }
 }

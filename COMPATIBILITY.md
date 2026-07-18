@@ -38,14 +38,37 @@ The request adapter preserves:
 - request-level `reasoning.effort` on both `POST /v1/responses` and
   `POST /responses`, without replacing it with a proxy-wide value.
 
+## Kimi compatibility
+
+Requests for K3 (`k3`) and Kimi K2.7 Code (`kimi-for-coding`, with the legacy
+`kimi-k2.6` and `k2.6` aliases) are translated from the Responses API to Kimi's
+coding Chat Completions endpoint. The adapter preserves
+developer/system instructions, user and assistant messages, function calls and
+outputs, function definitions and tool choice, prompt-cache session affinity,
+and model-specific reasoning effort. K3 maps Grok `low` to `low`, `medium` or
+`high` to `high`, and `xhigh` to `max`; K2.7 accepts `low`, `medium`, or `high`.
+Output is translated back to
+incremental Responses events for reasoning summaries, text, function arguments,
+terminal output items, and token usage. Both streaming and non-streaming client
+requests are supported.
+
+Kimi currently accepts function tools through this adapter. Responses custom
+tools are rejected instead of being silently changed into a different tool
+contract.
+
+Kimi Code API key authentication is preferred and sends the proxy's own
+User-Agent. Device OAuth remains as a compatibility fallback when no API key is
+configured.
+
 ## Reasoning effort and model discovery
 
 For capable models, both `GET /v1/models` and `GET /models` advertise
 `supports_reasoning_effort`, the default `reasoning_effort`, and the available
-`reasoning_efforts`. The advertised values are `low`, `medium`, `high`, and
-`xhigh`. `grok-build-proxy --print-grok-config` emits the corresponding
-`supports_reasoning_effort = true` and `reasoning_efforts` fields for Grok Build
-model entries.
+`reasoning_efforts`. Codex advertises `low`, `medium`, `high`, and `xhigh`; K3
+advertises `low`, `high`, and `xhigh`, while K2.7 advertises `low`, `medium`, and
+`high`. `grok-build-proxy --print-grok-config`
+emits the corresponding `supports_reasoning_effort = true` and
+`reasoning_efforts` fields for Grok Build model entries.
 
 Capability metadata is inherited by canonical catalog routes, configured
 model-map aliases, and eligible generated `-fast` routes. Unknown or unsupported

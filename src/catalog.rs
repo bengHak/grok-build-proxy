@@ -1,3 +1,4 @@
+use crate::provider::{Provider, kimi};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -20,6 +21,8 @@ pub struct ReasoningCapability {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Model {
     pub id: String,
+    pub upstream_id: String,
+    pub provider: Provider,
     pub display_name: String,
     pub description: String,
     pub context_window: u64,
@@ -49,6 +52,33 @@ fn reasoning(default: &str) -> ReasoningCapability {
 }
 
 fn known(id: &str) -> Option<Model> {
+    if let Some(upstream_id) = kimi::canonical_model(id) {
+        let k3 = upstream_id == kimi::K3_MODEL;
+        let default_effort = if k3 { "xhigh" } else { "medium" };
+        return Some(Model {
+            id: id.into(),
+            upstream_id: upstream_id.into(),
+            provider: Provider::Kimi,
+            display_name: if k3 { "Kimi K3" } else { "Kimi K2.7 Code" }.into(),
+            description: "Kimi Code model for agentic coding.".into(),
+            context_window: 256_000,
+            responses_lite: false,
+            reasoning: Some(ReasoningCapability {
+                default_effort: default_effort.into(),
+                efforts: reasoning(default_effort)
+                    .efforts
+                    .into_iter()
+                    .filter(|effort| {
+                        if k3 {
+                            effort.value != "medium"
+                        } else {
+                            effort.value != "xhigh"
+                        }
+                    })
+                    .collect(),
+            }),
+        });
+    }
     let (name, description, context, lite, effort) = match id {
         "gpt-5.6-sol" => (
             "GPT-5.6 Sol",
@@ -89,6 +119,8 @@ fn known(id: &str) -> Option<Model> {
     };
     Some(Model {
         id: id.into(),
+        upstream_id: id.into(),
+        provider: Provider::Codex,
         display_name: name.into(),
         description: description.into(),
         context_window: context,
@@ -119,7 +151,7 @@ pub struct Catalog {
 
 impl Catalog {
     pub fn new(csv: &str) -> Self {
-        let defaults = "gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.2";
+        let defaults = "gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.2,k3,kimi-for-coding";
         let source = if csv.trim().is_empty() { defaults } else { csv };
         let mut seen = HashSet::new();
         let mut models = HashMap::new();
@@ -131,6 +163,8 @@ impl Catalog {
             }
             let model = known(&id).unwrap_or_else(|| Model {
                 id: id.clone(),
+                upstream_id: id.clone(),
+                provider: Provider::Codex,
                 display_name: id.clone(),
                 description: String::new(),
                 context_window: 272_000,
@@ -154,6 +188,8 @@ impl Catalog {
         (
             Model {
                 id: base.clone(),
+                upstream_id: base.clone(),
+                provider: Provider::Codex,
                 display_name: base.clone(),
                 description: String::new(),
                 context_window: 272_000,

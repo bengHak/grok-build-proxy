@@ -1,4 +1,5 @@
 use crate::catalog::{Catalog, normalize_id, supports_fast};
+use crate::provider::Provider;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -81,7 +82,8 @@ impl ChangeSet {
 #[derive(Clone, Debug, Default)]
 struct EndpointStatus {
     proxy: bool,
-    ready: bool,
+    codex_ready: bool,
+    kimi_ready: bool,
     models: HashMap<String, JsonValue>,
     detail: String,
 }
@@ -358,16 +360,25 @@ pub fn model_spec(
         bail!("model `{base_model}` does not support the fast priority tier")
     }
     let (model, _) = catalog.lookup(&base_model);
+    let provider_name = match model.provider {
+        Provider::Codex => "Codex",
+        Provider::Kimi => "Kimi",
+    };
     let name = custom_name.map(str::to_owned).unwrap_or_else(|| {
-        format!(
-            "Codex {}{}",
-            model.display_name,
-            if fast { " (Fast)" } else { "" }
-        )
+        let display_name = if model.display_name.starts_with(provider_name) {
+            model.display_name.clone()
+        } else {
+            format!("{provider_name} {}", model.display_name)
+        };
+        format!("{display_name}{}", if fast { " (Fast)" } else { "" })
     });
     let description = format!(
-        "{} via ChatGPT Codex{}",
+        "{} via {}{}",
         model.description.trim_end_matches('.'),
+        match model.provider {
+            Provider::Codex => "ChatGPT Codex",
+            Provider::Kimi => "Kimi Coding API",
+        },
         if fast { " priority tier" } else { "" }
     );
     let effective_model = if fast {
@@ -501,7 +512,24 @@ pub async fn status(
             let advertised = advertised_value.is_some();
             let (base, fast) = normalize_id(&record.model);
             let (catalog_model, _) = catalog.lookup(&base);
-            let expected_context = catalog_model.context_window;
+            let provider = advertised_value
+                .and_then(|value| value.get("owned_by"))
+                .and_then(JsonValue::as_str)
+                .and_then(|owned_by| match owned_by {
+                    "kimi" => Some(Provider::Kimi),
+                    "openai-codex" => Some(Provider::Codex),
+                    _ => None,
+                })
+                .unwrap_or(catalog_model.provider);
+            let fast = fast && provider == Provider::Codex;
+            let ready = match provider {
+                Provider::Codex => endpoint.codex_ready,
+                Provider::Kimi => endpoint.kimi_ready,
+            };
+            let expected_context = advertised_value
+                .and_then(|value| value.get("context_window"))
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(catalog_model.context_window);
             let context_matches = model_item(&config.document, &record.alias)
                 .and_then(Item::as_table_like)
                 .and_then(|table| table.get("context_window"))
@@ -527,13 +555,16 @@ pub async fn status(
             if !endpoint.detail.is_empty() {
                 details.push(endpoint.detail.clone());
             }
+            if !ready {
+                details.push(format!("{} provider is not ready", provider.as_str()));
+            }
             ModelStatus {
                 alias: record.alias,
                 model: record.model,
-                service_tier: record.service_tier,
+                service_tier: tier(fast).to_owned(),
                 configured,
                 proxy: endpoint.proxy,
-                ready: endpoint.ready,
+                ready,
                 advertised,
                 metadata,
                 detail: details.join("; "),
@@ -579,7 +610,11 @@ async fn inspect_endpoint(
             request.bearer_auth(client_token.trim())
         }
     };
-    let ready = authorized(format!("{root}/readyz"))
+    let codex_ready = authorized(format!("{root}/readyz?provider=codex"))
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success());
+    let kimi_ready = authorized(format!("{root}/readyz?provider=kimi"))
         .send()
         .await
         .is_ok_and(|response| response.status().is_success());
@@ -602,13 +637,10 @@ async fn inspect_endpoint(
     };
     EndpointStatus {
         proxy,
-        ready,
+        codex_ready,
+        kimi_ready,
         models,
-        detail: if ready {
-            String::new()
-        } else {
-            "proxy is not ready".into()
-        },
+        detail: String::new(),
     }
 }
 
@@ -764,6 +796,8 @@ fn canonical_alias(model: &str) -> String {
         "gpt-5.6-sol" => "codex-sol".into(),
         "gpt-5.6-terra" => "codex-terra".into(),
         "gpt-5.6-luna" => "codex-luna".into(),
+        "k3" => "kimi-k3".into(),
+        "kimi-for-coding" => "kimi-kimi-for-coding".into(),
         _ => format!("codex-{}", model.replace(['.', '_', '/'], "-")),
     }
 }
@@ -922,25 +956,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn kimi_model_specs_use_kimi_metadata_and_aliases() {
+        let catalog = Catalog::default();
+        let k3 = model_spec(
+            &catalog,
+            "kimi-k3",
+            "k3",
+            false,
+            "127.0.0.1:18765",
+            "",
+            None,
+        )
+        .unwrap();
+        assert_eq!(k3.name, "Kimi K3");
+        assert_eq!(k3.context_window, 256_000);
+
+        let coding = model_spec(
+            &catalog,
+            "kimi",
+            "kimi-for-coding",
+            false,
+            "127.0.0.1:18765",
+            "",
+            None,
+        )
+        .unwrap();
+        assert_eq!(coding.name, "Kimi K2.7 Code");
+        assert!(coding.description.contains("via Kimi Coding API"));
+
+        let (specs, _) = sync_specs(&catalog, "127.0.0.1:18765", "", false).unwrap();
+        assert!(specs.iter().any(|spec| {
+            spec.alias == "kimi-k3" && spec.effective_model == "k3" && spec.name == "Kimi K3"
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.alias == "kimi-kimi-for-coding"
+                && spec.effective_model == "kimi-for-coding"
+                && spec.name == "Kimi K2.7 Code"
+        }));
+    }
+
     #[tokio::test]
-    async fn live_status_accepts_fast_priority_metadata() {
-        use axum::{Json, Router, routing::get};
+    async fn live_status_uses_provider_specific_readiness() {
+        use axum::{Json, Router, extract::Query, http::StatusCode, routing::get};
         use serde_json::json;
+        use std::collections::HashMap;
 
         let app = Router::new()
             .route(
                 "/healthz",
                 get(|| async { Json(json!({"service": "grok-build-proxy"})) }),
             )
-            .route("/readyz", get(|| async { Json(json!({"ok": true})) }))
+            .route(
+                "/readyz",
+                get(|Query(query): Query<HashMap<String, String>>| async move {
+                    let status = if query.get("provider").map(String::as_str) == Some("codex") {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    (status, Json(json!({"ok": status.is_success()})))
+                }),
+            )
             .route(
                 "/v1/models",
                 get(|| async {
-                    Json(json!({"data": [{
-                        "id": "gpt-5.6-sol-fast",
-                        "service_tier": "priority",
-                        "target_model": "gpt-5.6-sol-fast"
-                    }]}))
+                    Json(json!({"data": [
+                        {
+                            "id": "gpt-5.6-sol-fast",
+                            "service_tier": "priority",
+                            "target_model": "gpt-5.6-sol-fast"
+                        },
+                        {"id":"kimi-for-coding"},
+                        {"id":"mapped-kimi","owned_by":"kimi","context_window":256000},
+                        {
+                            "id":"mapped-kimi-fast",
+                            "owned_by":"kimi",
+                            "context_window":256000,
+                            "target_model":"kimi-for-coding"
+                        }
+                    ]}))
                 }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -961,6 +1056,45 @@ mod tests {
         )
         .unwrap();
         config.add(&spec).unwrap();
+        let kimi = model_spec(
+            &Catalog::default(),
+            "kimi",
+            "kimi-for-coding",
+            false,
+            &address.to_string(),
+            "",
+            None,
+        )
+        .unwrap();
+        config.add(&kimi).unwrap();
+        config
+            .add(&ModelSpec {
+                alias: "mapped-kimi".into(),
+                base_model: "mapped-kimi".into(),
+                effective_model: "mapped-kimi".into(),
+                fast: false,
+                name: "Mapped Kimi".into(),
+                description: "Mapped Kimi model".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: "unused".into(),
+                context_window: 256_000,
+                reasoning_efforts: Vec::new(),
+            })
+            .unwrap();
+        config
+            .add(&ModelSpec {
+                alias: "mapped-kimi-fast".into(),
+                base_model: "mapped-kimi-fast".into(),
+                effective_model: "mapped-kimi-fast".into(),
+                fast: false,
+                name: "Mapped Kimi Fast Source".into(),
+                description: "Mapped Kimi fast-suffixed source".into(),
+                base_url: format!("http://{address}/v1"),
+                api_key: "unused".into(),
+                context_window: 256_000,
+                reasoning_efforts: Vec::new(),
+            })
+            .unwrap();
         let statuses = status(
             &config,
             None,
@@ -970,13 +1104,42 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(statuses.len(), 1);
-        let status = &statuses[0];
+        assert_eq!(statuses.len(), 4);
+        let status = statuses
+            .iter()
+            .find(|status| status.alias == "codex-sol-fast")
+            .unwrap();
         assert!(status.configured);
         assert!(status.proxy);
         assert!(status.ready);
         assert!(status.advertised);
         assert!(status.metadata);
+        let kimi = statuses
+            .iter()
+            .find(|status| status.alias == "kimi")
+            .unwrap();
+        assert!(kimi.configured);
+        assert!(kimi.proxy);
+        assert!(!kimi.ready);
+        assert!(kimi.advertised);
+        assert!(kimi.metadata);
+        assert!(kimi.detail.contains("kimi provider is not ready"));
+        let mapped = statuses
+            .iter()
+            .find(|status| status.alias == "mapped-kimi")
+            .unwrap();
+        assert!(!mapped.ready);
+        assert!(mapped.advertised);
+        assert!(mapped.metadata);
+        let mapped_fast = statuses
+            .iter()
+            .find(|status| status.alias == "mapped-kimi-fast")
+            .unwrap();
+        assert_eq!(mapped_fast.service_tier, "standard");
+        assert!(!mapped_fast.ready);
+        assert!(mapped_fast.advertised);
+        assert!(mapped_fast.metadata);
+        assert!(mapped.detail.contains("kimi provider is not ready"));
     }
 
     #[test]
