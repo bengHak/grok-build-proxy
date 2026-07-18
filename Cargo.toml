@@ -16,8 +16,13 @@ base64 = "0.22"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+# Direct crossterm 0.29 for raw mode / events / TerminalGuard.
+# ratatui 0.29 still depends on crossterm 0.28 for CrosstermBackend drawing;
+# both write ANSI to the same stdout (process-wide termios). Intentional until
+# ratatui supports 0.29 without a higher MSRV.
 crossterm = "0.29"
 futures-util = "0.3"
+ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
