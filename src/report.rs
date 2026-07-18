@@ -406,6 +406,8 @@ mod tests {
             output_count: 2,
             capture_bytes: 4096,
             session_failure_index: 1,
+            diagnostics: Default::default(),
+            retry_candidate: false,
         }
     }
 

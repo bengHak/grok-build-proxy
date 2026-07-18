@@ -1,7 +1,8 @@
 //! Structured monitor store: sessions, active/recent turns, failure ring, metrics samples.
 
 use crate::events::{
-    FailureKind, Observer, RequestEvent, RequestEventKind, TokenUsage, sanitize, sanitize_id,
+    FailureKind, Observer, RequestDiagnostics, RequestEvent, RequestEventKind, TokenUsage,
+    sanitize, sanitize_id,
 };
 use chrono::{DateTime, Utc};
 use std::{
@@ -14,6 +15,7 @@ use std::{
 const DEFAULT_FAILURE_CAP: usize = 200;
 const RECENT_CAP: usize = 50;
 const METRICS_CAP: usize = 120;
+const RETRY_CANDIDATE_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -38,6 +40,8 @@ pub struct Request {
     pub attempt: u32,
     pub output_count: u32,
     pub capture_bytes: u32,
+    pub diagnostics: RequestDiagnostics,
+    pub retry_candidate: bool,
 }
 
 impl Request {
@@ -119,6 +123,8 @@ pub struct FailureRecord {
     pub output_count: u32,
     pub capture_bytes: u32,
     pub session_failure_index: u32,
+    pub diagnostics: RequestDiagnostics,
+    pub retry_candidate: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -158,6 +164,13 @@ fn ratio(numerator: u64, denominator: u64, observations: u64) -> Option<f64> {
     } else {
         Some(numerator as f64 / denominator as f64)
     }
+}
+
+fn terminal_is_suspicious(request: &Request) -> bool {
+    request.failure_kind.is_some()
+        || !(200..300).contains(&request.status)
+        || !request.error_type.is_empty()
+        || request.output_count == 0
 }
 
 struct State {
@@ -322,6 +335,7 @@ impl Dashboard {
                     active.mapped = event.mapped;
                     active.lite = event.lite;
                     active.fast = event.fast;
+                    active.diagnostics = event.diagnostics.clone();
                     if let Some(session) = state.sessions.get_mut(&event.session_id) {
                         session.updated_at = Some(Utc::now());
                     }
@@ -351,6 +365,8 @@ impl Dashboard {
                         attempt: event.attempt.max(1),
                         output_count: 0,
                         capture_bytes: 0,
+                        diagnostics: event.diagnostics.clone(),
+                        retry_candidate: false,
                     },
                 );
                 let session = state
@@ -391,6 +407,8 @@ impl Dashboard {
                     attempt: event.attempt.max(1),
                     output_count: 0,
                     capture_bytes: 0,
+                    diagnostics: event.diagnostics.clone(),
+                    retry_candidate: false,
                 });
                 request.status = event.status_code;
                 request.error = sanitize(&event.error);
@@ -412,9 +430,46 @@ impl Dashboard {
                 request.attempt = event.attempt.max(1);
                 request.output_count = event.output_count;
                 request.capture_bytes = event.capture_bytes;
+                request.diagnostics = event.diagnostics.clone();
 
                 let duration_secs = request.duration().as_secs_f64();
                 let failed = event.kind == RequestEventKind::Failed;
+
+                let prior_retry_id = if request.diagnostics.request_fingerprint.is_empty() {
+                    None
+                } else {
+                    state
+                        .recent
+                        .iter_mut()
+                        .find(|prior| {
+                            prior.session_id == request.session_id
+                                && prior.id != request.id
+                                && prior.diagnostics.request_fingerprint
+                                    == request.diagnostics.request_fingerprint
+                                && request
+                                    .started_at
+                                    .checked_duration_since(prior.started_at)
+                                    .or_else(|| {
+                                        prior.started_at.checked_duration_since(request.started_at)
+                                    })
+                                    .is_some_and(|gap| gap <= RETRY_CANDIDATE_WINDOW)
+                                && (terminal_is_suspicious(prior)
+                                    || terminal_is_suspicious(&request))
+                        })
+                        .map(|prior| {
+                            prior.retry_candidate = true;
+                            request.retry_candidate = true;
+                            prior.id.clone()
+                        })
+                };
+                if let Some(prior_id) = prior_retry_id
+                    && let Some(prior) = state
+                        .failures
+                        .iter_mut()
+                        .find(|failure| failure.request_id == prior_id)
+                {
+                    prior.retry_candidate = true;
+                }
 
                 state.recent.push_front(request.clone());
                 state.recent.truncate(RECENT_CAP);
@@ -454,6 +509,8 @@ impl Dashboard {
                         output_count: request.output_count,
                         capture_bytes: request.capture_bytes,
                         session_failure_index: idx,
+                        diagnostics: request.diagnostics.clone(),
+                        retry_candidate: request.retry_candidate,
                     };
                     state.failures.push_front(record);
                     let cap = state.failure_cap;
@@ -575,6 +632,150 @@ mod tests {
         assert!(!s.recent[0].id.contains('\n'));
         assert!(s.recent[0].mapped);
         assert!(s.recent[0].lite);
+    }
+
+    #[test]
+    fn request_diagnostics_reach_active_recent_and_failure_records() {
+        let dashboard = Dashboard::new();
+        let diagnostics = crate::events::RequestDiagnostics {
+            request_body_bytes: 1234,
+            input_item_count: 9,
+            proxy_prepare_ms: 3,
+            credential_ms: 4,
+            upstream_headers_ms: 5,
+            first_chunk_ms: 8,
+            request_fingerprint: "fp-safe".into(),
+        };
+
+        let mut started = base_event(RequestEventKind::Started);
+        started.diagnostics = diagnostics.clone();
+        dashboard.observe(started);
+        assert_eq!(dashboard.snapshot().active[0].diagnostics, diagnostics);
+
+        let mut failed = base_event(RequestEventKind::Failed);
+        failed.failure_kind = Some(FailureKind::ProxyAssemble);
+        failed.diagnostics = diagnostics.clone();
+        dashboard.observe(failed);
+
+        let snapshot = dashboard.snapshot();
+        assert_eq!(snapshot.recent[0].diagnostics, diagnostics);
+        assert_eq!(snapshot.failures[0].diagnostics, diagnostics);
+    }
+
+    fn observe_turn(
+        dashboard: &Dashboard,
+        request_id: &str,
+        fingerprint: &str,
+        kind: RequestEventKind,
+        output_count: u32,
+    ) {
+        let mut started = base_event(RequestEventKind::Started);
+        started.request_id = request_id.into();
+        started.diagnostics.request_fingerprint = fingerprint.into();
+        dashboard.observe(started);
+
+        let mut terminal = base_event(kind);
+        terminal.request_id = request_id.into();
+        terminal.output_count = output_count;
+        terminal.diagnostics.request_fingerprint = fingerprint.into();
+        if kind == RequestEventKind::Failed {
+            terminal.failure_kind = Some(FailureKind::ProxyAssemble);
+            terminal.error_type = "proxy_incomplete_output".into();
+        }
+        dashboard.observe(terminal);
+    }
+
+    #[test]
+    fn matching_suspicious_fingerprints_are_retry_candidates() {
+        let dashboard = Dashboard::new();
+        observe_turn(
+            &dashboard,
+            "first",
+            "same-fingerprint",
+            RequestEventKind::Failed,
+            0,
+        );
+        observe_turn(
+            &dashboard,
+            "second",
+            "same-fingerprint",
+            RequestEventKind::Completed,
+            1,
+        );
+
+        let snapshot = dashboard.snapshot();
+        assert!(
+            snapshot
+                .recent
+                .iter()
+                .all(|request| request.retry_candidate)
+        );
+        assert!(snapshot.failures[0].retry_candidate);
+    }
+
+    #[test]
+    fn successful_repeats_and_different_fingerprints_are_not_retry_candidates() {
+        let dashboard = Dashboard::new();
+        for request_id in ["success-a", "success-b"] {
+            observe_turn(
+                &dashboard,
+                request_id,
+                "successful-repeat",
+                RequestEventKind::Completed,
+                1,
+            );
+        }
+        observe_turn(
+            &dashboard,
+            "different",
+            "different-fingerprint",
+            RequestEventKind::Failed,
+            0,
+        );
+
+        assert!(
+            dashboard
+                .snapshot()
+                .recent
+                .iter()
+                .all(|request| !request.retry_candidate)
+        );
+    }
+
+    #[test]
+    fn matching_suspicious_fingerprints_after_window_are_not_retry_candidates() {
+        let dashboard = Dashboard::new();
+        let old_start = Instant::now() - Duration::from_secs(31);
+
+        let mut first_started = base_event(RequestEventKind::Started);
+        first_started.request_id = "old".into();
+        first_started.started_at = old_start;
+        first_started.diagnostics.request_fingerprint = "same-fingerprint".into();
+        dashboard.observe(first_started);
+        let mut first_failed = base_event(RequestEventKind::Failed);
+        first_failed.request_id = "old".into();
+        first_failed.failure_kind = Some(FailureKind::ProxyAssemble);
+        first_failed.diagnostics.request_fingerprint = "same-fingerprint".into();
+        dashboard.observe(first_failed);
+
+        let mut second_started = base_event(RequestEventKind::Started);
+        second_started.request_id = "new".into();
+        second_started.started_at = Instant::now();
+        second_started.diagnostics.request_fingerprint = "same-fingerprint".into();
+        dashboard.observe(second_started);
+        let mut second_failed = base_event(RequestEventKind::Failed);
+        second_failed.request_id = "new".into();
+        second_failed.failure_kind = Some(FailureKind::ProxyAssemble);
+        second_failed.diagnostics.request_fingerprint = "same-fingerprint".into();
+        dashboard.observe(second_failed);
+
+        assert!(
+            dashboard
+                .snapshot()
+                .recent
+                .iter()
+                .all(|request| !request.retry_candidate)
+        );
     }
 
     #[test]
