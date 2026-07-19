@@ -203,8 +203,10 @@ terminal is too short to keep the body panels usable.
 - Path: `~/.grok/proxy-reports/failure-YYYYMMDD-HHMMSS.md` (or `.json` with
   `W`; `Y` copies JSON to the clipboard). The directory is created with mode
   `0700` and files with `0600`.
-- Contents: selected `FailureRecord` metadata only; diagnostic error messages,
-  prompts, response bodies, and credentials are omitted. See
+- Contents: selected `FailureRecord` metadata only, including request size,
+  input-item count, latency phases, process-local fingerprint, and estimated
+  retry-candidate flag. Diagnostic error messages, prompts, response bodies,
+  and credentials are omitted. See
   [`SECURITY.md`](SECURITY.md).
 
 **Failure kinds** (filter groups in parentheses)
@@ -223,6 +225,11 @@ terminal is too short to keep the body panels usable.
 Same-session failures within 30s are grouped in the failures panel with an
 **estimated** retry label (heuristic, not a confirmed Grok turn id).
 
+Turn and failure details also show `retry_candidate`. It is set only when two
+different request IDs in the same session have the same non-empty fingerprint
+within 30 seconds and at least one result failed or had no output. The flag is
+diagnostic evidence, not proof of a client retry.
+
 Use plain logs for scripts, background services, or troubleshooting:
 
 ```sh
@@ -230,6 +237,10 @@ grok-build-proxy serve --no-monitor
 ```
 
 Non-interactive output automatically keeps the existing plain-log behavior.
+Completed-request logs include `request_body_bytes`, `input_item_count`,
+`proxy_prepare_ms`, `credential_ms`, `upstream_headers_ms`, `first_chunk_ms`,
+and `request_fingerprint`. The fingerprint is randomized per proxy process and
+cannot be compared across restarts. No request or response content is logged.
 
 ## Model configuration management
 
@@ -297,6 +308,22 @@ Canonical catalog routes, configured model-map aliases, and eligible generated
 `-fast` routes inherit their target's capability. Unknown or unsupported models
 omit the capability fields.
 
+## Responses Lite tool batching
+
+Responses Lite requires `parallel_tool_calls = false`, so independent Grok
+file reads otherwise tend to become separate model/tool turns. Enable the
+opt-in batching instruction to encourage one read-only shell call for multiple
+independent files:
+
+```sh
+grok-build-proxy serve --lite-tool-batching
+# or: GROK_BUILD_PROXY_LITE_TOOL_BATCHING=true grok-build-proxy serve
+```
+
+This does not execute tools in the proxy, enable parallel tool calls, or bypass
+Grok permissions. It only appends a developer instruction for Responses Lite
+models; dependent operations and non-Lite providers are unchanged.
+
 ## Prompt cache efficiency
 
 The proxy keeps Grok thread identity separate from prompt-cache routing. A valid
@@ -327,6 +354,13 @@ prompt-cache key as session affinity.
 When terminal usage is available, plain logs include `input_tokens`,
 `cached_input_tokens`, `cache_write_tokens`, `fresh_input_tokens`, and
 `cache_read_percent`. These metrics do not include prompt or response content.
+
+`proxy_prepare_ms` covers body collection and request transformation before
+credential loading. `credential_ms` combines credential lock wait, file read,
+and refresh time. `upstream_headers_ms` covers upstream send through response
+headers and is cumulative across an auth retry. `first_chunk_ms` covers the
+final upstream attempt through its first body chunk; zero means no measurable
+chunk delay was recorded.
 
 ## Responses Lite, Plan, and Goal compatibility
 
@@ -510,6 +544,7 @@ sources, self-maps, and cycles are rejected before the server starts.
 | `--model-map` | `GROK_BUILD_PROXY_MODEL_MAP` | empty |
 | `--codex-compat-version` | `GROK_BUILD_PROXY_CODEX_COMPAT_VERSION` | `0.144.0` |
 | — | `GROK_BUILD_PROXY_RESPONSES_COMPAT` | `full` (`full`, `text`, or `off`) |
+| `--lite-tool-batching` | `GROK_BUILD_PROXY_LITE_TOOL_BATCHING` | `false` |
 | `--client-token` | `GROK_BUILD_PROXY_TOKEN` | empty |
 | `--log-format` | `GROK_BUILD_PROXY_LOG_FORMAT` | `text` |
 | — | `GROK_BUILD_PROXY_FAILURE_CAP` | `200`; positive integer limiting in-memory failure records |

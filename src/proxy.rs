@@ -19,16 +19,23 @@ use axum::{
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::RandomState},
+    hash::{BuildHasher, Hash, Hasher},
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tracing::info;
 
-pub use crate::events::{FailureKind, Observer, RequestEvent, RequestEventKind};
+pub use crate::events::{
+    FailureKind, Observer, RequestDiagnostics, RequestEvent, RequestEventKind,
+};
 
 pub const DEFAULT_CODEX_COMPATIBILITY_VERSION: &str = "0.144.0";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 << 20;
+
+const LITE_TOOL_BATCHING_INSTRUCTION: &str = "Minimize model-tool round trips. When multiple independent files must be read, use one shell command to read them together instead of issuing separate file-read calls. Batch independent read-only operations into a single shell call.";
+
+static REQUEST_FINGERPRINT_STATE: OnceLock<RandomState> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct ProxyConfig {
@@ -42,6 +49,7 @@ pub struct ProxyConfig {
     pub version: String,
     pub compatibility_version: String,
     pub responses_compat: CompatMode,
+    pub lite_tool_batching: bool,
     pub observer: Option<Arc<dyn Observer>>,
     pub max_body_bytes: usize,
 }
@@ -600,7 +608,7 @@ fn cwd_tag(text: &str) -> Option<String> {
 
 #[derive(Debug)]
 pub struct TransformedRequest {
-    pub body: Vec<u8>,
+    pub body: Bytes,
     pub requested_model: String,
     pub model: String,
     pub mapped: bool,
@@ -608,11 +616,22 @@ pub struct TransformedRequest {
     pub fast: bool,
     pub stream: bool,
     pub provider: Provider,
+    pub input_item_count: u32,
+    pub request_fingerprint: String,
 }
 pub fn transform_request(
     raw: &[u8],
     catalog: &Catalog,
     mappings: &ModelMap,
+) -> Result<TransformedRequest> {
+    transform_request_with_options(raw, catalog, mappings, false)
+}
+
+fn transform_request_with_options(
+    raw: &[u8],
+    catalog: &Catalog,
+    mappings: &ModelMap,
+    lite_tool_batching: bool,
 ) -> Result<TransformedRequest> {
     if raw.iter().all(u8::is_ascii_whitespace) {
         bail!("request body is empty")
@@ -653,12 +672,20 @@ pub fn transform_request(
     if model.provider == Provider::Kimi {
         object.remove("service_tier");
     } else if model.responses_lite {
+        if lite_tool_batching {
+            append_lite_tool_batching_instruction(object);
+        }
         apply_responses_lite(object)
     } else {
         object.entry("parallel_tool_calls").or_insert(true.into());
     }
+    let input_item_count = body
+        .get("input")
+        .and_then(Value::as_array)
+        .map_or(0, |items| items.len().min(u32::MAX as usize) as u32);
+    let request_fingerprint = request_fingerprint(&body);
     Ok(TransformedRequest {
-        body: serde_json::to_vec(&body)?,
+        body: Bytes::from(serde_json::to_vec(&body)?),
         requested_model: requested,
         model: resolution.model,
         mapped: resolution.mapped,
@@ -666,7 +693,25 @@ pub fn transform_request(
         fast,
         stream,
         provider: model.provider,
+        input_item_count,
+        request_fingerprint,
     })
+}
+
+fn append_lite_tool_batching_instruction(body: &mut Map<String, Value>) {
+    let existing = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let separator = if existing.trim().is_empty() {
+        ""
+    } else {
+        "\n\n"
+    };
+    body.insert(
+        "instructions".into(),
+        format!("{existing}{separator}{LITE_TOOL_BATCHING_INSTRUCTION}").into(),
+    );
 }
 fn apply_responses_lite(body: &mut Map<String, Value>) {
     body.insert("parallel_tool_calls".into(), false.into());
@@ -733,6 +778,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             &request_id,
         );
     }
+    let started = std::time::Instant::now();
     let incoming_headers = request.headers().clone();
     let body = match axum::body::to_bytes(request.into_body(), s.0.max_body_bytes).await {
         Ok(b) => b,
@@ -748,7 +794,12 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         }
     };
     let session_context = extract_session_context(&body, &incoming_headers);
-    let transformed = match transform_request(&body, &s.0.catalog, &s.0.model_map) {
+    let mut transformed = match transform_request_with_options(
+        &body,
+        &s.0.catalog,
+        &s.0.model_map,
+        s.0.lite_tool_batching,
+    ) {
         Ok(v) => v,
         Err(e) => {
             return with_request_id(
@@ -764,6 +815,24 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     let identity =
         UpstreamIdentity::from_request(&incoming_headers, &transformed.body, &request_id);
     let session_id = identity.thread_id.clone();
+    if transformed.provider == Provider::Codex {
+        let prepared = match prepare_codex_request(&transformed.body, &identity, transformed.lite) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                return with_request_id(
+                    error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        e.to_string(),
+                    ),
+                    &request_id,
+                );
+            }
+        };
+        transformed.body = prepared.body;
+        transformed.input_item_count = prepared.input_item_count;
+        transformed.request_fingerprint = prepared.request_fingerprint;
+    }
     if transformed.provider == Provider::Kimi
         && let Err(error_message) =
             kimi::request::translate_request(&transformed.body, identity.cache_key.as_deref())
@@ -777,7 +846,6 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             &request_id,
         );
     }
-    let started = std::time::Instant::now();
     let mut base_event = RequestEvent {
         kind: RequestEventKind::Started,
         request_id: request_id.clone(),
@@ -800,6 +868,13 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         attempt: 1,
         output_count: 0,
         capture_bytes: 0,
+        diagnostics: RequestDiagnostics {
+            request_body_bytes: body.len() as u64,
+            input_item_count: transformed.input_item_count,
+            proxy_prepare_ms: started.elapsed().as_millis() as u64,
+            request_fingerprint: transformed.request_fingerprint.clone(),
+            ..Default::default()
+        },
     };
     if let Some(observer) = &s.0.observer {
         observer.observe(base_event.clone());
@@ -809,24 +884,38 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             &session_context.cwd,
         );
     }
-    let mut upstream =
-        match send_upstream(&s.0, &transformed, &incoming_headers, &identity, false).await {
-            Ok(r) => r,
-            Err(e) => {
-                observe_failure(
-                    &s.0,
-                    &base_event,
-                    FailureKind::UpstreamConnect,
-                    "upstream_connect",
-                    e.to_string(),
-                    StatusCode::BAD_GATEWAY,
-                );
-                return with_request_id(
-                    error(StatusCode::BAD_GATEWAY, "upstream_error", e.to_string()),
-                    &request_id,
-                );
-            }
-        };
+    let timed = match send_upstream(&s.0, &transformed, &incoming_headers, &identity, false).await {
+        Ok(r) => r,
+        Err(e) => {
+            let message = e.error.to_string();
+            apply_upstream_phase_timings(
+                &mut base_event,
+                e.credential_ms,
+                e.upstream_headers_ms,
+                false,
+            );
+            observe_failure(
+                &s.0,
+                &base_event,
+                FailureKind::UpstreamConnect,
+                "upstream_connect",
+                message.clone(),
+                StatusCode::BAD_GATEWAY,
+            );
+            return with_request_id(
+                error(StatusCode::BAD_GATEWAY, "upstream_error", message),
+                &request_id,
+            );
+        }
+    };
+    apply_upstream_phase_timings(
+        &mut base_event,
+        timed.credential_ms,
+        timed.upstream_headers_ms,
+        false,
+    );
+    let mut upstream_started_at = timed.upstream_started_at;
+    let mut upstream = timed.response;
     if upstream.status() == reqwest::StatusCode::UNAUTHORIZED {
         let _ = upstream.bytes().await;
         base_event.auth_retried = true;
@@ -835,24 +924,39 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         if let Some(observer) = &s.0.observer {
             observer.observe(base_event.clone());
         }
-        upstream = match send_upstream(&s.0, &transformed, &incoming_headers, &identity, true).await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                observe_failure(
-                    &s.0,
-                    &base_event,
-                    FailureKind::AuthRetryFailed,
-                    "auth_retry_failed",
-                    e.to_string(),
-                    StatusCode::BAD_GATEWAY,
-                );
-                return with_request_id(
-                    error(StatusCode::BAD_GATEWAY, "upstream_error", e.to_string()),
-                    &request_id,
-                );
-            }
-        };
+        let timed =
+            match send_upstream(&s.0, &transformed, &incoming_headers, &identity, true).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let message = e.error.to_string();
+                    apply_upstream_phase_timings(
+                        &mut base_event,
+                        e.credential_ms,
+                        e.upstream_headers_ms,
+                        true,
+                    );
+                    observe_failure(
+                        &s.0,
+                        &base_event,
+                        FailureKind::AuthRetryFailed,
+                        "auth_retry_failed",
+                        message.clone(),
+                        StatusCode::BAD_GATEWAY,
+                    );
+                    return with_request_id(
+                        error(StatusCode::BAD_GATEWAY, "upstream_error", message),
+                        &request_id,
+                    );
+                }
+            };
+        apply_upstream_phase_timings(
+            &mut base_event,
+            timed.credential_ms,
+            timed.upstream_headers_ms,
+            true,
+        );
+        upstream_started_at = timed.upstream_started_at;
+        upstream = timed.response;
         // Still-401 classification is handled in observe_stream_end (auth_retried + 401).
     }
     let status =
@@ -913,6 +1017,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             while let Some(chunk) = source.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        guard.record_first_chunk(upstream_started_at);
                         let output = translator.push(&chunk);
                         guard.capture_chunk(&output);
                         if !output.is_empty() {
@@ -944,27 +1049,41 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             }
         })
     } else if translate_kimi {
-        let upstream_body = match upstream.bytes().await {
-            Ok(body) => body,
-            Err(upstream_error) => {
-                observe_failure(
-                    &s.0,
-                    &base_event,
-                    FailureKind::StreamIo,
-                    "stream_io",
-                    upstream_error.to_string(),
-                    StatusCode::BAD_GATEWAY,
-                );
-                return with_request_id(
-                    error(
-                        StatusCode::BAD_GATEWAY,
-                        "upstream_error",
+        // Non-stream Kimi: drain the upstream body while recording first-chunk latency.
+        // `bytes().await` alone would leave first_chunk_ms at 0 ("not observed").
+        let mut source = upstream.bytes_stream();
+        let mut upstream_body = Vec::new();
+        let mut first_chunk_recorded = false;
+        while let Some(chunk) = source.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    if !first_chunk_recorded {
+                        first_chunk_recorded = true;
+                        base_event.diagnostics.first_chunk_ms =
+                            upstream_started_at.elapsed().as_millis() as u64;
+                    }
+                    upstream_body.extend_from_slice(&chunk);
+                }
+                Err(upstream_error) => {
+                    observe_failure(
+                        &s.0,
+                        &base_event,
+                        FailureKind::StreamIo,
+                        "stream_io",
                         upstream_error.to_string(),
-                    ),
-                    &request_id,
-                );
+                        StatusCode::BAD_GATEWAY,
+                    );
+                    return with_request_id(
+                        error(
+                            StatusCode::BAD_GATEWAY,
+                            "upstream_error",
+                            upstream_error.to_string(),
+                        ),
+                        &request_id,
+                    );
+                }
             }
-        };
+        }
         let mut translator = kimi::stream::Translator::new(&request_id, kimi_model);
         let mut capture = translator.push(&upstream_body);
         capture.extend(translator.finish());
@@ -997,6 +1116,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             while let Some(chunk) = source.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        guard.record_first_chunk(upstream_started_at);
                         let output = normalizer.push(&chunk);
                         if !output.is_empty() {
                             guard.capture_chunk(&output);
@@ -1029,6 +1149,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             while let Some(chunk) = source.next().await {
                 match chunk {
                     Ok(chunk) => {
+                        guard.record_first_chunk(upstream_started_at);
                         guard.capture_chunk(&chunk);
                         yield Ok::<Bytes, std::io::Error>(chunk);
                     }
@@ -1061,19 +1182,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         "x-grok-build-proxy-version",
         HeaderValue::from_str(&s.0.version).unwrap_or(HeaderValue::from_static("dev")),
     );
-    let response = with_request_id(response, &request_id);
-    info!(
-        request_id,
-        requested_model = transformed.requested_model,
-        model = transformed.model,
-        mapped = transformed.mapped,
-        responses_lite = transformed.lite,
-        fast = transformed.fast,
-        status = status.as_u16(),
-        duration_ms = started.elapsed().as_millis(),
-        "request complete"
-    );
-    response
+    with_request_id(response, &request_id)
 }
 /// Map a Kimi Chat Completions error body into Responses-style type/message fields.
 fn kimi_upstream_error(body: &[u8], status: StatusCode) -> (String, String) {
@@ -1130,6 +1239,7 @@ struct StreamObserveGuard {
     status: StatusCode,
     capture: Vec<u8>,
     usage: UsageAccumulator,
+    first_chunk_recorded: bool,
     finished: bool,
 }
 
@@ -1146,8 +1256,17 @@ impl StreamObserveGuard {
             status,
             capture: Vec::new(),
             usage: UsageAccumulator::new(is_sse),
+            first_chunk_recorded: false,
             finished: false,
         }
+    }
+
+    fn record_first_chunk(&mut self, upstream_started_at: std::time::Instant) {
+        if self.first_chunk_recorded {
+            return;
+        }
+        self.first_chunk_recorded = true;
+        self.event.diagnostics.first_chunk_ms = upstream_started_at.elapsed().as_millis() as u64;
     }
 
     /// Feed emitted bytes to usage extraction before retaining the bounded diagnostic tail.
@@ -1257,6 +1376,7 @@ fn observe_stream_end(
         } else {
             sanitize(&format!("upstream HTTP {}", status.as_u16()))
         };
+        log_request_diagnostics(&event);
         if let Some(observer) = observer {
             observer.observe(event);
         }
@@ -1283,9 +1403,33 @@ fn observe_stream_end(
         String::new()
     };
 
+    log_request_diagnostics(&event);
     if let Some(observer) = observer {
         observer.observe(event);
     }
+}
+
+fn log_request_diagnostics(event: &RequestEvent) {
+    info!(
+        request_id = event.request_id,
+        requested_model = event.requested_model,
+        model = event.model,
+        mapped = event.mapped,
+        responses_lite = event.lite,
+        fast = event.fast,
+        status = event.status_code,
+        duration_ms = event.duration_ms,
+        request_body_bytes = event.diagnostics.request_body_bytes,
+        input_item_count = event.diagnostics.input_item_count,
+        proxy_prepare_ms = event.diagnostics.proxy_prepare_ms,
+        credential_ms = event.diagnostics.credential_ms,
+        upstream_headers_ms = event.diagnostics.upstream_headers_ms,
+        first_chunk_ms = event.diagnostics.first_chunk_ms,
+        request_fingerprint = event.diagnostics.request_fingerprint,
+        attempt = event.attempt,
+        output_count = event.output_count,
+        "request complete"
+    );
 }
 
 fn observe_failure(
@@ -1296,14 +1440,15 @@ fn observe_failure(
     message: String,
     status: StatusCode,
 ) {
+    let mut event = base.clone();
+    event.kind = RequestEventKind::Failed;
+    event.status_code = status.as_u16();
+    event.duration_ms = event.started_at.elapsed().as_millis() as u64;
+    event.failure_kind = Some(kind);
+    event.error_type = sanitize(error_type);
+    event.error = sanitize(&message);
+    log_request_diagnostics(&event);
     if let Some(observer) = &config.observer {
-        let mut event = base.clone();
-        event.kind = RequestEventKind::Failed;
-        event.status_code = status.as_u16();
-        event.duration_ms = event.started_at.elapsed().as_millis() as u64;
-        event.failure_kind = Some(kind);
-        event.error_type = sanitize(error_type);
-        event.error = sanitize(&message);
         observer.observe(event);
     }
 }
@@ -1314,21 +1459,64 @@ fn with_request_id(mut r: Response, id: &str) -> Response {
     }
     r
 }
+
+struct TimedUpstreamResponse {
+    response: reqwest::Response,
+    credential_ms: u64,
+    upstream_headers_ms: u64,
+    upstream_started_at: std::time::Instant,
+}
+
+/// Partial phase timings preserved when credential load or upstream connect fails.
+struct TimedUpstreamError {
+    error: anyhow::Error,
+    credential_ms: u64,
+    upstream_headers_ms: u64,
+}
+
+fn apply_upstream_phase_timings(
+    event: &mut RequestEvent,
+    credential_ms: u64,
+    upstream_headers_ms: u64,
+    accumulate: bool,
+) {
+    if accumulate {
+        event.diagnostics.credential_ms = event
+            .diagnostics
+            .credential_ms
+            .saturating_add(credential_ms);
+        event.diagnostics.upstream_headers_ms = event
+            .diagnostics
+            .upstream_headers_ms
+            .saturating_add(upstream_headers_ms);
+    } else {
+        event.diagnostics.credential_ms = credential_ms;
+        event.diagnostics.upstream_headers_ms = upstream_headers_ms;
+    }
+}
+
 async fn send_upstream(
     cfg: &ProxyConfig,
     t: &TransformedRequest,
     incoming: &HeaderMap,
     identity: &UpstreamIdentity,
     force: bool,
-) -> Result<reqwest::Response> {
+) -> std::result::Result<TimedUpstreamResponse, TimedUpstreamError> {
     match t.provider {
         Provider::Codex => send_codex_upstream(cfg, t, incoming, identity, force).await,
         Provider::Kimi => {
-            let config = cfg
-                .kimi
-                .as_ref()
-                .context("Kimi provider is not configured")?;
-            kimi::client::send(
+            let config = match cfg.kimi.as_ref() {
+                Some(config) => config,
+                None => {
+                    return Err(TimedUpstreamError {
+                        error: anyhow!("Kimi provider is not configured"),
+                        credential_ms: 0,
+                        upstream_headers_ms: 0,
+                    });
+                }
+            };
+            let upstream_started_at = std::time::Instant::now();
+            match kimi::client::send(
                 &config.upstream_url,
                 &config.credentials,
                 &config.api_key,
@@ -1337,6 +1525,19 @@ async fn send_upstream(
                 force,
             )
             .await
+            {
+                Ok(response) => Ok(TimedUpstreamResponse {
+                    response,
+                    credential_ms: 0,
+                    upstream_headers_ms: upstream_started_at.elapsed().as_millis() as u64,
+                    upstream_started_at,
+                }),
+                Err(error) => Err(TimedUpstreamError {
+                    error,
+                    credential_ms: 0,
+                    upstream_headers_ms: upstream_started_at.elapsed().as_millis() as u64,
+                }),
+            }
         }
     }
 }
@@ -1347,13 +1548,19 @@ async fn send_codex_upstream(
     incoming: &HeaderMap,
     identity: &UpstreamIdentity,
     force: bool,
-) -> Result<reqwest::Response> {
-    let creds = cfg
-        .credentials
-        .get(force)
-        .await
-        .context("load Codex credentials")?;
-    let compatible_body = codex_compat_body_for_identity(&t.body, identity, t.lite)?;
+) -> std::result::Result<TimedUpstreamResponse, TimedUpstreamError> {
+    let credential_started = std::time::Instant::now();
+    let creds = match cfg.credentials.get(force).await {
+        Ok(creds) => creds,
+        Err(error) => {
+            return Err(TimedUpstreamError {
+                error: error.context("load Codex credentials"),
+                credential_ms: credential_started.elapsed().as_millis() as u64,
+                upstream_headers_ms: 0,
+            });
+        }
+    };
+    let credential_ms = credential_started.elapsed().as_millis() as u64;
     let mut req = cfg
         .client
         .post(&cfg.upstream_url)
@@ -1410,7 +1617,20 @@ async fn send_codex_upstream(
             req = req.header(key, v);
         }
     }
-    Ok(req.body(compatible_body).send().await?)
+    let upstream_started_at = std::time::Instant::now();
+    match req.body(t.body.clone()).send().await {
+        Ok(response) => Ok(TimedUpstreamResponse {
+            response,
+            credential_ms,
+            upstream_headers_ms: upstream_started_at.elapsed().as_millis() as u64,
+            upstream_started_at,
+        }),
+        Err(error) => Err(TimedUpstreamError {
+            error: error.into(),
+            credential_ms,
+            upstream_headers_ms: upstream_started_at.elapsed().as_millis() as u64,
+        }),
+    }
 }
 
 pub fn codex_compat_body(raw: &[u8], session: &str, lite: bool) -> Result<Vec<u8>> {
@@ -1427,6 +1647,66 @@ fn codex_compat_body_for_identity(
     identity: &UpstreamIdentity,
     lite: bool,
 ) -> Result<Vec<u8>> {
+    Ok(prepare_codex_request(raw, identity, lite)?.body.to_vec())
+}
+
+#[derive(Debug)]
+struct PreparedCodexRequest {
+    body: Bytes,
+    input_item_count: u32,
+    request_fingerprint: String,
+}
+
+fn request_fingerprint(value: &Value) -> String {
+    let state = REQUEST_FINGERPRINT_STATE.get_or_init(RandomState::new);
+    let mut hasher = state.build_hasher();
+    hash_request_value(value, &mut hasher, true);
+    format!("{:016x}", hasher.finish())
+}
+
+fn hash_request_value<H: Hasher>(value: &Value, hasher: &mut H, root: bool) {
+    match value {
+        Value::Null => 0u8.hash(hasher),
+        Value::Bool(value) => {
+            1u8.hash(hasher);
+            value.hash(hasher);
+        }
+        Value::Number(value) => {
+            2u8.hash(hasher);
+            value.to_string().hash(hasher);
+        }
+        Value::String(value) => {
+            3u8.hash(hasher);
+            value.hash(hasher);
+        }
+        Value::Array(values) => {
+            4u8.hash(hasher);
+            values.len().hash(hasher);
+            for value in values {
+                hash_request_value(value, hasher, false);
+            }
+        }
+        Value::Object(values) => {
+            5u8.hash(hasher);
+            let mut entries: Vec<_> = values
+                .iter()
+                .filter(|(key, _)| !(root && key.as_str() == "client_metadata"))
+                .collect();
+            entries.sort_unstable_by_key(|(left, _)| *left);
+            entries.len().hash(hasher);
+            for (key, value) in entries {
+                key.hash(hasher);
+                hash_request_value(value, hasher, false);
+            }
+        }
+    }
+}
+
+fn prepare_codex_request(
+    raw: &[u8],
+    identity: &UpstreamIdentity,
+    lite: bool,
+) -> Result<PreparedCodexRequest> {
     let mut value: Value = serde_json::from_slice(raw).context("decode Codex request body")?;
     let body = value
         .as_object_mut()
@@ -1550,7 +1830,16 @@ fn codex_compat_body_for_identity(
         );
         body.entry("instructions").or_insert("".into());
     }
-    Ok(serde_json::to_vec(&value)?)
+    let input_item_count = value
+        .get("input")
+        .and_then(Value::as_array)
+        .map_or(0, |items| items.len().min(u32::MAX as usize) as u32);
+    let request_fingerprint = request_fingerprint(&value);
+    Ok(PreparedCodexRequest {
+        body: Bytes::from(serde_json::to_vec(&value)?),
+        input_item_count,
+        request_fingerprint,
+    })
 }
 
 fn normalize_input_item(value: &mut Value) {
@@ -1771,6 +2060,56 @@ fn repair_terminal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_fingerprint_ignores_dynamic_metadata_and_key_order() {
+        let a = br#"{
+            "model":"gpt-5.6-sol",
+            "input":[{"id":"msg-a","type":"message","role":"user","content":[{"type":"input_text","text":"inspect"}]}],
+            "client_metadata":{"turn_id":"turn-a"}
+        }"#;
+        let b = br#"{
+            "client_metadata":{"turn_id":"turn-b"},
+            "input":[{"content":[{"text":"inspect","type":"input_text"}],"role":"user","type":"message","id":"msg-b"}],
+            "model":"gpt-5.6-sol"
+        }"#;
+        let identity = UpstreamIdentity {
+            thread_id: "session".into(),
+            request_id: "request".into(),
+            cache_key: Some("conversation".into()),
+        };
+
+        let a = prepare_codex_request(a, &identity, true).unwrap();
+        let b = prepare_codex_request(b, &identity, true).unwrap();
+
+        assert!(!a.request_fingerprint.is_empty());
+        assert_eq!(a.request_fingerprint, b.request_fingerprint);
+        assert_eq!(a.input_item_count, b.input_item_count);
+    }
+
+    #[test]
+    fn request_fingerprint_changes_with_model_visible_input() {
+        let identity = UpstreamIdentity {
+            thread_id: "session".into(),
+            request_id: "request".into(),
+            cache_key: Some("conversation".into()),
+        };
+        let a = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"inspect A"}"#,
+            &identity,
+            true,
+        )
+        .unwrap();
+        let b = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"inspect B"}"#,
+            &identity,
+            true,
+        )
+        .unwrap();
+
+        assert_ne!(a.request_fingerprint, b.request_fingerprint);
+    }
+
     #[test]
     fn transforms_lite() {
         let c = Catalog::default();
@@ -1785,6 +2124,30 @@ mod tests {
         assert_eq!(wire["input"][0]["type"], "additional_tools");
         assert_eq!(v["input"][1]["role"], "developer");
         assert_eq!(v["input"][2]["role"], "user");
+    }
+
+    #[test]
+    fn opt_in_lite_tool_batching_appends_a_developer_instruction() {
+        let transformed = transform_request_with_options(
+            br#"{"model":"gpt-5.6-sol","input":"inspect","instructions":"existing"}"#,
+            &Catalog::default(),
+            &ModelMap::default(),
+            true,
+        )
+        .unwrap();
+        let body: Value = serde_json::from_slice(&transformed.body).unwrap();
+        let developer_text = body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|item| item["role"] == "developer")
+            .filter_map(|item| item.pointer("/content/0/text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(developer_text.contains("existing"));
+        assert!(developer_text.contains("Batch independent read-only operations"));
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
@@ -2030,6 +2393,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 4096,
         })
@@ -2087,6 +2451,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 1024,
         })
@@ -2154,6 +2519,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 1024,
         })
@@ -2214,6 +2580,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 4096,
         })
@@ -2236,6 +2603,335 @@ mod tests {
         let stream = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(stream.contains("live"));
         assert!(stream.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn handler_records_latency_breakdown_and_first_chunk() {
+        use crate::auth::Credentials;
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+
+        struct SlowCreds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for SlowCreds {
+            async fn get(&self, _: bool) -> Result<Credentials> {
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                Ok(Credentials {
+                    access_token: "upstream-secret".into(),
+                    account_id: String::new(),
+                    expires_at: None,
+                })
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new().route(
+            "/responses",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                let body = Body::from_stream(async_stream::stream! {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    yield Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                        b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_timed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n",
+                    ));
+                });
+                ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let observer = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let app = router(ProxyConfig {
+            upstream_url: format!("http://{address}/responses"),
+            credentials: Arc::new(SlowCreds),
+            kimi: None,
+            catalog: Catalog::default(),
+            model_map: ModelMap::default(),
+            client: reqwest::Client::new(),
+            client_token: String::new(),
+            version: "test".into(),
+            compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+            responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
+            observer: Some(observer.clone()),
+            max_body_bytes: 4096,
+        })
+        .unwrap();
+        let request_body = r#"{"model":"gpt-5.6-sol","input":"hi"}"#;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+
+        let events = observer.events.lock().unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event.kind == RequestEventKind::Completed)
+            .expect("completed event");
+        assert_eq!(
+            completed.diagnostics.request_body_bytes,
+            request_body.len() as u64
+        );
+        assert_eq!(completed.diagnostics.input_item_count, 2);
+        assert!(!completed.diagnostics.request_fingerprint.is_empty());
+        assert!(completed.diagnostics.credential_ms >= 10);
+        assert!(completed.diagnostics.upstream_headers_ms >= 10);
+        assert!(completed.diagnostics.first_chunk_ms >= 25);
+    }
+
+    #[tokio::test]
+    async fn handler_preserves_phase_timings_on_credential_failure() {
+        use crate::auth::Credentials;
+        use tower::ServiceExt;
+
+        struct SlowFailCreds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for SlowFailCreds {
+            async fn get(&self, _: bool) -> Result<Credentials> {
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                Err(anyhow!("credentials unavailable"))
+            }
+        }
+
+        let observer = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let app = router(ProxyConfig {
+            upstream_url: "http://127.0.0.1:9/responses".into(),
+            credentials: Arc::new(SlowFailCreds),
+            kimi: None,
+            catalog: Catalog::default(),
+            model_map: ModelMap::default(),
+            client: reqwest::Client::new(),
+            client_token: String::new(),
+            version: "test".into(),
+            compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+            responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
+            observer: Some(observer.clone()),
+            max_body_bytes: 4096,
+        })
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"gpt-5.6-sol","input":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let events = observer.events.lock().unwrap();
+        let failed = events
+            .iter()
+            .find(|event| event.kind == RequestEventKind::Failed)
+            .expect("failed event");
+        assert_eq!(failed.failure_kind, Some(FailureKind::UpstreamConnect));
+        assert!(
+            failed.diagnostics.credential_ms >= 10,
+            "credential wait must survive the failure path, got {}",
+            failed.diagnostics.credential_ms
+        );
+        assert_eq!(failed.diagnostics.upstream_headers_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn handler_preserves_phase_timings_on_upstream_connect_failure() {
+        use crate::auth::Credentials;
+        use tower::ServiceExt;
+
+        struct SlowCreds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for SlowCreds {
+            async fn get(&self, _: bool) -> Result<Credentials> {
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                Ok(Credentials {
+                    access_token: "upstream-secret".into(),
+                    account_id: String::new(),
+                    expires_at: None,
+                })
+            }
+        }
+
+        let observer = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        // Closed port: connect fails after credentials load.
+        let app = router(ProxyConfig {
+            upstream_url: "http://127.0.0.1:9/responses".into(),
+            credentials: Arc::new(SlowCreds),
+            kimi: None,
+            catalog: Catalog::default(),
+            model_map: ModelMap::default(),
+            client: reqwest::Client::new(),
+            client_token: String::new(),
+            version: "test".into(),
+            compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+            responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
+            observer: Some(observer.clone()),
+            max_body_bytes: 4096,
+        })
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"gpt-5.6-sol","input":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let events = observer.events.lock().unwrap();
+        let failed = events
+            .iter()
+            .find(|event| event.kind == RequestEventKind::Failed)
+            .expect("failed event");
+        assert_eq!(failed.failure_kind, Some(FailureKind::UpstreamConnect));
+        assert!(
+            failed.diagnostics.credential_ms >= 10,
+            "credential_ms must not be dropped on connect failure, got {}",
+            failed.diagnostics.credential_ms
+        );
+        // Connect refused is usually sub-millisecond; field is still populated (may be 0).
+        let _ = failed.diagnostics.upstream_headers_ms;
+    }
+
+    #[tokio::test]
+    async fn kimi_non_stream_records_first_chunk_ms() {
+        use crate::auth::Credentials;
+        use crate::provider::kimi::auth::Store as KimiStore;
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+
+        struct CodexCreds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for CodexCreds {
+            async fn get(&self, _: bool) -> Result<Credentials> {
+                unreachable!("Codex credentials must not load for Kimi models")
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = Router::new().route(
+            "/chat/completions",
+            axum::routing::post(|| async {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    r#"{"choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                )
+                    .into_response()
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let auth_path = directory.path().join("auth.json");
+        tokio::fs::write(
+            &auth_path,
+            br#"{"access":"kimi-token","refresh":"refresh","expires":4102444800000,"userId":"user-1"}"#,
+        )
+        .await
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(directory.path().join("device_id"), "device-1\n")
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(
+                directory.path().join("device_id"),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .await
+            .unwrap();
+        }
+
+        let observer = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let app = router(ProxyConfig {
+            upstream_url: "http://127.0.0.1:9/responses".into(),
+            credentials: Arc::new(CodexCreds),
+            kimi: Some(KimiConfig {
+                upstream_url: format!("http://{address}/chat/completions"),
+                credentials: Arc::new(KimiStore::new(&auth_path, "http://127.0.0.1:9").unwrap()),
+                api_key: String::new(),
+            }),
+            catalog: Catalog::default(),
+            model_map: ModelMap::default(),
+            client: reqwest::Client::new(),
+            client_token: String::new(),
+            version: "test".into(),
+            compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+            responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
+            observer: Some(observer.clone()),
+            max_body_bytes: 4096,
+        })
+        .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"model":"kimi-k2.6","input":"hello","stream":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+
+        let events = observer.events.lock().unwrap();
+        let completed = events
+            .iter()
+            .find(|event| {
+                event.kind == RequestEventKind::Completed || event.kind == RequestEventKind::Failed
+            })
+            .expect("terminal event");
+        assert!(
+            completed.diagnostics.first_chunk_ms >= 20,
+            "non-stream Kimi must record first_chunk_ms, got {} (kind={:?})",
+            completed.diagnostics.first_chunk_ms,
+            completed.kind
+        );
     }
 
     #[test]
@@ -2325,6 +3021,7 @@ mod tests {
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: None,
             max_body_bytes: 4096,
         })
@@ -2411,6 +3108,28 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     fn sample_event() -> RequestEvent {
         RequestEvent {
             kind: RequestEventKind::Started,
@@ -2434,7 +3153,41 @@ mod tests {
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            diagnostics: Default::default(),
         }
+    }
+
+    #[test]
+    fn request_diagnostics_log_omits_content_and_credentials() {
+        let output = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(output.clone())
+            .finish();
+        let mut event = sample_event();
+        event.kind = RequestEventKind::Completed;
+        event.status_code = 200;
+        event.error = "secret prompt response secret access_token=bearer account_id=acct".into();
+        event.diagnostics = RequestDiagnostics {
+            request_body_bytes: 1234,
+            input_item_count: 9,
+            proxy_prepare_ms: 3,
+            credential_ms: 4,
+            upstream_headers_ms: 5,
+            first_chunk_ms: 8,
+            request_fingerprint: "fp-safe".into(),
+        };
+
+        tracing::subscriber::with_default(subscriber, || log_request_diagnostics(&event));
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+
+        assert!(text.contains("request_body_bytes=1234"));
+        assert!(text.contains("request_fingerprint=\"fp-safe\""));
+        assert!(!text.contains("secret prompt"));
+        assert!(!text.contains("response secret"));
+        assert!(!text.contains("access_token"));
+        assert!(!text.contains("account_id"));
     }
 
     #[test]
@@ -2592,6 +3345,7 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
             observer: Some(obs.clone()),
             max_body_bytes: 1024,
         };
@@ -2630,6 +3384,17 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
         assert_eq!(events[0].kind, RequestEventKind::Failed);
         assert_eq!(events[0].failure_kind, Some(FailureKind::StreamIo));
         assert!(events[0].error.contains("client disconnected"));
+    }
+
+    #[test]
+    fn stream_observe_guard_records_first_chunk_once() {
+        let mut guard = StreamObserveGuard::new(None, sample_event(), StatusCode::OK, true);
+        guard.record_first_chunk(std::time::Instant::now() - std::time::Duration::from_millis(25));
+        let first_chunk_ms = guard.event.diagnostics.first_chunk_ms;
+        guard.record_first_chunk(std::time::Instant::now() - std::time::Duration::from_millis(250));
+
+        assert_eq!(guard.event.diagnostics.first_chunk_ms, first_chunk_ms);
+        guard.finished = true;
     }
 
     #[test]

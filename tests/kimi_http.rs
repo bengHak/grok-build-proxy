@@ -79,6 +79,7 @@ async fn unscoped_readiness_returns_when_kimi_is_ready() {
         version: "test".into(),
         compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
         responses_compat: CompatMode::Full,
+        lite_tool_batching: false,
         observer: None,
         max_body_bytes: 4096,
     })
@@ -132,6 +133,7 @@ async fn kimi_k3_uses_api_key_without_cli_identity_headers() {
         version: "test".into(),
         compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
         responses_compat: CompatMode::Full,
+        lite_tool_batching: false,
         observer: None,
         max_body_bytes: 4096,
     })
@@ -235,6 +237,7 @@ async fn kimi_model_routes_to_chat_completions_and_translates_stream() {
         version: "test".into(),
         compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
         responses_compat: CompatMode::Full,
+        lite_tool_batching: false,
         observer: None,
         max_body_bytes: 4096,
     })
@@ -424,6 +427,7 @@ async fn kimi_non_success_is_mapped_to_responses_error_contract() {
         version: "test".into(),
         compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
         responses_compat: CompatMode::Full,
+        lite_tool_batching: false,
         observer: None,
         max_body_bytes: 4096,
     })

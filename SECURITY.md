@@ -27,7 +27,13 @@ tokens on macOS. Treat every upstream credential as a password.
 - Serve-monitor failure reports (`y`/`Y` clipboard, `w`/`W` under
   `~/.grok/proxy-reports/`) include selected `FailureRecord` metadata. They omit
   diagnostic error messages, prompt/request bodies, response bodies, and
-  credentials.
+  credentials. Reports may include request size, input-item count, latency
+  phases, and a short randomized fingerprint that is comparable only within
+  the current proxy process; the source request is never retained to compute a
+  stable cross-process digest.
+- `--lite-tool-batching` only adds a model instruction. Batched shell commands
+  remain subject to Grok's normal permission and sandbox checks; review the
+  resulting command before approval in interactive modes.
 
 ## Credential handling
 

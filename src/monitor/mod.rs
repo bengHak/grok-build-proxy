@@ -489,8 +489,13 @@ fn turn_detail_text(snapshot: &Snapshot, app: &App) -> String {
         .failure_kind
         .map(|kind| kind.as_str())
         .unwrap_or("-");
+    let fingerprint = if request.diagnostics.request_fingerprint.is_empty() {
+        "-"
+    } else {
+        request.diagnostics.request_fingerprint.as_str()
+    };
     format!(
-        "Turn {} ({kind_label})\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration: {:.1}s  tokens: {}\n  failure: {failure}\n  error: {error}",
+        "Turn {} ({kind_label})\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration: {:.1}s  tokens: {}\n  request: {} B · {} items · fp {}\n  latency_ms: prepare {} · credential {} · headers {} · first_chunk {}\n  retry_candidate: {}\n  failure: {failure}\n  error: {error}",
         request.id,
         request.session_id,
         request.model,
@@ -499,6 +504,14 @@ fn turn_detail_text(snapshot: &Snapshot, app: &App) -> String {
         request.attempt,
         request.duration().as_secs_f64(),
         request.output_tokens,
+        request.diagnostics.request_body_bytes,
+        request.diagnostics.input_item_count,
+        fingerprint,
+        request.diagnostics.proxy_prepare_ms,
+        request.diagnostics.credential_ms,
+        request.diagnostics.upstream_headers_ms,
+        request.diagnostics.first_chunk_ms,
+        request.retry_candidate,
     )
 }
 
@@ -532,9 +545,14 @@ fn failure_detail_text(snapshot: &Snapshot, app: &App) -> String {
     } else {
         record.response_id.as_str()
     };
+    let fingerprint = if record.diagnostics.request_fingerprint.is_empty() {
+        "-"
+    } else {
+        record.diagnostics.request_fingerprint.as_str()
+    };
 
     format!(
-        "Failure {}\n  ts: {}\n  kind: {}\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration_ms: {}  session_fail#: {}\n  error_type: {}\n  message: {}\n  response_id: {}\n  mapped: {}  lite: {}  fast: {}\n  auth_retried: {}  outputs: {}  capture_bytes: {}",
+        "Failure {}\n  ts: {}\n  kind: {}\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration_ms: {}  session_fail#: {}\n  error_type: {}\n  message: {}\n  response_id: {}\n  mapped: {}  lite: {}  fast: {}\n  auth_retried: {}  outputs: {}  capture_bytes: {}\n  request: {} B · {} items · fp {}\n  latency_ms: prepare {} · credential {} · headers {} · first_chunk {}\n  retry_candidate: {}",
         record.request_id,
         record.ts.to_rfc3339(),
         record.kind.as_str(),
@@ -554,6 +572,14 @@ fn failure_detail_text(snapshot: &Snapshot, app: &App) -> String {
         record.auth_retried,
         record.output_count,
         record.capture_bytes,
+        record.diagnostics.request_body_bytes,
+        record.diagnostics.input_item_count,
+        fingerprint,
+        record.diagnostics.proxy_prepare_ms,
+        record.diagnostics.credential_ms,
+        record.diagnostics.upstream_headers_ms,
+        record.diagnostics.first_chunk_ms,
+        record.retry_candidate,
     )
 }
 
@@ -632,6 +658,7 @@ mod tests {
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            diagnostics: Default::default(),
         }
     }
 
@@ -1071,6 +1098,48 @@ mod tests {
     }
 
     #[test]
+    fn detail_text_includes_request_diagnostics() {
+        let dashboard = Dashboard::new();
+        let diagnostics = crate::events::RequestDiagnostics {
+            request_body_bytes: 1234,
+            input_item_count: 9,
+            proxy_prepare_ms: 3,
+            credential_ms: 4,
+            upstream_headers_ms: 5,
+            first_chunk_ms: 8,
+            request_fingerprint: "fp-safe".into(),
+        };
+
+        let mut first = base_event(RequestEventKind::Started);
+        first.request_id = "first".into();
+        first.diagnostics = diagnostics.clone();
+        dashboard.observe(first);
+        let mut first_failed = base_event(RequestEventKind::Failed);
+        first_failed.request_id = "first".into();
+        first_failed.failure_kind = Some(FailureKind::ProxyAssemble);
+        first_failed.diagnostics = diagnostics.clone();
+        dashboard.observe(first_failed);
+
+        let mut second = base_event(RequestEventKind::Started);
+        second.request_id = "second".into();
+        second.diagnostics = diagnostics.clone();
+        dashboard.observe(second);
+        let mut second_completed = base_event(RequestEventKind::Completed);
+        second_completed.request_id = "second".into();
+        second_completed.output_count = 1;
+        second_completed.diagnostics = diagnostics;
+        dashboard.observe(second_completed);
+
+        let mut app = App::new();
+        app.selected_session_key = Some("sess-abc".into());
+        app.pin_turn_detail("second");
+        let text = turn_detail_text(&dashboard.snapshot(), &app);
+        assert!(text.contains("request: 1234 B · 9 items · fp fp-safe"));
+        assert!(text.contains("latency_ms: prepare 3 · credential 4 · headers 5 · first_chunk 8"));
+        assert!(text.contains("retry_candidate: true"));
+    }
+
+    #[test]
     fn detail_text_failure_fields_and_stable_id() {
         let snap = fixture_dashboard().snapshot();
         // Newest-first: req-3 ProxyAssemble, then req-2 UpstreamHttp.
@@ -1087,6 +1156,9 @@ mod tests {
         assert!(text.contains("  error_type:"), "error_type:\n{text}");
         assert!(text.contains("  auth_retried:"), "auth_retried:\n{text}");
         assert!(text.contains("  capture_bytes:"), "capture_bytes:\n{text}");
+        assert!(text.contains("request: 0 B · 0 items · fp -"));
+        assert!(text.contains("latency_ms: prepare 0 · credential 0 · headers 0 · first_chunk 0"));
+        assert!(text.contains("retry_candidate: false"));
         assert!(
             text.contains("proxy_incomplete_output"),
             "etype val:\n{text}"
@@ -1246,6 +1318,8 @@ mod tests {
                     output_count: 0,
                     capture_bytes: 0,
                     session_failure_index: 2,
+                    diagnostics: Default::default(),
+                    retry_candidate: false,
                 },
                 FailureRecord {
                     ts: t0,
@@ -1267,6 +1341,8 @@ mod tests {
                     output_count: 0,
                     capture_bytes: 0,
                     session_failure_index: 1,
+                    diagnostics: Default::default(),
+                    retry_candidate: false,
                 },
             ],
             ..Default::default()

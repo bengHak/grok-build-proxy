@@ -284,6 +284,8 @@ mod tests {
             output_count: 0,
             capture_bytes: 0,
             session_failure_index: 1,
+            diagnostics: Default::default(),
+            retry_candidate: false,
         }
     }
 

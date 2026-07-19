@@ -390,6 +390,8 @@ mod tests {
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            diagnostics: Default::default(),
+            retry_candidate: false,
         }
     }
 
@@ -525,6 +527,8 @@ mod tests {
             output_count: 0,
             capture_bytes: 0,
             session_failure_index: 1,
+            diagnostics: Default::default(),
+            retry_candidate: false,
         };
         let mut f2 = f1.clone();
         f2.request_id = "r2".into();
