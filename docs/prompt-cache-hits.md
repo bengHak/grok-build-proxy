@@ -47,8 +47,9 @@ is the common Goal/subagent case (child conversation + parent lineage).
 ## Prefix stability
 
 Responses Lite rebuilds tools into an `additional_tools` developer item at the
-front of `input`. This proxy sorts tools by `name` (then `type`) before send so
-identical tool sets produce the same prefix regardless of emission order.
+front of `input`. This proxy sorts tools by `name`, `type`, then canonical full
+definition before send so identical tool sets, including multiple MCP tools
+without a `name`, produce the same prefix regardless of emission order.
 
 Keep system/developer instructions and tool schemas stable across turns. Put
 dynamic content after the shared prefix.
@@ -65,10 +66,12 @@ Plain logs include:
 
 When `input_tokens >= 2048`, `cached_input_tokens == 0`, **and**
 `cache_write_tokens == 0`, a content-free warning is emitted so operators can
-investigate key/prefix stability. A pure cold-start first write (zero reads with
-non-zero writes) does **not** warn — that is expected for a new cache namespace.
-The warning includes `cache_write_tokens` and `fresh_input_tokens` for diagnosis
-and never logs prompt or response content.
+investigate key/prefix stability. Warnings are limited to GPT-5.6+ Codex
+requests using implicit caching or explicit caching with a cache breakpoint.
+Providers and older models without write-token reporting, explicit mode without
+a breakpoint, and pure cold-start first writes do **not** warn. The warning
+includes `cache_write_tokens` and `fresh_input_tokens` for diagnosis and never
+logs prompt or response content.
 
 ## Practical checklist
 

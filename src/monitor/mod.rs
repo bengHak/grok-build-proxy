@@ -658,6 +658,7 @@ mod tests {
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            warn_on_cache_miss: false,
             diagnostics: Default::default(),
         }
     }

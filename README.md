@@ -353,10 +353,11 @@ allowed to carry the separate cache key because it is a routing hint;
 `x-client-request-id` preserves the incoming request ID.
 
 Responses Lite rebuilds tools into a leading `additional_tools` developer item.
-The proxy sorts those tools by `name` then `type` before send so identical tool
-sets produce a stable prompt prefix regardless of client emission order. Keep
-system/developer instructions and tool schemas stable across turns; put dynamic
-content after the shared prefix. See
+The proxy sorts those tools by `name`, `type`, then canonical full definition
+before send so identical tool sets — including multiple MCP tools without a
+`name` — produce a stable prompt prefix regardless of client emission order.
+Keep system/developer instructions and tool schemas stable across turns; put
+dynamic content after the shared prefix. See
 [`docs/prompt-cache-hits.md`](docs/prompt-cache-hits.md) for an operator
 checklist.
 
@@ -375,7 +376,10 @@ When terminal usage is available, plain logs include `input_tokens`,
 When `input_tokens >= 2048`, `cached_input_tokens == 0`, and
 `cache_write_tokens == 0`, the proxy also emits a content-free warning (including
 write/fresh counters) so operators can investigate key or prefix stability.
-Pure cold-start first writes (zero reads, non-zero writes) do not warn.
+Warnings are limited to GPT-5.6+ Codex requests with caching enabled: implicit
+mode, or explicit mode with a cache breakpoint. Providers and older models that
+do not report cache writes cannot be classified reliably and do not warn. Pure
+cold-start first writes (zero reads, non-zero writes) also do not warn.
 
 `proxy_prepare_ms` covers body collection and request transformation before
 credential loading. `credential_ms` combines credential lock wait, file read,

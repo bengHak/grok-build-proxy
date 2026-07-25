@@ -641,6 +641,7 @@ pub struct TransformedRequest {
     pub provider: Provider,
     pub input_item_count: u32,
     pub request_fingerprint: String,
+    pub warn_on_cache_miss: bool,
 }
 pub fn transform_request(
     raw: &[u8],
@@ -702,6 +703,8 @@ fn transform_request_with_options(
     } else {
         object.entry("parallel_tool_calls").or_insert(true.into());
     }
+    let warn_on_cache_miss =
+        prompt_cache_miss_warning_enabled(&body, model.provider, &resolution.model);
     let input_item_count = body
         .get("input")
         .and_then(Value::as_array)
@@ -718,6 +721,7 @@ fn transform_request_with_options(
         provider: model.provider,
         input_item_count,
         request_fingerprint,
+        warn_on_cache_miss,
     })
 }
 
@@ -736,18 +740,66 @@ fn append_lite_tool_batching_instruction(body: &mut Map<String, Value>) {
         format!("{existing}{separator}{LITE_TOOL_BATCHING_INSTRUCTION}").into(),
     );
 }
-/// Sort Responses Lite tools by `name` then `type` so identical tool sets produce a stable
-/// `additional_tools` prefix regardless of client emission order.
+fn sort_json_keys(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(sort_json_keys),
+        Value::Object(values) => {
+            values.values_mut().for_each(sort_json_keys);
+            values.sort_keys();
+        }
+        _ => {}
+    }
+}
+
+/// Sort Responses Lite tools by `name`, `type`, then full definition so identical tool sets
+/// produce a stable `additional_tools` prefix regardless of client emission order.
 fn sort_tools_for_cache_prefix(tools: &mut [Value]) {
-    tools.sort_by(|left, right| {
-        let left_name = left.get("name").and_then(Value::as_str).unwrap_or("");
-        let right_name = right.get("name").and_then(Value::as_str).unwrap_or("");
-        left_name.cmp(right_name).then_with(|| {
-            let left_type = left.get("type").and_then(Value::as_str).unwrap_or("");
-            let right_type = right.get("type").and_then(Value::as_str).unwrap_or("");
-            left_type.cmp(right_type)
-        })
+    tools.iter_mut().for_each(sort_json_keys);
+    tools.sort_by_cached_key(|tool| {
+        (
+            tool.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            tool.get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            tool.to_string(),
+        )
     });
+}
+
+fn prompt_cache_miss_warning_enabled(body: &Value, provider: Provider, model: &str) -> bool {
+    if provider != Provider::Codex || !is_gpt_5_6_or_later(model) {
+        return false;
+    }
+    body.pointer("/prompt_cache_options/mode")
+        .and_then(Value::as_str)
+        != Some("explicit")
+        || body
+            .get("input")
+            .is_some_and(contains_prompt_cache_breakpoint)
+}
+
+fn contains_prompt_cache_breakpoint(value: &Value) -> bool {
+    value.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|part| {
+                        matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_text" | "input_image" | "input_file")
+                        ) && part
+                            .pointer("/prompt_cache_breakpoint/mode")
+                            .and_then(Value::as_str)
+                            == Some("explicit")
+                    })
+                })
+        })
+    })
 }
 
 fn apply_responses_lite(body: &mut Map<String, Value>) {
@@ -906,6 +958,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         attempt: 1,
         output_count: 0,
         capture_bytes: 0,
+        warn_on_cache_miss: transformed.warn_on_cache_miss,
         diagnostics: RequestDiagnostics {
             request_body_bytes: body.len() as u64,
             input_item_count: transformed.input_item_count,
@@ -1405,7 +1458,9 @@ fn observe_stream_end(
             cache_read_percent,
             "prompt cache usage"
         );
-        maybe_warn_prompt_cache_miss(&event.request_id, &usage);
+        if event.warn_on_cache_miss {
+            maybe_warn_prompt_cache_miss(&event.request_id, &usage);
+        }
     }
 
     let diag = parse_capture_diagnostics(capture);
@@ -3263,6 +3318,84 @@ mod tests {
     }
 
     #[test]
+    fn responses_lite_mcp_tools_sorted_by_full_definition() {
+        let catalog = Catalog::default();
+        let model_map = ModelMap::default();
+        let first = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"mcp","server_label":"zeta","server_url":"https://z.example/mcp"},
+                {"type":"mcp","server_label":"alpha","server_url":"https://a.example/mcp"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let second = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"server_url":"https://a.example/mcp","server_label":"alpha","type":"mcp"},
+                {"server_url":"https://z.example/mcp","server_label":"zeta","type":"mcp"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let first_body: Value = serde_json::from_slice(&first.body).unwrap();
+        let second_body: Value = serde_json::from_slice(&second.body).unwrap();
+        let first_tools = first_body["input"][0]["tools"].as_array().unwrap();
+        let second_tools = second_body["input"][0]["tools"].as_array().unwrap();
+        assert_eq!(first_tools, second_tools);
+        assert_eq!(
+            serde_json::to_vec(first_tools).unwrap(),
+            serde_json::to_vec(second_tools).unwrap()
+        );
+        assert_eq!(first_tools[0]["server_label"], "alpha");
+        assert_eq!(first_tools[1]["server_label"], "zeta");
+    }
+
+    #[test]
+    fn cache_miss_warning_scope_matches_supported_cache_policy() {
+        let cases = [
+            (
+                r#"{"model":"gpt-5.6-sol","input":"hi"}"#,
+                true,
+                "GPT-5.6 implicit caching",
+            ),
+            (
+                r#"{"model":"gpt-5.6-sol","prompt_cache_options":{"mode":"explicit"},"input":"hi"}"#,
+                false,
+                "explicit mode without a breakpoint",
+            ),
+            (
+                r#"{"model":"gpt-5.6-sol","prompt_cache_options":{"mode":"explicit"},"input":[{"role":"user","content":[{"type":"input_text","text":"hi","prompt_cache_breakpoint":{"mode":"explicit"}}]}]}"#,
+                true,
+                "explicit mode with a breakpoint",
+            ),
+            (
+                r#"{"model":"gpt-5.6-sol","prompt_cache_options":{"mode":"explicit"},"input":"hi","tools":[{"type":"function","name":"inspect","parameters":{"type":"object","properties":{"prompt_cache_breakpoint":{"type":"string"}}}}]}"#,
+                false,
+                "tool schema property is not a cache breakpoint",
+            ),
+            (
+                r#"{"model":"gpt-5.5","input":"hi"}"#,
+                false,
+                "pre-GPT-5.6 without write-token reporting",
+            ),
+            (
+                r#"{"model":"k3","input":"hi"}"#,
+                false,
+                "Kimi without write-token reporting",
+            ),
+        ];
+
+        for (raw, expected, case) in cases {
+            let transformed =
+                transform_request(raw.as_bytes(), &Catalog::default(), &ModelMap::default())
+                    .unwrap();
+            assert_eq!(transformed.warn_on_cache_miss, expected, "{case}");
+        }
+    }
+
+    #[test]
     fn large_input_zero_cache_warns_without_prompt_content() {
         let output = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
@@ -3274,6 +3407,7 @@ mod tests {
         let mut event = sample_event();
         event.request_id = "req-cache-miss".into();
         event.error = "secret prompt body must never appear".into();
+        event.warn_on_cache_miss = true;
         let usage = Some(crate::events::TokenUsage {
             input_tokens: 2048,
             cached_input_tokens: 0,
@@ -3314,6 +3448,22 @@ data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage"
             .with_writer(output.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
+            observe_stream_end(
+                &None,
+                sample_event(),
+                StatusCode::OK,
+                br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_disabled","output":[]}}
+
+"#,
+                Some(crate::events::TokenUsage {
+                    input_tokens: 4096,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 1,
+                }),
+                None,
+            );
             maybe_warn_prompt_cache_miss(
                 "req-hit",
                 &crate::events::TokenUsage {
@@ -3549,6 +3699,7 @@ data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage"
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            warn_on_cache_miss: false,
             diagnostics: Default::default(),
         }
     }

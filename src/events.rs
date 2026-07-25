@@ -110,6 +110,7 @@ pub struct RequestEvent {
     pub attempt: u32,
     pub output_count: u32,
     pub capture_bytes: u32,
+    pub warn_on_cache_miss: bool,
     pub diagnostics: RequestDiagnostics,
 }
 
@@ -153,6 +154,7 @@ impl RequestEvent {
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            warn_on_cache_miss: false,
             diagnostics: RequestDiagnostics::default(),
         }
     }
