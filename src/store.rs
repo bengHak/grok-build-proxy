@@ -402,29 +402,57 @@ impl Dashboard {
         use crate::events::FailureKind;
         let t0 = Instant::now() - Duration::from_secs(12);
 
-        let mut start = RequestEvent::started("demo-req-1", "demo-sess-a", "codex-sol", "gpt-5.6-sol", true, true, false)
-            .with_provider("codex")
-            .with_phase(RequestPhase::Preparing);
+        let mut start = RequestEvent::started(
+            "demo-req-1",
+            "demo-sess-a",
+            "codex-sol",
+            "gpt-5.6-sol",
+            true,
+            true,
+            false,
+        )
+        .with_provider("codex")
+        .with_phase(RequestPhase::Preparing);
         start.started_at = t0;
         start.diagnostics.request_body_bytes = 4096;
         start.diagnostics.input_item_count = 12;
         start.diagnostics.request_fingerprint = "demo-fp-a".into();
         self.observe(start);
-        self.observe_session_context("demo-sess-a", "demo: inspect this session", "/tmp/demo-project");
+        self.observe_session_context(
+            "demo-sess-a",
+            "demo: inspect this session",
+            "/tmp/demo-project",
+        );
 
-        let mut phase = RequestEvent::started("demo-req-1", "demo-sess-a", "codex-sol", "gpt-5.6-sol", true, true, false)
-            .with_provider("codex")
-            .with_phase(RequestPhase::Upstream)
-            .as_updated();
+        let mut phase = RequestEvent::started(
+            "demo-req-1",
+            "demo-sess-a",
+            "codex-sol",
+            "gpt-5.6-sol",
+            true,
+            true,
+            false,
+        )
+        .with_provider("codex")
+        .with_phase(RequestPhase::Upstream)
+        .as_updated();
         phase.started_at = t0;
         phase.diagnostics.credential_ms = 40;
         phase.diagnostics.upstream_headers_ms = 120;
         self.observe(phase);
 
-        let mut progress = RequestEvent::started("demo-req-1", "demo-sess-a", "codex-sol", "gpt-5.6-sol", true, true, false)
-            .with_provider("codex")
-            .with_phase(RequestPhase::Streaming)
-            .as_updated();
+        let mut progress = RequestEvent::started(
+            "demo-req-1",
+            "demo-sess-a",
+            "codex-sol",
+            "gpt-5.6-sol",
+            true,
+            true,
+            false,
+        )
+        .with_provider("codex")
+        .with_phase(RequestPhase::Streaming)
+        .as_updated();
         progress.started_at = t0;
         progress.output_tokens = 80;
         progress.streamed_bytes = 2400;
@@ -433,9 +461,17 @@ impl Dashboard {
         progress.diagnostics.first_chunk_ms = 350;
         self.observe(progress);
 
-        let mut done = RequestEvent::started("demo-req-1", "demo-sess-a", "codex-sol", "gpt-5.6-sol", true, true, false)
-            .with_provider("codex")
-            .with_phase(RequestPhase::Streaming);
+        let mut done = RequestEvent::started(
+            "demo-req-1",
+            "demo-sess-a",
+            "codex-sol",
+            "gpt-5.6-sol",
+            true,
+            true,
+            false,
+        )
+        .with_provider("codex")
+        .with_phase(RequestPhase::Streaming);
         done.kind = RequestEventKind::Completed;
         done.started_at = t0;
         done.status_code = 200;
@@ -463,9 +499,17 @@ impl Dashboard {
 
         // Second session with a live streaming turn + a failed turn.
         let t1 = Instant::now() - Duration::from_secs(3);
-        let mut live = RequestEvent::started("demo-req-live", "demo-sess-b", "kimi-k3", "k3", true, false, false)
-            .with_provider("kimi")
-            .with_phase(RequestPhase::Streaming);
+        let mut live = RequestEvent::started(
+            "demo-req-live",
+            "demo-sess-b",
+            "kimi-k3",
+            "k3",
+            true,
+            false,
+            false,
+        )
+        .with_provider("kimi")
+        .with_phase(RequestPhase::Streaming);
         live.started_at = t1;
         live.streamed_bytes = 900;
         live.stream_chunks = 4;
@@ -474,12 +518,28 @@ impl Dashboard {
         self.observe(live);
         self.observe_session_context("demo-sess-b", "demo: kimi live stream", "/tmp/kimi");
 
-        let mut fail_start = RequestEvent::started("demo-req-fail", "demo-sess-b", "kimi-k3", "k3", true, false, false)
-            .with_provider("kimi");
+        let mut fail_start = RequestEvent::started(
+            "demo-req-fail",
+            "demo-sess-b",
+            "kimi-k3",
+            "k3",
+            true,
+            false,
+            false,
+        )
+        .with_provider("kimi");
         fail_start.started_at = Instant::now() - Duration::from_secs(8);
         self.observe(fail_start);
-        let mut fail = RequestEvent::started("demo-req-fail", "demo-sess-b", "kimi-k3", "k3", true, false, false)
-            .with_provider("kimi");
+        let mut fail = RequestEvent::started(
+            "demo-req-fail",
+            "demo-sess-b",
+            "kimi-k3",
+            "k3",
+            true,
+            false,
+            false,
+        )
+        .with_provider("kimi");
         fail.kind = RequestEventKind::Failed;
         fail.started_at = Instant::now() - Duration::from_secs(8);
         fail.status_code = 502;
@@ -569,6 +629,7 @@ impl Dashboard {
                     return;
                 }
                 // Re-observe Started after auth retry: refresh in-flight attempt flags only.
+                // Do NOT regress phase (base_event still carries Preparing) — only advance.
                 if let Some(active) = state.active.get_mut(&event.request_id) {
                     active.auth_retried = event.auth_retried;
                     active.attempt = event.attempt.max(1);
@@ -579,7 +640,9 @@ impl Dashboard {
                         active.provider = sanitize(&event.provider);
                     }
                     active.diagnostics = event.diagnostics.clone();
-                    active.phase = event.phase;
+                    if phase_rank(event.phase) >= phase_rank(active.phase) {
+                        active.phase = event.phase;
+                    }
                     if let Some(session) = state.sessions.get_mut(&event.session_id) {
                         session.updated_at = Some(Utc::now());
                         if !event.provider.is_empty() {
@@ -1404,6 +1467,28 @@ mod tests {
         assert!(s.active[0].auth_retried);
         assert_eq!(s.sessions[0].requests, 1); // not double-counted
         assert_eq!(s.sessions[0].active, 1);
+    }
+
+    #[test]
+    fn started_reobserve_does_not_regress_phase_from_upstream() {
+        // Auth-retry re-emits Started with phase=Preparing; hang diagnosis must keep Upstream.
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        let mut upstream = base_event(RequestEventKind::Updated);
+        upstream.phase = RequestPhase::Upstream;
+        d.observe(upstream);
+        assert_eq!(d.snapshot().active[0].phase, RequestPhase::Upstream);
+
+        let mut retry = base_event(RequestEventKind::Started);
+        retry.auth_retried = true;
+        retry.attempt = 2;
+        retry.phase = RequestPhase::Preparing; // base_event default — must not overwrite
+        d.observe(retry);
+
+        let active = &d.snapshot().active[0];
+        assert_eq!(active.phase, RequestPhase::Upstream);
+        assert_eq!(active.attempt, 2);
+        assert!(active.auth_retried);
     }
 
     #[test]

@@ -63,7 +63,9 @@ fn readme_core_cli_reference_matches_help() {
     let cases: &[(&[&str], &[&str])] = &[
         (
             &["--help"],
-            &["serve", "demo", "auth", "kimi", "doctor", "models", "version"],
+            &[
+                "serve", "demo", "auth", "kimi", "doctor", "models", "version",
+            ],
         ),
         (
             &["serve", "--help"],

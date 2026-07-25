@@ -1505,6 +1505,20 @@ mod tests {
             try_export(KeyCode::Char('y'), &snap, &app, "a", "v").is_none(),
             "export should no-op in Detail"
         );
+        // ConfirmQuit: y/Y must confirm quit only — never export reports.
+        app.mode = Mode::ConfirmQuit;
+        assert!(
+            try_export(KeyCode::Char('y'), &snap, &app, "a", "v").is_none(),
+            "export should no-op on y in ConfirmQuit"
+        );
+        assert!(
+            try_export(KeyCode::Char('Y'), &snap, &app, "a", "v").is_none(),
+            "export should no-op on Y in ConfirmQuit"
+        );
+        assert!(
+            try_export(KeyCode::Char('w'), &snap, &app, "a", "v").is_none(),
+            "export should no-op on w in ConfirmQuit"
+        );
         app.mode = Mode::Dashboard;
         let dir = tempfile::tempdir().unwrap();
         assert!(

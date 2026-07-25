@@ -122,7 +122,13 @@ mod tests {
             }
             text.push('\n');
         }
-        for expected in ["Shift-Tab", "failures", "JSON", "estimated retry", "confirm quit"] {
+        for expected in [
+            "Shift-Tab",
+            "failures",
+            "JSON",
+            "estimated retry",
+            "confirm quit",
+        ] {
             assert!(text.contains(expected), "missing {expected}:\n{text}");
         }
     }

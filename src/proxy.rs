@@ -1419,10 +1419,10 @@ impl StreamObserveGuard {
         }
         let now = std::time::Instant::now();
         let due = force
-            || self.last_progress_at.is_none_or(|t| now.duration_since(t) >= PROGRESS_THROTTLE)
             || self
-                .streamed_bytes
-                .saturating_sub(self.last_progress_bytes)
+                .last_progress_at
+                .is_none_or(|t| now.duration_since(t) >= PROGRESS_THROTTLE)
+            || self.streamed_bytes.saturating_sub(self.last_progress_bytes)
                 >= PROGRESS_BYTE_THRESHOLD;
         if !due {
             return;
@@ -4131,7 +4131,12 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
         let terminal = events
             .iter()
             .rev()
-            .find(|e| matches!(e.kind, RequestEventKind::Failed | RequestEventKind::Completed))
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    RequestEventKind::Failed | RequestEventKind::Completed
+                )
+            })
             .expect("terminal event");
         assert_eq!(terminal.kind, RequestEventKind::Failed);
         assert_eq!(terminal.failure_kind, Some(FailureKind::StreamIo));
@@ -4168,7 +4173,12 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
         let terminal = events
             .iter()
             .rev()
-            .find(|e| matches!(e.kind, RequestEventKind::Failed | RequestEventKind::Completed))
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    RequestEventKind::Failed | RequestEventKind::Completed
+                )
+            })
             .expect("terminal event");
         assert_eq!(terminal.kind, RequestEventKind::Completed);
         assert_eq!(terminal.failure_kind, None);
@@ -4198,7 +4208,12 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
         let terminal = events
             .iter()
             .rev()
-            .find(|e| matches!(e.kind, RequestEventKind::Failed | RequestEventKind::Completed))
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    RequestEventKind::Failed | RequestEventKind::Completed
+                )
+            })
             .expect("terminal event");
         assert_eq!(
             terminal.usage,
@@ -4230,7 +4245,12 @@ data: {"type":"error","error":{"type":"proxy_incomplete_output","message":"incom
         let terminal = events
             .iter()
             .rev()
-            .find(|e| matches!(e.kind, RequestEventKind::Failed | RequestEventKind::Completed))
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    RequestEventKind::Failed | RequestEventKind::Completed
+                )
+            })
             .expect("terminal event");
         assert_eq!(terminal.kind, RequestEventKind::Failed);
         assert_eq!(terminal.failure_kind, Some(FailureKind::ProxyAssemble));

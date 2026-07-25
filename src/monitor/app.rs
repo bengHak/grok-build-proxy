@@ -280,9 +280,7 @@ impl App {
         failures_len: usize,
     ) -> bool {
         // Force quit always wins.
-        if matches!(key.code, KeyCode::Char('c'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
             return true;
         }
 
