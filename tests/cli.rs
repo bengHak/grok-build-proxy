@@ -5,6 +5,21 @@ fn binary() -> Command {
 }
 
 #[test]
+fn demo_command_runs_offline_without_tty_or_bind() {
+    let output = binary().arg("demo").output().unwrap();
+    assert!(
+        output.status.success(),
+        "demo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("demo fixture ok") || text.contains("sessions="),
+        "expected headless demo summary, got: {text}"
+    );
+}
+
+#[test]
 fn version_contract_is_plain_and_stable() {
     for argument in ["--version", "version"] {
         let output = binary().arg(argument).output().unwrap();
@@ -48,7 +63,7 @@ fn readme_core_cli_reference_matches_help() {
     let cases: &[(&[&str], &[&str])] = &[
         (
             &["--help"],
-            &["serve", "auth", "kimi", "doctor", "models", "version"],
+            &["serve", "demo", "auth", "kimi", "doctor", "models", "version"],
         ),
         (
             &["serve", "--help"],

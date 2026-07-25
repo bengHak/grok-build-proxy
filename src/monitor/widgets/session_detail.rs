@@ -6,22 +6,25 @@
 //!
 //! j/k navigates the turn list only; the summary always follows the pin.
 
+use super::layout::{LayoutTier, token_bucket_sparkline};
 use super::truncate;
 use crate::monitor::theme::Theme;
 use crate::monitor::widgets::metrics::{format_cache_read_value, format_token_count};
 use crate::store::{Request, Session, Snapshot};
 
-/// Session summary `tokens` line: output, absolute cache reads, and lifetime tok/s.
+/// Session summary `tokens` line: output, absolute cache reads, lifetime + gen rates.
 ///
 /// Cache reads use the same absolute+ratio formatting as the fleet metrics strip so a
 /// zero-cache session is visible without leaving the inspector.
+/// Lifetime (`t/s`) matches the metrics fleet sparkline; `gen/s` is generation-window.
 pub fn format_session_tokens_line(session: &Session) -> String {
     let cache = format_cache_read_value(session.cached_input_tokens, session.cache_read_ratio());
     format!(
-        "{} out · cache {} · {:.1} t/s",
+        "{} out · cache {} · {:.1} fleet · {:.1} gen/s",
         format_token_count(session.output_tokens),
         cache,
-        session.tokens_per_second()
+        session.tokens_per_second(),
+        session.generation_tokens_per_second()
     )
 }
 use ratatui::{
@@ -184,6 +187,11 @@ impl SessionDetailPanel<'_> {
         } else {
             session.last_model.as_str()
         };
+        let provider = if session.last_provider.is_empty() {
+            "-"
+        } else {
+            session.last_provider.as_str()
+        };
         let cwd = if session.cwd.is_empty() {
             "-"
         } else {
@@ -195,12 +203,15 @@ impl SessionDetailPanel<'_> {
             session.last_prompt.as_str()
         };
         let value_width = area.width.saturating_sub(8) as usize;
+        let spark_w = value_width.min(24);
+        let spark = token_bucket_sparkline(&session.output_token_buckets, spark_w);
         let identity = format!(
-            "{} · model {}",
-            truncate(&session.id, 16),
-            truncate(model, value_width.saturating_sub(12))
+            "{} · {} · {}",
+            truncate(&session.id, 14),
+            truncate(provider, 5),
+            truncate(model, value_width.saturating_sub(20))
         );
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("id      ", self.theme.muted),
                 Span::styled(truncate(&identity, value_width), self.theme.header),
@@ -246,6 +257,12 @@ impl SessionDetailPanel<'_> {
                 Span::styled(truncate(prompt, value_width), self.theme.header),
             ]),
         ];
+        if !spark.is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("spark   ", self.theme.muted),
+                Span::styled(spark, self.theme.ok),
+            ]));
+        }
         Paragraph::new(lines).render(area, buf);
     }
 
@@ -287,20 +304,47 @@ impl SessionDetailPanel<'_> {
             return;
         }
 
+        let tier = LayoutTier::for_width(area.width);
+        let id_w = tier.session_id_width().min(12);
+        let model_w = tier.model_width().min(14);
+        let show_provider = tier.show_provider();
+
         let items: Vec<ListItem> = rows
             .iter()
             .map(|(kind, r)| {
+                let provider = if r.provider.is_empty() {
+                    "?"
+                } else {
+                    r.provider.as_str()
+                };
                 let (label, style) = match kind {
-                    TurnKind::Active => (
-                        format!(
-                            "▶ {:<12} {:<12} {:>5.1}s a{}",
-                            truncate(&r.id, 12),
-                            truncate(&r.model, 12),
-                            r.duration().as_secs_f64(),
-                            r.attempt
-                        ),
-                        self.theme.active,
-                    ),
+                    TurnKind::Active => {
+                        let label = if show_provider {
+                            format!(
+                                "▶ {:<id_w$} {:<5} {:<model_w$} {} {:>5.1}s {}t {}B a{}",
+                                truncate(&r.id, id_w),
+                                truncate(provider, 5),
+                                truncate(&r.model, model_w),
+                                r.phase.as_str(),
+                                r.duration().as_secs_f64(),
+                                r.output_tokens,
+                                r.streamed_bytes,
+                                r.attempt,
+                                id_w = id_w,
+                                model_w = model_w,
+                            )
+                        } else {
+                            format!(
+                                "▶ {:<id_w$} {} {:>4.0}s a{}",
+                                truncate(&r.id, id_w),
+                                r.phase.as_str(),
+                                r.duration().as_secs_f64(),
+                                r.attempt,
+                                id_w = id_w,
+                            )
+                        };
+                        (label, self.theme.active)
+                    }
                     TurnKind::Recent => {
                         let failed = r.status == 0
                             || !(200..300).contains(&r.status)
@@ -318,9 +362,10 @@ impl SessionDetailPanel<'_> {
                             }
                         } else {
                             format!(
-                                " ok {}  {}tok {:>5.1}s",
+                                " ok {}  {}tok gen{:.0} {:>5.1}s",
                                 r.status,
                                 r.output_tokens,
+                                r.generation_tokens_per_second(),
                                 r.duration().as_secs_f64()
                             )
                         };
@@ -329,14 +374,25 @@ impl SessionDetailPanel<'_> {
                         } else {
                             self.theme.ok
                         };
-                        (
+                        let label = if show_provider {
                             format!(
-                                "  {:<12} {:<12}{status_txt}",
-                                truncate(&r.id, 12),
-                                truncate(&r.model, 12),
-                            ),
-                            style,
-                        )
+                                "  {:<id_w$} {:<5} {:<model_w$}{status_txt}",
+                                truncate(&r.id, id_w),
+                                truncate(provider, 5),
+                                truncate(&r.model, model_w),
+                                id_w = id_w,
+                                model_w = model_w,
+                            )
+                        } else {
+                            format!(
+                                "  {:<id_w$} {:<model_w$}{status_txt}",
+                                truncate(&r.id, id_w),
+                                truncate(&r.model, model_w),
+                                id_w = id_w,
+                                model_w = model_w,
+                            )
+                        };
+                        (label, style)
                     }
                 };
                 ListItem::new(Line::from(Span::styled(label, style)))
@@ -373,6 +429,7 @@ mod tests {
             session_id: session.into(),
             requested_model: "m".into(),
             model: "m".into(),
+            provider: "codex".into(),
             status: 200,
             error: String::new(),
             error_type: String::new(),
@@ -392,6 +449,11 @@ mod tests {
             capture_bytes: 0,
             diagnostics: Default::default(),
             retry_candidate: false,
+            phase: crate::events::RequestPhase::Preparing,
+            streamed_bytes: 0,
+            stream_chunks: 0,
+            generation_started_at: None,
+            generation_initial_output_tokens: 0,
         }
     }
 
@@ -513,6 +575,7 @@ mod tests {
             session_id: "s1".into(),
             requested_model: "a".into(),
             model: "m".into(),
+            provider: "codex".into(),
             status_code: 502,
             duration_ms: 10,
             kind: FailureKind::UpstreamHttp,

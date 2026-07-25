@@ -949,6 +949,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         session_id: session_id.clone(),
         requested_model: transformed.requested_model.clone(),
         model: transformed.model.clone(),
+        provider: transformed.provider.as_str().to_owned(),
         status_code: 0,
         usage: None,
         output_tokens: 0,
@@ -973,6 +974,10 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             request_fingerprint: transformed.request_fingerprint.clone(),
             ..Default::default()
         },
+        phase: crate::events::RequestPhase::Preparing,
+        streamed_bytes: 0,
+        stream_chunks: 0,
+        mark_generation_start: false,
     };
     if let Some(observer) = &s.0.observer {
         observer.observe(base_event.clone());
@@ -981,6 +986,10 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             &session_context.last_prompt,
             &session_context.cwd,
         );
+        // Auth/credential phase begins as we enter send_upstream.
+        let mut auth_phase = base_event.clone().as_updated();
+        auth_phase.phase = crate::events::RequestPhase::Auth;
+        observer.observe(auth_phase);
     }
     let timed = match send_upstream(&s.0, &transformed, &incoming_headers, &identity, false).await {
         Ok(r) => r,
@@ -1012,6 +1021,11 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         timed.upstream_headers_ms,
         false,
     );
+    if let Some(observer) = &s.0.observer {
+        let mut upstream_phase = base_event.clone().as_updated();
+        upstream_phase.phase = crate::events::RequestPhase::Upstream;
+        observer.observe(upstream_phase);
+    }
     let mut upstream_started_at = timed.upstream_started_at;
     let mut upstream = timed.response;
     if upstream.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -1339,7 +1353,16 @@ struct StreamObserveGuard {
     usage: UsageAccumulator,
     first_chunk_recorded: bool,
     finished: bool,
+    stream_chunks: u64,
+    streamed_bytes: u64,
+    last_progress_at: Option<std::time::Instant>,
+    last_progress_bytes: u64,
 }
+
+/// Minimum interval between mid-stream Updated progress publishes.
+const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Or publish when at least this many new body bytes have been seen.
+const PROGRESS_BYTE_THRESHOLD: u64 = 4096;
 
 impl StreamObserveGuard {
     fn new(
@@ -1356,6 +1379,10 @@ impl StreamObserveGuard {
             usage: UsageAccumulator::new(is_sse),
             first_chunk_recorded: false,
             finished: false,
+            stream_chunks: 0,
+            streamed_bytes: 0,
+            last_progress_at: None,
+            last_progress_bytes: 0,
         }
     }
 
@@ -1365,12 +1392,58 @@ impl StreamObserveGuard {
         }
         self.first_chunk_recorded = true;
         self.event.diagnostics.first_chunk_ms = upstream_started_at.elapsed().as_millis() as u64;
+        self.event.phase = crate::events::RequestPhase::Streaming;
+        self.event.mark_generation_start = true;
+        // Immediate phase publish so hang diagnosis shows Streaming before throttle window.
+        self.publish_progress(true);
     }
 
     /// Feed emitted bytes to usage extraction before retaining the bounded diagnostic tail.
     fn capture_chunk(&mut self, chunk: &[u8]) {
         self.usage.push(chunk);
         capture_tail(&mut self.capture, chunk);
+        self.stream_chunks = self.stream_chunks.saturating_add(1);
+        self.streamed_bytes = self.streamed_bytes.saturating_add(chunk.len() as u64);
+        self.event.stream_chunks = self.stream_chunks;
+        self.event.streamed_bytes = self.streamed_bytes;
+        self.event.capture_bytes = self.capture.len().min(u32::MAX as usize) as u32;
+        self.publish_progress(false);
+    }
+
+    fn publish_progress(&mut self, force: bool) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        if self.finished {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = force
+            || self.last_progress_at.is_none_or(|t| now.duration_since(t) >= PROGRESS_THROTTLE)
+            || self
+                .streamed_bytes
+                .saturating_sub(self.last_progress_bytes)
+                >= PROGRESS_BYTE_THRESHOLD;
+        if !due {
+            return;
+        }
+        self.last_progress_at = Some(now);
+        self.last_progress_bytes = self.streamed_bytes;
+        let mut progress = self.event.clone().as_updated();
+        progress.phase = if self.first_chunk_recorded {
+            crate::events::RequestPhase::Streaming
+        } else {
+            crate::events::RequestPhase::Upstream
+        };
+        progress.streamed_bytes = self.streamed_bytes;
+        progress.stream_chunks = self.stream_chunks;
+        progress.mark_generation_start = self.first_chunk_recorded;
+        // Best-effort live output estimate from partial usage when available.
+        if let Some(usage) = self.usage.current() {
+            progress.output_tokens = usage.output_tokens;
+            progress.usage = Some(usage);
+        }
+        observer.observe(progress);
     }
 
     fn finish(&mut self, stream_io_error: Option<String>) {
@@ -1379,6 +1452,11 @@ impl StreamObserveGuard {
         }
         self.finished = true;
         let usage = self.usage.finish();
+        self.event.streamed_bytes = self.streamed_bytes;
+        self.event.stream_chunks = self.stream_chunks;
+        if self.first_chunk_recorded {
+            self.event.phase = crate::events::RequestPhase::Streaming;
+        }
         observe_stream_end(
             &self.observer,
             self.event.clone(),
@@ -3800,6 +3878,7 @@ data: {"type":"response.completed","response":{"id":"resp_disabled","output":[]}
             session_id: "sess".into(),
             requested_model: "alias".into(),
             model: "gpt-5.6-sol".into(),
+            provider: "codex".into(),
             status_code: 0,
             usage: None,
             output_tokens: 0,
@@ -3818,6 +3897,10 @@ data: {"type":"response.completed","response":{"id":"resp_disabled","output":[]}
             capture_bytes: 0,
             warn_on_cache_miss: false,
             diagnostics: Default::default(),
+            phase: crate::events::RequestPhase::Preparing,
+            streamed_bytes: 0,
+            stream_chunks: 0,
+            mark_generation_start: false,
         }
     }
 
@@ -4044,10 +4127,15 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             // drop without finish and without terminal → client disconnect path
         }
         let events = obs.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, RequestEventKind::Failed);
-        assert_eq!(events[0].failure_kind, Some(FailureKind::StreamIo));
-        assert!(events[0].error.contains("client disconnected"));
+        // Mid-stream Updated progress may precede the terminal Failed event.
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, RequestEventKind::Failed | RequestEventKind::Completed))
+            .expect("terminal event");
+        assert_eq!(terminal.kind, RequestEventKind::Failed);
+        assert_eq!(terminal.failure_kind, Some(FailureKind::StreamIo));
+        assert!(terminal.error.contains("client disconnected"));
     }
 
     #[test]
@@ -4077,10 +4165,14 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             // Client drop after last chunk without finish() — must not force StreamIo.
         }
         let events = obs.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, RequestEventKind::Completed);
-        assert_eq!(events[0].failure_kind, None);
-        assert_eq!(events[0].response_id, "resp_ok");
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, RequestEventKind::Failed | RequestEventKind::Completed))
+            .expect("terminal event");
+        assert_eq!(terminal.kind, RequestEventKind::Completed);
+        assert_eq!(terminal.failure_kind, None);
+        assert_eq!(terminal.response_id, "resp_ok");
     }
 
     #[test]
@@ -4103,9 +4195,13 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             guard.finish(None);
         }
         let events = obs.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, RequestEventKind::Failed | RequestEventKind::Completed))
+            .expect("terminal event");
         assert_eq!(
-            events[0].usage,
+            terminal.usage,
             Some(crate::events::TokenUsage {
                 input_tokens: 321,
                 cached_input_tokens: 123,
@@ -4113,7 +4209,7 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
                 output_tokens: 9,
             })
         );
-        assert_eq!(events[0].output_tokens, 9);
+        assert_eq!(terminal.output_tokens, 9);
     }
 
     #[test]
@@ -4131,8 +4227,13 @@ data: {"type":"error","error":{"type":"proxy_incomplete_output","message":"incom
             guard.capture_chunk(err);
         }
         let events = obs.events.lock().unwrap();
-        assert_eq!(events[0].kind, RequestEventKind::Failed);
-        assert_eq!(events[0].failure_kind, Some(FailureKind::ProxyAssemble));
-        assert_eq!(events[0].error_type, "proxy_incomplete_output");
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| matches!(e.kind, RequestEventKind::Failed | RequestEventKind::Completed))
+            .expect("terminal event");
+        assert_eq!(terminal.kind, RequestEventKind::Failed);
+        assert_eq!(terminal.failure_kind, Some(FailureKind::ProxyAssemble));
+        assert_eq!(terminal.error_type, "proxy_incomplete_output");
     }
 }

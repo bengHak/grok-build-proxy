@@ -16,7 +16,8 @@ impl Widget for HelpOverlay {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // Center a modal within the full frame.
         let width = area.width.min(72);
-        let height = area.height.min(20);
+        // Enough rows for key list + gen/s / retry notes (wrap on narrow).
+        let height = area.height.min(24);
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
         let modal = Rect {
@@ -43,7 +44,12 @@ impl Widget for HelpOverlay {
             Line::from("  W            write JSON report"),
             Line::from("  Esc/Backspace return"),
             Line::from("  ?            toggle help"),
-            Line::from("  q/Q / Ctrl-C stop proxy"),
+            Line::from("  q/Q          confirm quit (y/n)"),
+            Line::from("  Ctrl-C       force quit (drain)"),
+            Line::from(Span::styled(
+                "  gen/s=generation window · fleet=lifetime tok/s",
+                self.theme.muted,
+            )),
             Line::from(Span::styled(
                 "  ≤30s same-session failures: estimated retry",
                 self.theme.muted,
@@ -99,8 +105,24 @@ mod tests {
 
     #[test]
     fn long_help_lines_wrap_on_narrow_terminals() {
-        let text = render(50);
-        for expected in ["Shift-Tab", "failures", "JSON", "estimated retry"] {
+        // Height 28 so wrapped key list + notes fit on width 50.
+        let mut terminal = Terminal::new(TestBackend::new(50, 28)).unwrap();
+        terminal
+            .draw(|frame| {
+                HelpOverlay {
+                    theme: Theme::default(),
+                }
+                .render(frame.area(), frame.buffer_mut())
+            })
+            .unwrap();
+        let mut text = String::new();
+        for y in 0..28 {
+            for x in 0..50 {
+                text.push_str(terminal.backend().buffer().cell((x, y)).unwrap().symbol());
+            }
+            text.push('\n');
+        }
+        for expected in ["Shift-Tab", "failures", "JSON", "estimated retry", "confirm quit"] {
             assert!(text.contains(expected), "missing {expected}:\n{text}");
         }
     }

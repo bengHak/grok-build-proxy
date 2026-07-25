@@ -183,7 +183,8 @@ fn try_export_to(
         KeyCode::Char('Y' | 'W') => true,
         _ => return None,
     };
-    // Avoid accidental clipboard/file writes while reading help or detail.
+    // Avoid accidental clipboard/file writes while reading help/detail/confirm-quit.
+    // ConfirmQuit y/Y must never export — only confirm quit.
     if app.mode != Mode::Dashboard {
         return None;
     }
@@ -306,17 +307,45 @@ fn draw(
         .render(body[1], buf);
     }
 
+    let confirm_toast = if app.mode == Mode::ConfirmQuit {
+        Some("quit? y confirm · n/Esc cancel · Ctrl-C force")
+    } else {
+        None
+    };
     Footer {
         theme,
-        toast: app.toast_message(),
+        toast: confirm_toast.or_else(|| app.toast_message()),
     }
     .render(footer_area, buf);
 
     match app.mode {
         Mode::Help => HelpOverlay { theme }.render(area, buf),
         Mode::Detail => draw_detail(area, buf, snapshot, app, theme),
+        Mode::ConfirmQuit => draw_confirm_quit(area, buf, theme),
         Mode::Dashboard => {}
     }
+}
+
+fn draw_confirm_quit(area: Rect, buf: &mut ratatui::buffer::Buffer, theme: Theme) {
+    let width = area.width.min(56);
+    let height = 5u16.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let modal = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    Clear.render(modal, buf);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.active)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(" quit ", theme.title));
+    Paragraph::new("Stop proxy?\n  y  confirm   n/Esc cancel   Ctrl-C force")
+        .block(block)
+        .render(modal, buf);
 }
 
 /// Narrow or short terminal: only the focused panel fills the body (Tab cycles).
@@ -494,16 +523,26 @@ fn turn_detail_text(snapshot: &Snapshot, app: &App) -> String {
     } else {
         request.diagnostics.request_fingerprint.as_str()
     };
+    let provider = if request.provider.is_empty() {
+        "-"
+    } else {
+        request.provider.as_str()
+    };
     format!(
-        "Turn {} ({kind_label})\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration: {:.1}s  tokens: {}\n  request: {} B · {} items · fp {}\n  latency_ms: prepare {} · credential {} · headers {} · first_chunk {}\n  retry_candidate: {}\n  failure: {failure}\n  error: {error}",
+        "Turn {} ({kind_label})\n  session: {}\n  provider: {provider}\n  model: {} (requested {})\n  phase: {}  status: {}  attempt: {}\n  duration: {:.1}s  wall {:.1} t/s  gen {:.1} t/s\n  tokens: {}  stream: {} B / {} chunks\n  request: {} B · {} items · fp {}\n  latency_ms: prepare {} · credential {} · headers {} · first_chunk {}\n  retry_candidate: {}\n  failure: {failure}\n  error: {error}",
         request.id,
         request.session_id,
         request.model,
         request.requested_model,
+        request.phase.as_str(),
         request.status,
         request.attempt,
         request.duration().as_secs_f64(),
+        request.tokens_per_second(),
+        request.generation_tokens_per_second(),
         request.output_tokens,
+        request.streamed_bytes,
+        request.stream_chunks,
         request.diagnostics.request_body_bytes,
         request.diagnostics.input_item_count,
         fingerprint,
@@ -551,8 +590,13 @@ fn failure_detail_text(snapshot: &Snapshot, app: &App) -> String {
         record.diagnostics.request_fingerprint.as_str()
     };
 
+    let provider = if record.provider.is_empty() {
+        "-"
+    } else {
+        record.provider.as_str()
+    };
     format!(
-        "Failure {}\n  ts: {}\n  kind: {}\n  session: {}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration_ms: {}  session_fail#: {}\n  error_type: {}\n  message: {}\n  response_id: {}\n  mapped: {}  lite: {}  fast: {}\n  auth_retried: {}  outputs: {}  capture_bytes: {}\n  request: {} B · {} items · fp {}\n  latency_ms: prepare {} · credential {} · headers {} · first_chunk {}\n  retry_candidate: {}",
+        "Failure {}\n  ts: {}\n  kind: {}\n  session: {}\n  provider: {provider}\n  model: {} (requested {})\n  status: {}  attempt: {}\n  duration_ms: {}  session_fail#: {}\n  error_type: {}\n  message: {}\n  response_id: {}\n  mapped: {}  lite: {}  fast: {}\n  auth_retried: {}  outputs: {}  capture_bytes: {}\n  request: {} B · {} items · fp {}\n  latency_ms: prepare {} · credential {} · headers {} · first_chunk {}\n  retry_candidate: {}",
         record.request_id,
         record.ts.to_rfc3339(),
         record.kind.as_str(),
@@ -642,6 +686,7 @@ mod tests {
             session_id: "sess-abc".into(),
             requested_model: "alias".into(),
             model: "gpt-test".into(),
+            provider: "codex".into(),
             status_code: 200,
             usage: None,
             output_tokens: 40,
@@ -660,6 +705,10 @@ mod tests {
             capture_bytes: 0,
             warn_on_cache_miss: false,
             diagnostics: Default::default(),
+            phase: crate::events::RequestPhase::Preparing,
+            streamed_bytes: 0,
+            stream_chunks: 0,
+            mark_generation_start: false,
         }
     }
 
@@ -776,11 +825,15 @@ mod tests {
             "metrics strip title missing on tall/wide terminal:\n{text}"
         );
         assert!(
-            text.contains("tok/s")
+            (text.contains("fleet") || text.contains("tok/s"))
                 && text.contains("fail%")
                 && text.contains("done")
                 && text.contains("cache"),
             "metrics strip labels missing:\n{text}"
+        );
+        assert!(
+            text.contains("gen/s") || text.contains("gen"),
+            "header should show generation rate label:\n{text}"
         );
     }
 
@@ -923,10 +976,10 @@ mod tests {
             text.contains("1ok/2f"),
             "done activity should show 1ok/2f:\n{text}"
         );
-        // Live fleet-average tok/s from session lifetime rates.
+        // Metrics strip fleet lifetime rate from session samples.
         assert!(
-            text.contains("tok/s") && !text.contains("tok/s 0.0"),
-            "tok/s should be non-zero from fixture session rates:\n{text}"
+            text.contains("fleet") && text.contains("20.0"),
+            "fleet lifetime rate should be non-zero from fixture session rates:\n{text}"
         );
     }
 
@@ -1019,8 +1072,8 @@ mod tests {
             "empty snapshot should still paint metrics strip:\n{text}"
         );
         assert!(
-            text.contains("tok/s") && text.contains("0.0"),
-            "cold-start tok/s should be 0.0:\n{text}"
+            (text.contains("fleet") || text.contains("gen/s")) && text.contains("0.0"),
+            "cold-start rates should be 0.0:\n{text}"
         );
         assert!(
             text.contains("fail%") && text.contains("0%"),
@@ -1305,6 +1358,7 @@ mod tests {
                     session_id: "sess-retry".into(),
                     requested_model: "a".into(),
                     model: "m".into(),
+                    provider: "codex".into(),
                     status_code: 200,
                     duration_ms: 100,
                     kind: FailureKind::ProxyAssemble,
@@ -1328,6 +1382,7 @@ mod tests {
                     session_id: "sess-retry".into(),
                     requested_model: "a".into(),
                     model: "m".into(),
+                    provider: "codex".into(),
                     status_code: 200,
                     duration_ms: 100,
                     kind: FailureKind::ProxyAssemble,
