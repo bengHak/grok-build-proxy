@@ -113,8 +113,10 @@ impl UpstreamIdentity {
         let session_id = first_valid_header(headers, &["x-grok-session-id"]);
         let conversation_id = first_valid_header(headers, &["x-grok-conv-id"]);
         // Lineage is a cache-routing namespace only (Goal/subagent children); it must never
-        // replace thread/session identity selection below.
-        let lineage_id = first_valid_header(
+        // replace thread/session identity selection below. Select the first alias that is
+        // both a valid header and a legal cache key (≤64) so an overlong preferred alias
+        // does not consume the lineage slot and block remaining aliases.
+        let lineage_id = first_valid_cache_header(
             headers,
             &[
                 "x-grok-cache-lineage",
@@ -146,7 +148,6 @@ impl UpstreamIdentity {
             });
         let cache_key = explicit_cache_key.or_else(|| {
             lineage_id
-                .filter(|value| valid_cache_key(value))
                 .or_else(|| conversation_id.filter(|value| valid_cache_key(value)))
                 .or_else(|| session_id.filter(|value| valid_cache_key(value)))
                 .map(str::to_owned)
@@ -164,6 +165,14 @@ fn first_valid_header<'a>(headers: &'a HeaderMap, keys: &[&str]) -> Option<&'a s
     keys.iter()
         .filter_map(|key| headers.get(*key)?.to_str().ok())
         .find(|value| valid_header(value))
+}
+
+/// First header among `keys` that is both a valid header and a legal cache key (≤64).
+/// Used for cache-lineage aliases so an overlong preferred value does not block later aliases.
+fn first_valid_cache_header<'a>(headers: &'a HeaderMap, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| headers.get(*key)?.to_str().ok())
+        .find(|value| valid_header(value) && valid_cache_key(value))
 }
 
 fn valid_cache_key(value: &str) -> bool {
@@ -3068,6 +3077,48 @@ mod tests {
 
         // Alias headers share the lineage slot and still beat conv.
         headers.insert("x-cache-lineage", HeaderValue::from_static("alias-lineage"));
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(identity.cache_key.as_deref(), Some("alias-lineage"));
+        assert_eq!(identity.thread_id, "session-child");
+    }
+
+    #[test]
+    fn overlong_primary_lineage_falls_through_to_valid_alias() {
+        // Preferred lineage is a valid header (≤512, non-empty) but not a legal cache key
+        // (>64 Unicode scalars). Resolution must continue to remaining lineage aliases
+        // instead of dropping the whole lineage slot and falling through to conv/session.
+        let overlong_primary = "L".repeat(65);
+        assert!(overlong_primary.chars().count() > 64);
+        assert!(overlong_primary.len() <= 512);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("session-child"),
+        );
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("conversation-child"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage",
+            HeaderValue::from_str(&overlong_primary).unwrap(),
+        );
+        headers.insert("x-cache-lineage", HeaderValue::from_static("alias-lineage"));
+        headers.insert("x-grok-req-id", HeaderValue::from_static("request-unique"));
+
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(
+            identity.cache_key.as_deref(),
+            Some("alias-lineage"),
+            "overlong preferred lineage must not block a legal secondary alias"
+        );
+        // Thread/session identity is unchanged by lineage.
+        assert_eq!(identity.thread_id, "session-child");
+        assert_eq!(identity.request_id, "request-unique");
+
+        // Missing preferred still falls through to the secondary alias (alias-share-slot).
+        headers.remove("x-grok-cache-lineage");
         let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
         assert_eq!(identity.cache_key.as_deref(), Some("alias-lineage"));
         assert_eq!(identity.thread_id, "session-child");
