@@ -9,7 +9,7 @@ Priority order:
 
 1. Body `prompt_cache_key` (authoritative)
 2. Header `x-grok-conv-id`
-3. Header `x-grok-cache-lineage` (or `x-cache-lineage`)
+3. Cache lineage: `x-grok-cache-lineage`, `x-grok-cache-lineage-id`, or `x-cache-lineage`
 4. Header `x-grok-session-id`
 
 Request IDs and proxy-generated UUIDs are **never** used as cache keys.

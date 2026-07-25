@@ -24,7 +24,7 @@ use std::{
     net::IpAddr,
     sync::{Arc, OnceLock},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 pub use crate::events::{
     FailureKind, Observer, RequestDiagnostics, RequestEvent, RequestEventKind,
@@ -112,6 +112,16 @@ impl UpstreamIdentity {
     fn from_request(headers: &HeaderMap, body: &[u8], fallback: &str) -> Self {
         let session_id = first_valid_header(headers, &["x-grok-session-id"]);
         let conversation_id = first_valid_header(headers, &["x-grok-conv-id"]);
+        // Lineage is a cache-routing namespace only (Goal/subagent children); it must never
+        // replace thread/session identity selection below.
+        let lineage_id = first_valid_header(
+            headers,
+            &[
+                "x-grok-cache-lineage",
+                "x-grok-cache-lineage-id",
+                "x-cache-lineage",
+            ],
+        );
         let incoming_request_id = first_valid_header(headers, &["x-grok-req-id", "x-request-id"]);
         let thread_id = session_id
             .or(conversation_id)
@@ -120,8 +130,9 @@ impl UpstreamIdentity {
             .to_owned();
         let request_id = incoming_request_id.unwrap_or(fallback).to_owned();
 
-        // The body key is authoritative. Otherwise use only stable Grok identities;
-        // request IDs and the proxy-generated fallback must never become cache keys.
+        // Body key is authoritative. Fallbacks use only stable namespaces; request IDs and
+        // the proxy-generated fallback must never become cache keys.
+        // Priority: body prompt_cache_key → x-grok-conv-id → lineage → x-grok-session-id.
         let explicit_cache_key = serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|value| {
@@ -134,6 +145,7 @@ impl UpstreamIdentity {
             Some(value) => Some(value),
             None => conversation_id
                 .filter(|value| valid_cache_key(value))
+                .or_else(|| lineage_id.filter(|value| valid_cache_key(value)))
                 .or_else(|| session_id.filter(|value| valid_cache_key(value)))
                 .map(str::to_owned),
         };
@@ -713,6 +725,20 @@ fn append_lite_tool_batching_instruction(body: &mut Map<String, Value>) {
         format!("{existing}{separator}{LITE_TOOL_BATCHING_INSTRUCTION}").into(),
     );
 }
+/// Sort Responses Lite tools by `name` then `type` so identical tool sets produce a stable
+/// `additional_tools` prefix regardless of client emission order.
+fn sort_tools_for_cache_prefix(tools: &mut [Value]) {
+    tools.sort_by(|left, right| {
+        let left_name = left.get("name").and_then(Value::as_str).unwrap_or("");
+        let right_name = right.get("name").and_then(Value::as_str).unwrap_or("");
+        left_name.cmp(right_name).then_with(|| {
+            let left_type = left.get("type").and_then(Value::as_str).unwrap_or("");
+            let right_type = right.get("type").and_then(Value::as_str).unwrap_or("");
+            left_type.cmp(right_type)
+        })
+    });
+}
+
 fn apply_responses_lite(body: &mut Map<String, Value>) {
     body.insert("parallel_tool_calls".into(), false.into());
     for (key, name, value) in [
@@ -747,9 +773,10 @@ fn apply_responses_lite(body: &mut Map<String, Value>) {
         Some(v) => vec![v],
     };
     let mut prefix = Vec::new();
-    if let Some(Value::Array(tools)) = body.remove("tools")
+    if let Some(Value::Array(mut tools)) = body.remove("tools")
         && !tools.is_empty()
     {
+        sort_tools_for_cache_prefix(&mut tools);
         prefix.push(json!({"type":"additional_tools","role":"developer","tools":tools}));
     }
     if let Some(Value::String(i)) = body.remove("instructions")
@@ -1318,6 +1345,19 @@ impl Drop for StreamObserveGuard {
     }
 }
 
+/// Emit a content-free warning when a large input recorded zero cache reads.
+/// Threshold matches operator docs (`input_tokens >= 2048` and no cache hits).
+fn maybe_warn_prompt_cache_miss(request_id: &str, usage: &TokenUsage) {
+    if usage.input_tokens >= 2048 && usage.cached_input_tokens == 0 {
+        warn!(
+            request_id,
+            input_tokens = usage.input_tokens,
+            cached_input_tokens = usage.cached_input_tokens,
+            "prompt cache miss on large input"
+        );
+    }
+}
+
 fn observe_stream_end(
     observer: &Option<Arc<dyn Observer>>,
     mut event: RequestEvent,
@@ -1338,7 +1378,7 @@ fn observe_stream_end(
             .checked_div(usage.input_tokens)
             .unwrap_or(0);
         info!(
-            request_id = event.request_id,
+            request_id = %event.request_id,
             input_tokens = usage.input_tokens,
             cached_input_tokens = usage.cached_input_tokens,
             cache_write_tokens = usage.cache_write_tokens,
@@ -1347,6 +1387,7 @@ fn observe_stream_end(
             cache_read_percent,
             "prompt cache usage"
         );
+        maybe_warn_prompt_cache_miss(&event.request_id, &usage);
     }
 
     let diag = parse_capture_diagnostics(capture);
@@ -2970,6 +3011,181 @@ mod tests {
         assert_eq!(identity.thread_id, "proxy-request");
         assert_eq!(identity.request_id, "proxy-request");
         assert_eq!(identity.cache_key, None);
+    }
+
+    #[test]
+    fn cache_lineage_beats_session_but_not_conversation_or_thread_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("session-child"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage",
+            HeaderValue::from_static("parent-lineage"),
+        );
+        headers.insert("x-grok-req-id", HeaderValue::from_static("request-unique"));
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"model":"gpt-5.6-sol","input":"hi"}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.thread_id, "session-child");
+        assert_eq!(identity.request_id, "request-unique");
+        assert_eq!(identity.cache_key.as_deref(), Some("parent-lineage"));
+
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("conversation-stable"),
+        );
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(identity.thread_id, "session-child");
+        assert_eq!(identity.cache_key.as_deref(), Some("conversation-stable"));
+
+        // Alias headers share the lineage slot.
+        headers.remove("x-grok-cache-lineage");
+        headers.remove("x-grok-conv-id");
+        headers.insert("x-cache-lineage", HeaderValue::from_static("alias-lineage"));
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(identity.cache_key.as_deref(), Some("alias-lineage"));
+    }
+
+    #[test]
+    fn body_prompt_cache_key_beats_lineage() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("session-child"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage",
+            HeaderValue::from_static("parent-lineage"),
+        );
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("conversation-stable"),
+        );
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":"explicit-body-key"}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key.as_deref(), Some("explicit-body-key"));
+        // Thread identity still prefers session over lineage.
+        assert_eq!(identity.thread_id, "session-child");
+    }
+
+    #[test]
+    fn responses_lite_tools_sorted_independently_of_emission_order() {
+        let catalog = Catalog::default();
+        let model_map = ModelMap::default();
+        let first = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"function","name":"zeta_tool"},
+                {"type":"function","name":"alpha_tool"},
+                {"type":"custom","name":"alpha_tool"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let second = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"custom","name":"alpha_tool"},
+                {"type":"function","name":"alpha_tool"},
+                {"type":"function","name":"zeta_tool"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let first_body: Value = serde_json::from_slice(&first.body).unwrap();
+        let second_body: Value = serde_json::from_slice(&second.body).unwrap();
+        let first_tools = first_body["input"][0]["tools"].as_array().unwrap();
+        let second_tools = second_body["input"][0]["tools"].as_array().unwrap();
+        assert_eq!(first_tools, second_tools);
+        assert_eq!(first_tools[0]["name"], "alpha_tool");
+        assert_eq!(first_tools[0]["type"], "custom");
+        assert_eq!(first_tools[1]["name"], "alpha_tool");
+        assert_eq!(first_tools[1]["type"], "function");
+        assert_eq!(first_tools[2]["name"], "zeta_tool");
+        assert_eq!(first_tools[2]["type"], "function");
+    }
+
+    #[test]
+    fn large_input_zero_cache_warns_without_prompt_content() {
+        let output = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(output.clone())
+            .finish();
+        let mut event = sample_event();
+        event.request_id = "req-cache-miss".into();
+        event.error = "secret prompt body must never appear".into();
+        let usage = Some(crate::events::TokenUsage {
+            input_tokens: 2048,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 1,
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            observe_stream_end(
+                &None,
+                event,
+                StatusCode::OK,
+                br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage":{"input_tokens":2048,"output_tokens":1}}}
+
+"#,
+                usage,
+                None,
+            );
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("prompt cache miss on large input"),
+            "expected cache-miss warning, got: {text}"
+        );
+        assert!(text.contains("input_tokens=2048"));
+        assert!(text.contains("cached_input_tokens=0"));
+        assert!(!text.contains("secret prompt"));
+        assert!(!text.contains("must never appear"));
+
+        // Below threshold or non-zero cache should not warn.
+        let output = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(output.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            maybe_warn_prompt_cache_miss(
+                "req-hit",
+                &crate::events::TokenUsage {
+                    input_tokens: 4096,
+                    cached_input_tokens: 100,
+                    cache_write_tokens: 0,
+                    output_tokens: 1,
+                },
+            );
+            maybe_warn_prompt_cache_miss(
+                "req-small",
+                &crate::events::TokenUsage {
+                    input_tokens: 2047,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 1,
+                },
+            );
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !text.contains("prompt cache miss"),
+            "unexpected warning: {text}"
+        );
     }
 
     #[tokio::test]
