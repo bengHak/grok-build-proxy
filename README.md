@@ -326,19 +326,23 @@ models; dependent operations and non-Lite providers are unchanged.
 
 ## Prompt cache efficiency
 
-The proxy keeps Grok thread identity separate from prompt-cache routing. A valid
-client `prompt_cache_key` is preserved; otherwise the cache key falls back in
-this order:
+The proxy keeps Grok thread identity separate from prompt-cache routing. A
+non-empty valid client `prompt_cache_key` (≤64 characters) is preserved;
+otherwise the cache key falls back in this order:
 
-1. `x-grok-conv-id`
-2. cache lineage: `x-grok-cache-lineage`, `x-grok-cache-lineage-id`, or
+1. cache lineage: `x-grok-cache-lineage`, `x-grok-cache-lineage-id`, or
    `x-cache-lineage` (Goal/subagent children can reuse a parent cache namespace
-   without inheriting thread identity)
+   without inheriting thread identity; set this to the parent’s **resolved**
+   cache key)
+2. `x-grok-conv-id`
 3. `x-grok-session-id`
 
-The per-request `x-grok-req-id` and the proxy's generated request UUID are never
-used as cache keys. If no stable key is available, the proxy omits both
-`prompt_cache_key` and `x-session-affinity` rather than manufacturing one.
+An empty body `prompt_cache_key` is ignored and falls through to those headers.
+A non-empty body key always beats lineage. Lineage beats ambient child conv and
+session ids — the common Goal/subagent case. The per-request `x-grok-req-id` and
+the proxy's generated request UUID are never used as cache keys. If no stable
+key is available, the proxy omits both `prompt_cache_key` and
+`x-session-affinity` rather than manufacturing one.
 
 `session-id`, `thread-id`, and (when the client sends `client_metadata`)
 `client_metadata.session_id` and `client_metadata.thread_id` use
@@ -368,8 +372,10 @@ prompt-cache key as session affinity.
 When terminal usage is available, plain logs include `input_tokens`,
 `cached_input_tokens`, `cache_write_tokens`, `fresh_input_tokens`, and
 `cache_read_percent`. These metrics do not include prompt or response content.
-When `input_tokens >= 2048` and `cached_input_tokens == 0`, the proxy also emits
-a content-free warning so operators can investigate key or prefix stability.
+When `input_tokens >= 2048`, `cached_input_tokens == 0`, and
+`cache_write_tokens == 0`, the proxy also emits a content-free warning (including
+write/fresh counters) so operators can investigate key or prefix stability.
+Pure cold-start first writes (zero reads, non-zero writes) do not warn.
 
 `proxy_prepare_ms` covers body collection and request transformation before
 credential loading. `credential_ms` combines credential lock wait, file read,

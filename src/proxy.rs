@@ -130,25 +130,27 @@ impl UpstreamIdentity {
             .to_owned();
         let request_id = incoming_request_id.unwrap_or(fallback).to_owned();
 
-        // Body key is authoritative. Fallbacks use only stable namespaces; request IDs and
-        // the proxy-generated fallback must never become cache keys.
-        // Priority: body prompt_cache_key → x-grok-conv-id → lineage → x-grok-session-id.
+        // Body key is authoritative only when non-empty and ≤64 chars. Empty body keys fall
+        // through so Goal/subagent lineage (and other header fallbacks) still apply.
+        // Priority: body prompt_cache_key → lineage → x-grok-conv-id → x-grok-session-id.
+        // Request IDs and the proxy-generated fallback must never become cache keys.
+        // Lineage is cache-routing only; thread_id selection above never uses it.
         let explicit_cache_key = serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|value| {
                 value
                     .get("prompt_cache_key")
                     .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty() && valid_cache_key(value))
                     .map(str::to_owned)
             });
-        let cache_key = match explicit_cache_key {
-            Some(value) => Some(value),
-            None => conversation_id
+        let cache_key = explicit_cache_key.or_else(|| {
+            lineage_id
                 .filter(|value| valid_cache_key(value))
-                .or_else(|| lineage_id.filter(|value| valid_cache_key(value)))
+                .or_else(|| conversation_id.filter(|value| valid_cache_key(value)))
                 .or_else(|| session_id.filter(|value| valid_cache_key(value)))
-                .map(str::to_owned),
-        };
+                .map(str::to_owned)
+        });
 
         Self {
             thread_id,
@@ -1345,14 +1347,21 @@ impl Drop for StreamObserveGuard {
     }
 }
 
-/// Emit a content-free warning when a large input recorded zero cache reads.
-/// Threshold matches operator docs (`input_tokens >= 2048` and no cache hits).
+/// Emit a content-free warning when a large input recorded a true cache miss.
+///
+/// Threshold: `input_tokens >= 2048`, zero reads, and zero writes. A pure cold-start
+/// first write (`cached_input_tokens == 0` with `cache_write_tokens > 0`) is expected
+/// for a new cache namespace and is not treated as a miss. Warning fields stay
+/// content-free (ids + token counters only).
 fn maybe_warn_prompt_cache_miss(request_id: &str, usage: &TokenUsage) {
-    if usage.input_tokens >= 2048 && usage.cached_input_tokens == 0 {
+    if usage.input_tokens >= 2048 && usage.cached_input_tokens == 0 && usage.cache_write_tokens == 0
+    {
         warn!(
             request_id,
             input_tokens = usage.input_tokens,
             cached_input_tokens = usage.cached_input_tokens,
+            cache_write_tokens = usage.cache_write_tokens,
+            fresh_input_tokens = usage.fresh_input_tokens(),
             "prompt cache miss on large input"
         );
     }
@@ -3014,7 +3023,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_lineage_beats_session_but_not_conversation_or_thread_identity() {
+    fn cache_lineage_beats_conversation_and_session_but_not_thread_identity() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-grok-session-id",
@@ -3034,20 +3043,25 @@ mod tests {
         assert_eq!(identity.request_id, "request-unique");
         assert_eq!(identity.cache_key.as_deref(), Some("parent-lineage"));
 
+        // Explicit lineage overrides ambient child conv-id (Goal/subagent case).
         headers.insert(
             "x-grok-conv-id",
-            HeaderValue::from_static("conversation-stable"),
+            HeaderValue::from_static("conversation-child"),
         );
         let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
         assert_eq!(identity.thread_id, "session-child");
-        assert_eq!(identity.cache_key.as_deref(), Some("conversation-stable"));
+        assert_eq!(identity.cache_key.as_deref(), Some("parent-lineage"));
 
-        // Alias headers share the lineage slot.
+        // Without lineage, conv still beats session.
         headers.remove("x-grok-cache-lineage");
-        headers.remove("x-grok-conv-id");
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(identity.cache_key.as_deref(), Some("conversation-child"));
+
+        // Alias headers share the lineage slot and still beat conv.
         headers.insert("x-cache-lineage", HeaderValue::from_static("alias-lineage"));
         let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
         assert_eq!(identity.cache_key.as_deref(), Some("alias-lineage"));
+        assert_eq!(identity.thread_id, "session-child");
     }
 
     #[test]
@@ -3073,6 +3087,47 @@ mod tests {
         assert_eq!(identity.cache_key.as_deref(), Some("explicit-body-key"));
         // Thread identity still prefers session over lineage.
         assert_eq!(identity.thread_id, "session-child");
+    }
+
+    #[test]
+    fn empty_body_prompt_cache_key_falls_through_to_lineage() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("session-child"),
+        );
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("conversation-child"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage",
+            HeaderValue::from_static("parent-lineage"),
+        );
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key.as_deref(), Some("parent-lineage"));
+        assert_eq!(identity.thread_id, "session-child");
+
+        // Empty body with no lineage falls through to conv, then session.
+        headers.remove("x-grok-cache-lineage");
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"prompt_cache_key":""}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key.as_deref(), Some("conversation-child"));
+
+        headers.remove("x-grok-conv-id");
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"prompt_cache_key":""}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key.as_deref(), Some("session-child"));
     }
 
     #[test]
@@ -3150,10 +3205,12 @@ data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage"
         );
         assert!(text.contains("input_tokens=2048"));
         assert!(text.contains("cached_input_tokens=0"));
+        assert!(text.contains("cache_write_tokens=0"));
+        assert!(text.contains("fresh_input_tokens=2048"));
         assert!(!text.contains("secret prompt"));
         assert!(!text.contains("must never appear"));
 
-        // Below threshold or non-zero cache should not warn.
+        // Below threshold, non-zero reads, or pure cold-start write should not warn.
         let output = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
@@ -3177,6 +3234,15 @@ data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage"
                     input_tokens: 2047,
                     cached_input_tokens: 0,
                     cache_write_tokens: 0,
+                    output_tokens: 1,
+                },
+            );
+            maybe_warn_prompt_cache_miss(
+                "req-cold-write",
+                &crate::events::TokenUsage {
+                    input_tokens: 4096,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 512,
                     output_tokens: 1,
                 },
             );
