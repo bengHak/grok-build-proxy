@@ -24,7 +24,7 @@ use std::{
     net::IpAddr,
     sync::{Arc, OnceLock},
 };
-use tracing::info;
+use tracing::{info, warn};
 
 pub use crate::events::{
     FailureKind, Observer, RequestDiagnostics, RequestEvent, RequestEventKind,
@@ -112,6 +112,18 @@ impl UpstreamIdentity {
     fn from_request(headers: &HeaderMap, body: &[u8], fallback: &str) -> Self {
         let session_id = first_valid_header(headers, &["x-grok-session-id"]);
         let conversation_id = first_valid_header(headers, &["x-grok-conv-id"]);
+        // Lineage is a cache-routing namespace only (Goal/subagent children); it must never
+        // replace thread/session identity selection below. Select the first alias that is
+        // both a valid header and a legal cache key (≤64) so an overlong preferred alias
+        // does not consume the lineage slot and block remaining aliases.
+        let lineage_id = first_valid_cache_header(
+            headers,
+            &[
+                "x-grok-cache-lineage",
+                "x-grok-cache-lineage-id",
+                "x-cache-lineage",
+            ],
+        );
         let incoming_request_id = first_valid_header(headers, &["x-grok-req-id", "x-request-id"]);
         let thread_id = session_id
             .or(conversation_id)
@@ -120,23 +132,26 @@ impl UpstreamIdentity {
             .to_owned();
         let request_id = incoming_request_id.unwrap_or(fallback).to_owned();
 
-        // The body key is authoritative. Otherwise use only stable Grok identities;
-        // request IDs and the proxy-generated fallback must never become cache keys.
+        // Body key is authoritative only when non-empty and ≤64 chars. Empty body keys fall
+        // through so Goal/subagent lineage (and other header fallbacks) still apply.
+        // Priority: body prompt_cache_key → lineage → x-grok-conv-id → x-grok-session-id.
+        // Request IDs and the proxy-generated fallback must never become cache keys.
+        // Lineage is cache-routing only; thread_id selection above never uses it.
         let explicit_cache_key = serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|value| {
                 value
                     .get("prompt_cache_key")
                     .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty() && valid_cache_key(value))
                     .map(str::to_owned)
             });
-        let cache_key = match explicit_cache_key {
-            Some(value) => Some(value),
-            None => conversation_id
-                .filter(|value| valid_cache_key(value))
+        let cache_key = explicit_cache_key.or_else(|| {
+            lineage_id
+                .or_else(|| conversation_id.filter(|value| valid_cache_key(value)))
                 .or_else(|| session_id.filter(|value| valid_cache_key(value)))
-                .map(str::to_owned),
-        };
+                .map(str::to_owned)
+        });
 
         Self {
             thread_id,
@@ -150,6 +165,14 @@ fn first_valid_header<'a>(headers: &'a HeaderMap, keys: &[&str]) -> Option<&'a s
     keys.iter()
         .filter_map(|key| headers.get(*key)?.to_str().ok())
         .find(|value| valid_header(value))
+}
+
+/// First header among `keys` that is both a valid header and a legal cache key (≤64).
+/// Used for cache-lineage aliases so an overlong preferred value does not block later aliases.
+fn first_valid_cache_header<'a>(headers: &'a HeaderMap, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|key| headers.get(*key)?.to_str().ok())
+        .find(|value| valid_header(value) && valid_cache_key(value))
 }
 
 fn valid_cache_key(value: &str) -> bool {
@@ -618,6 +641,7 @@ pub struct TransformedRequest {
     pub provider: Provider,
     pub input_item_count: u32,
     pub request_fingerprint: String,
+    pub warn_on_cache_miss: bool,
 }
 pub fn transform_request(
     raw: &[u8],
@@ -679,6 +703,8 @@ fn transform_request_with_options(
     } else {
         object.entry("parallel_tool_calls").or_insert(true.into());
     }
+    let warn_on_cache_miss =
+        prompt_cache_miss_warning_enabled(&body, model.provider, &resolution.model);
     let input_item_count = body
         .get("input")
         .and_then(Value::as_array)
@@ -695,6 +721,7 @@ fn transform_request_with_options(
         provider: model.provider,
         input_item_count,
         request_fingerprint,
+        warn_on_cache_miss,
     })
 }
 
@@ -713,6 +740,75 @@ fn append_lite_tool_batching_instruction(body: &mut Map<String, Value>) {
         format!("{existing}{separator}{LITE_TOOL_BATCHING_INSTRUCTION}").into(),
     );
 }
+fn sort_json_keys(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(sort_json_keys),
+        Value::Object(values) => {
+            values.values_mut().for_each(sort_json_keys);
+            values.sort_keys();
+        }
+        _ => {}
+    }
+}
+
+/// Sort Responses Lite tools by `name`, `type`, then full definition so identical tool sets
+/// produce a stable `additional_tools` prefix regardless of client emission order.
+/// Only the tool object's own ephemeral `id` is removed (same as `normalize_input_item`
+/// for a tool entry) — nested schema fields such as `parameters.properties.id` must remain.
+fn sort_tools_for_cache_prefix(tools: &mut [Value]) {
+    for tool in tools.iter_mut() {
+        if let Some(object) = tool.as_object_mut() {
+            object.remove("id");
+        }
+        sort_json_keys(tool);
+    }
+    tools.sort_by_cached_key(|tool| {
+        (
+            tool.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            tool.get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            tool.to_string(),
+        )
+    });
+}
+
+fn prompt_cache_miss_warning_enabled(body: &Value, provider: Provider, model: &str) -> bool {
+    if provider != Provider::Codex || !is_gpt_5_6_or_later(model) {
+        return false;
+    }
+    body.pointer("/prompt_cache_options/mode")
+        .and_then(Value::as_str)
+        != Some("explicit")
+        || body
+            .get("input")
+            .is_some_and(contains_prompt_cache_breakpoint)
+}
+
+fn contains_prompt_cache_breakpoint(value: &Value) -> bool {
+    value.as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|part| {
+                        matches!(
+                            part.get("type").and_then(Value::as_str),
+                            Some("input_text" | "input_image" | "input_file")
+                        ) && part
+                            .pointer("/prompt_cache_breakpoint/mode")
+                            .and_then(Value::as_str)
+                            == Some("explicit")
+                    })
+                })
+        })
+    })
+}
+
 fn apply_responses_lite(body: &mut Map<String, Value>) {
     body.insert("parallel_tool_calls".into(), false.into());
     for (key, name, value) in [
@@ -747,9 +843,10 @@ fn apply_responses_lite(body: &mut Map<String, Value>) {
         Some(v) => vec![v],
     };
     let mut prefix = Vec::new();
-    if let Some(Value::Array(tools)) = body.remove("tools")
+    if let Some(Value::Array(mut tools)) = body.remove("tools")
         && !tools.is_empty()
     {
+        sort_tools_for_cache_prefix(&mut tools);
         prefix.push(json!({"type":"additional_tools","role":"developer","tools":tools}));
     }
     if let Some(Value::String(i)) = body.remove("instructions")
@@ -868,6 +965,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         attempt: 1,
         output_count: 0,
         capture_bytes: 0,
+        warn_on_cache_miss: transformed.warn_on_cache_miss,
         diagnostics: RequestDiagnostics {
             request_body_bytes: body.len() as u64,
             input_item_count: transformed.input_item_count,
@@ -1318,6 +1416,26 @@ impl Drop for StreamObserveGuard {
     }
 }
 
+/// Emit a content-free warning when a large input recorded a true cache miss.
+///
+/// Threshold: `input_tokens >= 2048`, zero reads, and zero writes. A pure cold-start
+/// first write (`cached_input_tokens == 0` with `cache_write_tokens > 0`) is expected
+/// for a new cache namespace and is not treated as a miss. Warning fields stay
+/// content-free (ids + token counters only).
+fn maybe_warn_prompt_cache_miss(request_id: &str, usage: &TokenUsage) {
+    if usage.input_tokens >= 2048 && usage.cached_input_tokens == 0 && usage.cache_write_tokens == 0
+    {
+        warn!(
+            request_id,
+            input_tokens = usage.input_tokens,
+            cached_input_tokens = usage.cached_input_tokens,
+            cache_write_tokens = usage.cache_write_tokens,
+            fresh_input_tokens = usage.fresh_input_tokens(),
+            "prompt cache miss on large input"
+        );
+    }
+}
+
 fn observe_stream_end(
     observer: &Option<Arc<dyn Observer>>,
     mut event: RequestEvent,
@@ -1338,7 +1456,7 @@ fn observe_stream_end(
             .checked_div(usage.input_tokens)
             .unwrap_or(0);
         info!(
-            request_id = event.request_id,
+            request_id = %event.request_id,
             input_tokens = usage.input_tokens,
             cached_input_tokens = usage.cached_input_tokens,
             cache_write_tokens = usage.cache_write_tokens,
@@ -1347,6 +1465,9 @@ fn observe_stream_end(
             cache_read_percent,
             "prompt cache usage"
         );
+        if event.warn_on_cache_miss {
+            maybe_warn_prompt_cache_miss(&event.request_id, &usage);
+        }
     }
 
     let diag = parse_capture_diagnostics(capture);
@@ -1736,10 +1857,19 @@ fn prepare_codex_request(
         body.get("model").and_then(Value::as_str).unwrap_or(""),
     )?;
     body.insert("store".into(), false.into());
-    if !body.contains_key("prompt_cache_key")
-        && let Some(cache_key) = &identity.cache_key
-    {
-        body.insert("prompt_cache_key".into(), cache_key.clone().into());
+    // Match UpstreamIdentity::from_request: only a non-empty ≤64-char body key is
+    // authoritative. Empty or otherwise non-authoritative values must not stay on the
+    // wire and block injection of the resolved lineage/conv/session cache key.
+    let body_key_authoritative = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty() && valid_cache_key(value));
+    if !body_key_authoritative {
+        if let Some(cache_key) = &identity.cache_key {
+            body.insert("prompt_cache_key".into(), cache_key.clone().into());
+        } else {
+            body.remove("prompt_cache_key");
+        }
     }
     match body.get("tool_choice") {
         None | Some(Value::Null) => {
@@ -1824,6 +1954,9 @@ fn prepare_codex_request(
                 true
             }
         });
+        // Re-sort after normalize_input_item so the final lite wire prefix is stable
+        // even when sort earlier ran while ephemeral ids were still present.
+        sort_tools_for_cache_prefix(&mut adopted);
         items.insert(
             0,
             json!({"type":"additional_tools","role":"developer","tools":adopted}),
@@ -2972,6 +3105,517 @@ mod tests {
         assert_eq!(identity.cache_key, None);
     }
 
+    #[test]
+    fn cache_lineage_beats_conversation_and_session_but_not_thread_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("session-child"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage",
+            HeaderValue::from_static("parent-lineage"),
+        );
+        headers.insert("x-grok-req-id", HeaderValue::from_static("request-unique"));
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"model":"gpt-5.6-sol","input":"hi"}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.thread_id, "session-child");
+        assert_eq!(identity.request_id, "request-unique");
+        assert_eq!(identity.cache_key.as_deref(), Some("parent-lineage"));
+
+        // Explicit lineage overrides ambient child conv-id (Goal/subagent case).
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("conversation-child"),
+        );
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(identity.thread_id, "session-child");
+        assert_eq!(identity.cache_key.as_deref(), Some("parent-lineage"));
+
+        // Without lineage, conv still beats session.
+        headers.remove("x-grok-cache-lineage");
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(identity.cache_key.as_deref(), Some("conversation-child"));
+
+        // Alias headers share the lineage slot and still beat conv.
+        headers.insert("x-cache-lineage", HeaderValue::from_static("alias-lineage"));
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(identity.cache_key.as_deref(), Some("alias-lineage"));
+        assert_eq!(identity.thread_id, "session-child");
+    }
+
+    #[test]
+    fn overlong_primary_lineage_falls_through_to_valid_alias() {
+        // Preferred lineage is a valid header (≤512, non-empty) but not a legal cache key
+        // (>64 Unicode scalars). Resolution must continue to remaining lineage aliases
+        // instead of dropping the whole lineage slot and falling through to conv/session.
+        let overlong_primary = "L".repeat(65);
+        assert!(overlong_primary.chars().count() > 64);
+        assert!(overlong_primary.len() <= 512);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("session-child"),
+        );
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("conversation-child"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage",
+            HeaderValue::from_str(&overlong_primary).unwrap(),
+        );
+        headers.insert("x-cache-lineage", HeaderValue::from_static("alias-lineage"));
+        headers.insert("x-grok-req-id", HeaderValue::from_static("request-unique"));
+
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(
+            identity.cache_key.as_deref(),
+            Some("alias-lineage"),
+            "overlong preferred lineage must not block a legal secondary alias"
+        );
+        // Thread/session identity is unchanged by lineage.
+        assert_eq!(identity.thread_id, "session-child");
+        assert_eq!(identity.request_id, "request-unique");
+
+        // Missing preferred still falls through to the secondary alias (alias-share-slot).
+        headers.remove("x-grok-cache-lineage");
+        let identity = UpstreamIdentity::from_request(&headers, b"{}", "proxy-request");
+        assert_eq!(identity.cache_key.as_deref(), Some("alias-lineage"));
+        assert_eq!(identity.thread_id, "session-child");
+    }
+
+    #[test]
+    fn body_prompt_cache_key_beats_lineage() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("session-child"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage",
+            HeaderValue::from_static("parent-lineage"),
+        );
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("conversation-stable"),
+        );
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":"explicit-body-key"}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key.as_deref(), Some("explicit-body-key"));
+        // Thread identity still prefers session over lineage.
+        assert_eq!(identity.thread_id, "session-child");
+    }
+
+    #[test]
+    fn empty_body_prompt_cache_key_falls_through_to_lineage() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-grok-session-id",
+            HeaderValue::from_static("session-child"),
+        );
+        headers.insert(
+            "x-grok-conv-id",
+            HeaderValue::from_static("conversation-child"),
+        );
+        headers.insert(
+            "x-grok-cache-lineage",
+            HeaderValue::from_static("parent-lineage"),
+        );
+        let raw = br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#;
+        let identity = UpstreamIdentity::from_request(&headers, raw, "proxy-request");
+        assert_eq!(identity.cache_key.as_deref(), Some("parent-lineage"));
+        assert_eq!(identity.thread_id, "session-child");
+
+        // prepare_codex_request must rewrite empty body keys to the resolved identity
+        // cache key so "" does not stay on the Codex wire.
+        let prepared = prepare_codex_request(raw, &identity, false).unwrap();
+        let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(value["prompt_cache_key"], "parent-lineage");
+
+        // Empty body with no lineage falls through to conv, then session.
+        headers.remove("x-grok-cache-lineage");
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"prompt_cache_key":""}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key.as_deref(), Some("conversation-child"));
+        let prepared = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            &identity,
+            false,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(value["prompt_cache_key"], "conversation-child");
+
+        headers.remove("x-grok-conv-id");
+        let identity = UpstreamIdentity::from_request(
+            &headers,
+            br#"{"prompt_cache_key":""}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key.as_deref(), Some("session-child"));
+        let prepared = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            &identity,
+            false,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(value["prompt_cache_key"], "session-child");
+
+        // Empty body with no resolved cache key is stripped, not left as "".
+        let identity = UpstreamIdentity::from_request(
+            &HeaderMap::new(),
+            br#"{"prompt_cache_key":""}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key, None);
+        let prepared = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            &identity,
+            false,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert!(value.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn responses_lite_tools_sorted_independently_of_emission_order() {
+        let catalog = Catalog::default();
+        let model_map = ModelMap::default();
+        let first = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"function","name":"zeta_tool"},
+                {"type":"function","name":"alpha_tool"},
+                {"type":"custom","name":"alpha_tool"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let second = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"custom","name":"alpha_tool"},
+                {"type":"function","name":"alpha_tool"},
+                {"type":"function","name":"zeta_tool"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let first_body: Value = serde_json::from_slice(&first.body).unwrap();
+        let second_body: Value = serde_json::from_slice(&second.body).unwrap();
+        let first_tools = first_body["input"][0]["tools"].as_array().unwrap();
+        let second_tools = second_body["input"][0]["tools"].as_array().unwrap();
+        assert_eq!(first_tools, second_tools);
+        assert_eq!(first_tools[0]["name"], "alpha_tool");
+        assert_eq!(first_tools[0]["type"], "custom");
+        assert_eq!(first_tools[1]["name"], "alpha_tool");
+        assert_eq!(first_tools[1]["type"], "function");
+        assert_eq!(first_tools[2]["name"], "zeta_tool");
+        assert_eq!(first_tools[2]["type"], "function");
+    }
+
+    /// Ephemeral nested `id` must not change post-prepare `additional_tools` order.
+    /// Production path: transform (sort) then prepare_codex_request (normalize + rebuild).
+    #[test]
+    fn prepare_lite_tool_order_ignores_ephemeral_ids() {
+        let catalog = Catalog::default();
+        let model_map = ModelMap::default();
+        let identity = UpstreamIdentity {
+            thread_id: "session".into(),
+            request_id: "request".into(),
+            cache_key: Some("conversation".into()),
+        };
+        // name empty, type identical (mcp): tertiary sort key is the full definition.
+        // After key-sort, `id` sorts before `server_label`, so differing ids can invert
+        // alpha vs zeta order unless ids are stripped before sort / on the final wire path.
+        let first = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"mcp","server_label":"zeta","server_url":"https://z.example/mcp","id":"id-z-early"},
+                {"type":"mcp","server_label":"alpha","server_url":"https://a.example/mcp","id":"id-a-late"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let second = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"mcp","server_label":"alpha","server_url":"https://a.example/mcp","id":"id-a-other"},
+                {"type":"mcp","server_label":"zeta","server_url":"https://z.example/mcp","id":"id-z-other"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        assert!(first.lite && second.lite);
+
+        let prepared_a = prepare_codex_request(&first.body, &identity, first.lite).unwrap();
+        let prepared_b = prepare_codex_request(&second.body, &identity, second.lite).unwrap();
+        let body_a: Value = serde_json::from_slice(&prepared_a.body).unwrap();
+        let body_b: Value = serde_json::from_slice(&prepared_b.body).unwrap();
+        let tools_a = body_a["input"][0]["tools"].as_array().expect("tools a");
+        let tools_b = body_b["input"][0]["tools"].as_array().expect("tools b");
+
+        assert_eq!(
+            serde_json::to_vec(tools_a).unwrap(),
+            serde_json::to_vec(tools_b).unwrap(),
+            "id-only differences must not change on-wire additional_tools bytes"
+        );
+        assert_eq!(tools_a, tools_b);
+        assert_eq!(tools_a[0]["server_label"], "alpha");
+        assert_eq!(tools_a[1]["server_label"], "zeta");
+        assert!(tools_a.iter().all(|t| t.get("id").is_none()));
+        assert!(tools_b.iter().all(|t| t.get("id").is_none()));
+    }
+
+    /// Sorting must drop only the tool entry's ephemeral top-level `id`, not JSON Schema
+    /// property names under `parameters.properties.id` (or similar nested keys).
+    #[test]
+    fn prepare_lite_preserves_schema_property_named_id() {
+        let catalog = Catalog::default();
+        let model_map = ModelMap::default();
+        let identity = UpstreamIdentity {
+            thread_id: "session".into(),
+            request_id: "request".into(),
+            cache_key: Some("conversation".into()),
+        };
+        let transformed = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {
+                    "id":"ephemeral-tool-id",
+                    "type":"function",
+                    "name":"lookup",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"id":{"type":"string"},"query":{"type":"string"}},
+                        "required":["id"]
+                    }
+                }
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        assert!(transformed.lite);
+        let prepared =
+            prepare_codex_request(&transformed.body, &identity, transformed.lite).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let tool = &body["input"][0]["tools"][0];
+        assert!(
+            tool.get("id").is_none(),
+            "ephemeral top-level tool id must be stripped"
+        );
+        assert_eq!(tool["name"], "lookup");
+        assert_eq!(
+            tool.pointer("/parameters/properties/id/type")
+                .and_then(Value::as_str),
+            Some("string"),
+            "schema property named id must survive sort + prepare"
+        );
+        let required = tool
+            .pointer("/parameters/required")
+            .and_then(Value::as_array)
+            .expect("required array");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("id")),
+            "required must still list id"
+        );
+    }
+
+    #[test]
+    fn responses_lite_mcp_tools_sorted_by_full_definition() {
+        let catalog = Catalog::default();
+        let model_map = ModelMap::default();
+        let first = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"mcp","server_label":"zeta","server_url":"https://z.example/mcp"},
+                {"type":"mcp","server_label":"alpha","server_url":"https://a.example/mcp"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let second = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"server_url":"https://a.example/mcp","server_label":"alpha","type":"mcp"},
+                {"server_url":"https://z.example/mcp","server_label":"zeta","type":"mcp"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let first_body: Value = serde_json::from_slice(&first.body).unwrap();
+        let second_body: Value = serde_json::from_slice(&second.body).unwrap();
+        let first_tools = first_body["input"][0]["tools"].as_array().unwrap();
+        let second_tools = second_body["input"][0]["tools"].as_array().unwrap();
+        assert_eq!(first_tools, second_tools);
+        assert_eq!(
+            serde_json::to_vec(first_tools).unwrap(),
+            serde_json::to_vec(second_tools).unwrap()
+        );
+        assert_eq!(first_tools[0]["server_label"], "alpha");
+        assert_eq!(first_tools[1]["server_label"], "zeta");
+    }
+
+    #[test]
+    fn cache_miss_warning_scope_matches_supported_cache_policy() {
+        let cases = [
+            (
+                r#"{"model":"gpt-5.6-sol","input":"hi"}"#,
+                true,
+                "GPT-5.6 implicit caching",
+            ),
+            (
+                r#"{"model":"gpt-5.6-sol","prompt_cache_options":{"mode":"explicit"},"input":"hi"}"#,
+                false,
+                "explicit mode without a breakpoint",
+            ),
+            (
+                r#"{"model":"gpt-5.6-sol","prompt_cache_options":{"mode":"explicit"},"input":[{"role":"user","content":[{"type":"input_text","text":"hi","prompt_cache_breakpoint":{"mode":"explicit"}}]}]}"#,
+                true,
+                "explicit mode with a breakpoint",
+            ),
+            (
+                r#"{"model":"gpt-5.6-sol","prompt_cache_options":{"mode":"explicit"},"input":"hi","tools":[{"type":"function","name":"inspect","parameters":{"type":"object","properties":{"prompt_cache_breakpoint":{"type":"string"}}}}]}"#,
+                false,
+                "tool schema property is not a cache breakpoint",
+            ),
+            (
+                r#"{"model":"gpt-5.5","input":"hi"}"#,
+                false,
+                "pre-GPT-5.6 without write-token reporting",
+            ),
+            (
+                r#"{"model":"k3","input":"hi"}"#,
+                false,
+                "Kimi without write-token reporting",
+            ),
+        ];
+
+        for (raw, expected, case) in cases {
+            let transformed =
+                transform_request(raw.as_bytes(), &Catalog::default(), &ModelMap::default())
+                    .unwrap();
+            assert_eq!(transformed.warn_on_cache_miss, expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn large_input_zero_cache_warns_without_prompt_content() {
+        let output = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(output.clone())
+            .finish();
+        let mut event = sample_event();
+        event.request_id = "req-cache-miss".into();
+        event.error = "secret prompt body must never appear".into();
+        event.warn_on_cache_miss = true;
+        let usage = Some(crate::events::TokenUsage {
+            input_tokens: 2048,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 1,
+        });
+        tracing::subscriber::with_default(subscriber, || {
+            observe_stream_end(
+                &None,
+                event,
+                StatusCode::OK,
+                br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage":{"input_tokens":2048,"output_tokens":1}}}
+
+"#,
+                usage,
+                None,
+            );
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("prompt cache miss on large input"),
+            "expected cache-miss warning, got: {text}"
+        );
+        assert!(text.contains("input_tokens=2048"));
+        assert!(text.contains("cached_input_tokens=0"));
+        assert!(text.contains("cache_write_tokens=0"));
+        assert!(text.contains("fresh_input_tokens=2048"));
+        assert!(!text.contains("secret prompt"));
+        assert!(!text.contains("must never appear"));
+
+        // Below threshold, non-zero reads, or pure cold-start write should not warn.
+        let output = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(output.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            observe_stream_end(
+                &None,
+                sample_event(),
+                StatusCode::OK,
+                br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_disabled","output":[]}}
+
+"#,
+                Some(crate::events::TokenUsage {
+                    input_tokens: 4096,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 1,
+                }),
+                None,
+            );
+            maybe_warn_prompt_cache_miss(
+                "req-hit",
+                &crate::events::TokenUsage {
+                    input_tokens: 4096,
+                    cached_input_tokens: 100,
+                    cache_write_tokens: 0,
+                    output_tokens: 1,
+                },
+            );
+            maybe_warn_prompt_cache_miss(
+                "req-small",
+                &crate::events::TokenUsage {
+                    input_tokens: 2047,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 0,
+                    output_tokens: 1,
+                },
+            );
+            maybe_warn_prompt_cache_miss(
+                "req-cold-write",
+                &crate::events::TokenUsage {
+                    input_tokens: 4096,
+                    cached_input_tokens: 0,
+                    cache_write_tokens: 512,
+                    output_tokens: 1,
+                },
+            );
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !text.contains("prompt cache miss"),
+            "unexpected warning: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn upstream_keeps_thread_request_and_cache_routing_identities_separate() {
         use crate::auth::Credentials;
@@ -3048,6 +3692,16 @@ mod tests {
                 vec![("x-grok-req-id", "request-only")],
                 r#"{"model":"gpt-5.6-sol","input":"hi"}"#,
             ),
+            // Empty body key must not block lineage injection on the wire.
+            (
+                vec![
+                    ("x-grok-session-id", "session-child"),
+                    ("x-grok-conv-id", "conversation-child"),
+                    ("x-grok-cache-lineage", "parent-lineage"),
+                    ("x-grok-req-id", "request-child"),
+                ],
+                r#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            ),
         ];
 
         for (headers, body) in scenarios {
@@ -3070,7 +3724,7 @@ mod tests {
         }
 
         let guard = captured.lock().unwrap();
-        assert_eq!(guard.len(), 3);
+        assert_eq!(guard.len(), 4);
 
         let (headers, body) = &guard[0];
         assert_eq!(headers["session-id"], "session-stable");
@@ -3097,6 +3751,15 @@ mod tests {
         assert!(!headers.contains_key("x-session-affinity"));
         assert!(body.get("prompt_cache_key").is_none());
         assert_eq!(body["client_metadata"]["session_id"], "request-only");
+
+        let (headers, body) = &guard[3];
+        assert_eq!(headers["session-id"], "session-child");
+        assert_eq!(headers["thread-id"], "session-child");
+        assert_eq!(headers["x-client-request-id"], "request-child");
+        assert_eq!(headers["x-session-affinity"], "parent-lineage");
+        assert_eq!(body["prompt_cache_key"], "parent-lineage");
+        assert_eq!(body["client_metadata"]["session_id"], "session-child");
+        assert_eq!(body["client_metadata"]["thread_id"], "session-child");
     }
 
     struct RecordingObserver {
@@ -3153,6 +3816,7 @@ mod tests {
             attempt: 1,
             output_count: 0,
             capture_bytes: 0,
+            warn_on_cache_miss: false,
             diagnostics: Default::default(),
         }
     }

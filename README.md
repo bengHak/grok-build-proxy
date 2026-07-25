@@ -326,9 +326,21 @@ models; dependent operations and non-Lite providers are unchanged.
 
 ## Prompt cache efficiency
 
-The proxy keeps Grok thread identity separate from prompt-cache routing. A valid
-client `prompt_cache_key` is preserved; otherwise the cache key falls back to
-`x-grok-conv-id`, then `x-grok-session-id`. The per-request `x-grok-req-id` and
+The proxy keeps Grok thread identity separate from prompt-cache routing. A
+non-empty valid client `prompt_cache_key` (≤64 characters) is preserved;
+otherwise the cache key falls back in this order:
+
+1. cache lineage: `x-grok-cache-lineage`, `x-grok-cache-lineage-id`, or
+   `x-cache-lineage` (Goal/subagent children can reuse a parent cache namespace
+   without inheriting thread identity; set this to the parent’s **resolved**
+   cache key — body `prompt_cache_key` if set, else lineage, else conv-id, else
+   session-id; nested children reuse the parent’s already-resolved string)
+2. `x-grok-conv-id`
+3. `x-grok-session-id`
+
+An empty body `prompt_cache_key` is ignored and falls through to those headers.
+A non-empty body key always beats lineage. Lineage beats ambient child conv and
+session ids — the common Goal/subagent case. The per-request `x-grok-req-id` and
 the proxy's generated request UUID are never used as cache keys. If no stable
 key is available, the proxy omits both `prompt_cache_key` and
 `x-session-affinity` rather than manufacturing one.
@@ -336,11 +348,19 @@ key is available, the proxy omits both `prompt_cache_key` and
 `session-id`, `thread-id`, and (when the client sends `client_metadata`)
 `client_metadata.session_id` and `client_metadata.thread_id` use
 `x-grok-session-id`, then `x-grok-conv-id`, then the incoming request ID, and
-finally the proxy-generated request ID. Only the stable session and conversation
-identities are eligible as fallback cache keys. `x-session-affinity` is
-deliberately allowed to carry the separate cache key because it is a routing
-hint; `x-client-request-id` preserves the incoming request ID. Public Grok Build
-does not send a cache-lineage header, so none is supported here.
+finally the proxy-generated request ID. Lineage headers affect only the cache
+key, never thread/session identity. `x-session-affinity` is deliberately
+allowed to carry the separate cache key because it is a routing hint;
+`x-client-request-id` preserves the incoming request ID.
+
+Responses Lite rebuilds tools into a leading `additional_tools` developer item.
+The proxy sorts those tools by `name`, `type`, then canonical full definition
+before send so identical tool sets — including multiple MCP tools without a
+`name` — produce a stable prompt prefix regardless of client emission order.
+Keep system/developer instructions and tool schemas stable across turns; put
+dynamic content after the shared prefix. See
+[`docs/prompt-cache-hits.md`](docs/prompt-cache-hits.md) for an operator
+checklist.
 
 On Codex routes, client cache policy fields pass through only when they match
 current OpenAI semantics. `prompt_cache_key` must be a string of at most 64
@@ -354,6 +374,13 @@ prompt-cache key as session affinity.
 When terminal usage is available, plain logs include `input_tokens`,
 `cached_input_tokens`, `cache_write_tokens`, `fresh_input_tokens`, and
 `cache_read_percent`. These metrics do not include prompt or response content.
+When `input_tokens >= 2048`, `cached_input_tokens == 0`, and
+`cache_write_tokens == 0`, the proxy also emits a content-free warning (including
+write/fresh counters) so operators can investigate key or prefix stability.
+Warnings are limited to GPT-5.6+ Codex requests with caching enabled: implicit
+mode, or explicit mode with a cache breakpoint. Providers and older models that
+do not report cache writes cannot be classified reliably and do not warn. Pure
+cold-start first writes (zero reads, non-zero writes) also do not warn.
 
 `proxy_prepare_ms` covers body collection and request transformation before
 credential loading. `credential_ms` combines credential lock wait, file read,
