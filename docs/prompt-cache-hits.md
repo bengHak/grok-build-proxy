@@ -22,8 +22,11 @@ with `400`.
 
 Child sessions often get a different `x-grok-session-id` and/or `x-grok-conv-id`
 even when they share the same system prompt and tool definitions as the parent.
-Set lineage to the parent’s **resolved** cache namespace (whatever the parent used
-as its effective cache key — body key if set, else conv-id, else session-id):
+Set lineage to the parent’s **resolved** cache namespace — the same priority the
+proxy uses for every request: non-empty valid body `prompt_cache_key`, else
+lineage, else `x-grok-conv-id`, else `x-grok-session-id`. Nested children should
+reuse the string the parent already resolved to (which may already be a
+grandparent lineage value), not merely the parent’s session or conv id:
 
 ```http
 x-grok-cache-lineage: <parent-resolved-cache-namespace>
@@ -80,8 +83,9 @@ logs prompt or response content.
 3. Send a stable non-empty `prompt_cache_key` or rely on conv/session headers for
    the whole conversation.
 4. For Goal/subagent children, set `x-grok-cache-lineage` to the parent’s
-   **resolved** cache key (not merely the parent session id if the parent used a
-   body key or conv-id). Lineage overrides child conv/session; a child body key
-   still overrides lineage.
+   **resolved** cache key using the full order (body `prompt_cache_key` →
+   lineage → conv-id → session-id). Reuse the parent’s already-resolved
+   namespace string when the parent itself inherited lineage. Lineage overrides
+   child conv/session; a child body key still overrides lineage.
 5. Watch `cache_read_percent` in logs / the serve monitor; treat large-input
    zero-read/zero-write warnings as real misses, not first-write noise.

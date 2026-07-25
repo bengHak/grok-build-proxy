@@ -751,10 +751,29 @@ fn sort_json_keys(value: &mut Value) {
     }
 }
 
+/// Drop nested `id` fields so ephemeral client ids cannot influence sort keys or
+/// the on-wire tool prefix. Mirrors `normalize_input_item` id stripping (array
+/// children) and also walks nested objects so tool-definition ids are cleared.
+fn strip_ids_from_json(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(strip_ids_from_json),
+        Value::Object(object) => {
+            object.remove("id");
+            object.values_mut().for_each(strip_ids_from_json);
+        }
+        _ => {}
+    }
+}
+
 /// Sort Responses Lite tools by `name`, `type`, then full definition so identical tool sets
 /// produce a stable `additional_tools` prefix regardless of client emission order.
+/// Volatile nested `id` fields are stripped before sorting so they cannot reorder tools
+/// that share empty/identical name+type (common for MCP tools).
 fn sort_tools_for_cache_prefix(tools: &mut [Value]) {
-    tools.iter_mut().for_each(sort_json_keys);
+    for tool in tools.iter_mut() {
+        strip_ids_from_json(tool);
+        sort_json_keys(tool);
+    }
     tools.sort_by_cached_key(|tool| {
         (
             tool.get("name")
@@ -1947,6 +1966,9 @@ fn prepare_codex_request(
                 true
             }
         });
+        // Re-sort after normalize_input_item so the final lite wire prefix is stable
+        // even when sort earlier ran while ephemeral ids were still present.
+        sort_tools_for_cache_prefix(&mut adopted);
         items.insert(
             0,
             json!({"type":"additional_tools","role":"developer","tools":adopted}),
@@ -3315,6 +3337,59 @@ mod tests {
         assert_eq!(first_tools[1]["type"], "function");
         assert_eq!(first_tools[2]["name"], "zeta_tool");
         assert_eq!(first_tools[2]["type"], "function");
+    }
+
+    /// Ephemeral nested `id` must not change post-prepare `additional_tools` order.
+    /// Production path: transform (sort) then prepare_codex_request (normalize + rebuild).
+    #[test]
+    fn prepare_lite_tool_order_ignores_ephemeral_ids() {
+        let catalog = Catalog::default();
+        let model_map = ModelMap::default();
+        let identity = UpstreamIdentity {
+            thread_id: "session".into(),
+            request_id: "request".into(),
+            cache_key: Some("conversation".into()),
+        };
+        // name empty, type identical (mcp): tertiary sort key is the full definition.
+        // After key-sort, `id` sorts before `server_label`, so differing ids can invert
+        // alpha vs zeta order unless ids are stripped before sort / on the final wire path.
+        let first = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"mcp","server_label":"zeta","server_url":"https://z.example/mcp","id":"id-z-early"},
+                {"type":"mcp","server_label":"alpha","server_url":"https://a.example/mcp","id":"id-a-late"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        let second = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {"type":"mcp","server_label":"alpha","server_url":"https://a.example/mcp","id":"id-a-other"},
+                {"type":"mcp","server_label":"zeta","server_url":"https://z.example/mcp","id":"id-z-other"}
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        assert!(first.lite && second.lite);
+
+        let prepared_a = prepare_codex_request(&first.body, &identity, first.lite).unwrap();
+        let prepared_b = prepare_codex_request(&second.body, &identity, second.lite).unwrap();
+        let body_a: Value = serde_json::from_slice(&prepared_a.body).unwrap();
+        let body_b: Value = serde_json::from_slice(&prepared_b.body).unwrap();
+        let tools_a = body_a["input"][0]["tools"].as_array().expect("tools a");
+        let tools_b = body_b["input"][0]["tools"].as_array().expect("tools b");
+
+        assert_eq!(
+            serde_json::to_vec(tools_a).unwrap(),
+            serde_json::to_vec(tools_b).unwrap(),
+            "id-only differences must not change on-wire additional_tools bytes"
+        );
+        assert_eq!(tools_a, tools_b);
+        assert_eq!(tools_a[0]["server_label"], "alpha");
+        assert_eq!(tools_a[1]["server_label"], "zeta");
+        assert!(tools_a.iter().all(|t| t.get("id").is_none()));
+        assert!(tools_b.iter().all(|t| t.get("id").is_none()));
     }
 
     #[test]

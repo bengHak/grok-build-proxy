@@ -333,7 +333,8 @@ otherwise the cache key falls back in this order:
 1. cache lineage: `x-grok-cache-lineage`, `x-grok-cache-lineage-id`, or
    `x-cache-lineage` (Goal/subagent children can reuse a parent cache namespace
    without inheriting thread identity; set this to the parent’s **resolved**
-   cache key)
+   cache key — body `prompt_cache_key` if set, else lineage, else conv-id, else
+   session-id; nested children reuse the parent’s already-resolved string)
 2. `x-grok-conv-id`
 3. `x-grok-session-id`
 
