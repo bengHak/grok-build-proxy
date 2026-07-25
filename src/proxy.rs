@@ -751,27 +751,15 @@ fn sort_json_keys(value: &mut Value) {
     }
 }
 
-/// Drop nested `id` fields so ephemeral client ids cannot influence sort keys or
-/// the on-wire tool prefix. Mirrors `normalize_input_item` id stripping (array
-/// children) and also walks nested objects so tool-definition ids are cleared.
-fn strip_ids_from_json(value: &mut Value) {
-    match value {
-        Value::Array(values) => values.iter_mut().for_each(strip_ids_from_json),
-        Value::Object(object) => {
-            object.remove("id");
-            object.values_mut().for_each(strip_ids_from_json);
-        }
-        _ => {}
-    }
-}
-
 /// Sort Responses Lite tools by `name`, `type`, then full definition so identical tool sets
 /// produce a stable `additional_tools` prefix regardless of client emission order.
-/// Volatile nested `id` fields are stripped before sorting so they cannot reorder tools
-/// that share empty/identical name+type (common for MCP tools).
+/// Only the tool object's own ephemeral `id` is removed (same as `normalize_input_item`
+/// for a tool entry) — nested schema fields such as `parameters.properties.id` must remain.
 fn sort_tools_for_cache_prefix(tools: &mut [Value]) {
     for tool in tools.iter_mut() {
-        strip_ids_from_json(tool);
+        if let Some(object) = tool.as_object_mut() {
+            object.remove("id");
+        }
         sort_json_keys(tool);
     }
     tools.sort_by_cached_key(|tool| {
@@ -3390,6 +3378,59 @@ mod tests {
         assert_eq!(tools_a[1]["server_label"], "zeta");
         assert!(tools_a.iter().all(|t| t.get("id").is_none()));
         assert!(tools_b.iter().all(|t| t.get("id").is_none()));
+    }
+
+    /// Sorting must drop only the tool entry's ephemeral top-level `id`, not JSON Schema
+    /// property names under `parameters.properties.id` (or similar nested keys).
+    #[test]
+    fn prepare_lite_preserves_schema_property_named_id() {
+        let catalog = Catalog::default();
+        let model_map = ModelMap::default();
+        let identity = UpstreamIdentity {
+            thread_id: "session".into(),
+            request_id: "request".into(),
+            cache_key: Some("conversation".into()),
+        };
+        let transformed = transform_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","tools":[
+                {
+                    "id":"ephemeral-tool-id",
+                    "type":"function",
+                    "name":"lookup",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"id":{"type":"string"},"query":{"type":"string"}},
+                        "required":["id"]
+                    }
+                }
+            ]}"#,
+            &catalog,
+            &model_map,
+        )
+        .unwrap();
+        assert!(transformed.lite);
+        let prepared =
+            prepare_codex_request(&transformed.body, &identity, transformed.lite).unwrap();
+        let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+        let tool = &body["input"][0]["tools"][0];
+        assert!(
+            tool.get("id").is_none(),
+            "ephemeral top-level tool id must be stripped"
+        );
+        assert_eq!(tool["name"], "lookup");
+        assert_eq!(
+            tool.pointer("/parameters/properties/id/type").and_then(Value::as_str),
+            Some("string"),
+            "schema property named id must survive sort + prepare"
+        );
+        let required = tool
+            .pointer("/parameters/required")
+            .and_then(Value::as_array)
+            .expect("required array");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("id")),
+            "required must still list id"
+        );
     }
 
     #[test]
