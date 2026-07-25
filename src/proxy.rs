@@ -1786,10 +1786,19 @@ fn prepare_codex_request(
         body.get("model").and_then(Value::as_str).unwrap_or(""),
     )?;
     body.insert("store".into(), false.into());
-    if !body.contains_key("prompt_cache_key")
-        && let Some(cache_key) = &identity.cache_key
-    {
-        body.insert("prompt_cache_key".into(), cache_key.clone().into());
+    // Match UpstreamIdentity::from_request: only a non-empty ≤64-char body key is
+    // authoritative. Empty or otherwise non-authoritative values must not stay on the
+    // wire and block injection of the resolved lineage/conv/session cache key.
+    let body_key_authoritative = body
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty() && valid_cache_key(value));
+    if !body_key_authoritative {
+        if let Some(cache_key) = &identity.cache_key {
+            body.insert("prompt_cache_key".into(), cache_key.clone().into());
+        } else {
+            body.remove("prompt_cache_key");
+        }
     }
     match body.get("tool_choice") {
         None | Some(Value::Null) => {
@@ -3104,13 +3113,16 @@ mod tests {
             "x-grok-cache-lineage",
             HeaderValue::from_static("parent-lineage"),
         );
-        let identity = UpstreamIdentity::from_request(
-            &headers,
-            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
-            "proxy-request",
-        );
+        let raw = br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#;
+        let identity = UpstreamIdentity::from_request(&headers, raw, "proxy-request");
         assert_eq!(identity.cache_key.as_deref(), Some("parent-lineage"));
         assert_eq!(identity.thread_id, "session-child");
+
+        // prepare_codex_request must rewrite empty body keys to the resolved identity
+        // cache key so "" does not stay on the Codex wire.
+        let prepared = prepare_codex_request(raw, &identity, false).unwrap();
+        let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(value["prompt_cache_key"], "parent-lineage");
 
         // Empty body with no lineage falls through to conv, then session.
         headers.remove("x-grok-cache-lineage");
@@ -3120,6 +3132,14 @@ mod tests {
             "proxy-request",
         );
         assert_eq!(identity.cache_key.as_deref(), Some("conversation-child"));
+        let prepared = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            &identity,
+            false,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(value["prompt_cache_key"], "conversation-child");
 
         headers.remove("x-grok-conv-id");
         let identity = UpstreamIdentity::from_request(
@@ -3128,6 +3148,30 @@ mod tests {
             "proxy-request",
         );
         assert_eq!(identity.cache_key.as_deref(), Some("session-child"));
+        let prepared = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            &identity,
+            false,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert_eq!(value["prompt_cache_key"], "session-child");
+
+        // Empty body with no resolved cache key is stripped, not left as "".
+        let identity = UpstreamIdentity::from_request(
+            &HeaderMap::new(),
+            br#"{"prompt_cache_key":""}"#,
+            "proxy-request",
+        );
+        assert_eq!(identity.cache_key, None);
+        let prepared = prepare_codex_request(
+            br#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            &identity,
+            false,
+        )
+        .unwrap();
+        let value: Value = serde_json::from_slice(&prepared.body).unwrap();
+        assert!(value.get("prompt_cache_key").is_none());
     }
 
     #[test]
@@ -3330,6 +3374,16 @@ data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage"
                 vec![("x-grok-req-id", "request-only")],
                 r#"{"model":"gpt-5.6-sol","input":"hi"}"#,
             ),
+            // Empty body key must not block lineage injection on the wire.
+            (
+                vec![
+                    ("x-grok-session-id", "session-child"),
+                    ("x-grok-conv-id", "conversation-child"),
+                    ("x-grok-cache-lineage", "parent-lineage"),
+                    ("x-grok-req-id", "request-child"),
+                ],
+                r#"{"model":"gpt-5.6-sol","input":"hi","prompt_cache_key":""}"#,
+            ),
         ];
 
         for (headers, body) in scenarios {
@@ -3352,7 +3406,7 @@ data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage"
         }
 
         let guard = captured.lock().unwrap();
-        assert_eq!(guard.len(), 3);
+        assert_eq!(guard.len(), 4);
 
         let (headers, body) = &guard[0];
         assert_eq!(headers["session-id"], "session-stable");
@@ -3379,6 +3433,15 @@ data: {"type":"response.completed","response":{"id":"resp_x","output":[],"usage"
         assert!(!headers.contains_key("x-session-affinity"));
         assert!(body.get("prompt_cache_key").is_none());
         assert_eq!(body["client_metadata"]["session_id"], "request-only");
+
+        let (headers, body) = &guard[3];
+        assert_eq!(headers["session-id"], "session-child");
+        assert_eq!(headers["thread-id"], "session-child");
+        assert_eq!(headers["x-client-request-id"], "request-child");
+        assert_eq!(headers["x-session-affinity"], "parent-lineage");
+        assert_eq!(body["prompt_cache_key"], "parent-lineage");
+        assert_eq!(body["client_metadata"]["session_id"], "session-child");
+        assert_eq!(body["client_metadata"]["thread_id"], "session-child");
     }
 
     struct RecordingObserver {
