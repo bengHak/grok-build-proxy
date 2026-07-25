@@ -3419,7 +3419,8 @@ mod tests {
         );
         assert_eq!(tool["name"], "lookup");
         assert_eq!(
-            tool.pointer("/parameters/properties/id/type").and_then(Value::as_str),
+            tool.pointer("/parameters/properties/id/type")
+                .and_then(Value::as_str),
             Some("string"),
             "schema property named id must survive sort + prepare"
         );
