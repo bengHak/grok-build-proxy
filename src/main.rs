@@ -38,6 +38,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Serve(ServeArgs),
+    /// Open the serve monitor offline with Dashboard fixture data (no bind/creds).
+    Demo,
     Auth(AuthArgs),
     Kimi(kimi_cli::KimiArgs),
     Doctor(DoctorArgs),
@@ -281,6 +283,7 @@ async fn run() -> Result<()> {
         let known = matches!(
             first.as_ref(),
             "serve"
+                | "demo"
                 | "auth"
                 | "doctor"
                 | "models"
@@ -306,6 +309,7 @@ async fn run() -> Result<()> {
     let cli = Cli::parse_from(args);
     match cli.command {
         Command::Serve(a) => serve(a).await,
+        Command::Demo => demo().await,
         Command::Auth(a) => auth_command(a).await,
         Command::Kimi(a) => {
             require_macos()?;
@@ -318,6 +322,33 @@ async fn run() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Offline monitor using Dashboard::observe fixtures — no listen port or credentials.
+async fn demo() -> Result<()> {
+    require_macos()?;
+    if !monitor::is_interactive() {
+        // Headless / CI: seed fixture and exit after proving store path works.
+        let dashboard = monitor::Dashboard::new();
+        dashboard.seed_demo_fixture();
+        let snap = dashboard.snapshot();
+        anyhow::ensure!(
+            !snap.sessions.is_empty() && (!snap.active.is_empty() || !snap.recent.is_empty()),
+            "demo fixture produced empty monitor state"
+        );
+        println!(
+            "demo fixture ok: sessions={} active={} recent={} failures={} (TTY required for interactive TUI)",
+            snap.sessions.len(),
+            snap.active.len(),
+            snap.recent.len(),
+            snap.failures.len()
+        );
+        return Ok(());
+    }
+    let dashboard = Arc::new(monitor::Dashboard::new());
+    dashboard.seed_demo_fixture();
+    monitor::run(dashboard, "demo://offline", VERSION).await?;
+    Ok(())
 }
 async fn serve(a: ServeArgs) -> Result<()> {
     require_macos()?;
@@ -403,15 +434,33 @@ async fn serve(a: ServeArgs) -> Result<()> {
         lite_tool_batching = a.lite_tool_batching,
         "proxy listening"
     );
+    // Shared shutdown: monitor confirm-quit / force Ctrl-C and OS Ctrl-C all drain axum.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = shutdown_rx => {}
+            }
         })
         .into_future();
     tokio::pin!(server);
     if monitor_enabled {
-        tokio::select! { result=&mut server=>result?, result=monitor::run(dashboard,&a.listen,VERSION)=>result? }
+        tokio::select! {
+            result = &mut server => {
+                result?;
+            }
+            result = monitor::run(dashboard, &a.listen, VERSION) => {
+                result?;
+                // Signal graceful drain; ignore if server already exited.
+                let _ = shutdown_tx.send(());
+                // Wait for axum to finish draining in-flight connections.
+                server.await?;
+            }
+        }
     } else {
+        // Keep sender alive until server completes so the oneshot is not dropped early.
+        let _hold = shutdown_tx;
         server.await?;
     }
     Ok(())

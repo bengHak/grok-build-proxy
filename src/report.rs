@@ -97,11 +97,17 @@ fn format_failure_md(index: usize, r: &FailureRecord) -> String {
     } else {
         r.response_id.as_str()
     };
+    let provider = if r.provider.is_empty() {
+        "-"
+    } else {
+        r.provider.as_str()
+    };
     format!(
         "\n### {index}. {etype}\n\
          - ts: {}\n\
          - request_id: {}\n\
          - session_id: {}\n\
+         - provider: {provider}\n\
          - model: {} → {}\n\
          - kind: {}\n\
          - status: {}\n\
@@ -179,6 +185,7 @@ fn failure_to_json(r: &FailureRecord) -> Value {
         "ts": r.ts.to_rfc3339(),
         "request_id": r.request_id,
         "session_id": r.session_id,
+        "provider": r.provider,
         "requested_model": r.requested_model,
         "model": r.model,
         "status_code": r.status_code,
@@ -416,6 +423,7 @@ mod tests {
             session_id: session.into(),
             requested_model: "alias".into(),
             model: "gpt-test".into(),
+            provider: "codex".into(),
             status_code: 502,
             duration_ms: 1823,
             kind,

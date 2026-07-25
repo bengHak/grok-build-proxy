@@ -1,5 +1,6 @@
-//! Left panel: active sessions only (id, model, requests, errors, tok/s).
+//! Left panel: active sessions only (id, provider, model, requests, errors, tok/s).
 
+use super::layout::LayoutTier;
 use super::truncate;
 use crate::monitor::theme::Theme;
 use crate::store::{Session, Snapshot};
@@ -46,6 +47,11 @@ impl Widget for SessionsPanel<'_> {
             .border_type(ratatui::widgets::BorderType::Rounded)
             .title(Span::styled(" sessions ", title_style));
 
+        let tier = LayoutTier::for_width(area.width);
+        let id_w = tier.session_id_width();
+        let model_w = tier.model_width();
+        let show_provider = tier.show_provider();
+
         let sessions = active_sessions(self.snapshot);
         let items: Vec<ListItem> = sessions
             .iter()
@@ -61,17 +67,41 @@ impl Widget for SessionsPanel<'_> {
                 } else {
                     Style::default()
                 };
-                let line = Line::from(Span::styled(
-                    format!(
-                        "{:<16} {:<14} r{:>3} e{:>3} {:>5.1}t/s{err_tag}",
-                        truncate(&s.id, 16),
-                        truncate(&s.last_model, 14),
-                        s.requests,
-                        s.errors,
-                        s.tokens_per_second()
-                    ),
-                    style,
-                ));
+                let provider = if s.last_provider.is_empty() {
+                    "?"
+                } else {
+                    s.last_provider.as_str()
+                };
+                let line = if show_provider {
+                    Line::from(Span::styled(
+                        format!(
+                            "{:<id_w$} {:<5} {:<model_w$} r{:>3} e{:>3} {:>5.1}t/s{err_tag}",
+                            truncate(&s.id, id_w),
+                            truncate(provider, 5),
+                            truncate(&s.last_model, model_w),
+                            s.requests,
+                            s.errors,
+                            s.tokens_per_second(),
+                            id_w = id_w,
+                            model_w = model_w,
+                        ),
+                        style,
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        format!(
+                            "{:<id_w$} {:<model_w$} r{:>3} e{:>3} {:>4.0}t{err_tag}",
+                            truncate(&s.id, id_w),
+                            truncate(&s.last_model, model_w),
+                            s.requests,
+                            s.errors,
+                            s.tokens_per_second(),
+                            id_w = id_w,
+                            model_w = model_w,
+                        ),
+                        style,
+                    ))
+                };
                 ListItem::new(line)
             })
             .collect();
