@@ -71,7 +71,8 @@ impl Request {
     }
 
     /// Generation-window rate: tokens after generation start / generation elapsed.
-    /// Falls back to wall-clock when generation has not started.
+    /// Falls back to wall-clock when generation has not started, or when the
+    /// generation window saturates to zero length (e.g. terminal Instant::now mark).
     pub fn generation_tokens_per_second(&self) -> f64 {
         let Some(gen_start) = self.generation_started_at else {
             return self.tokens_per_second();
@@ -84,7 +85,8 @@ impl Request {
         if seconds > 0.0 {
             tokens as f64 / seconds
         } else {
-            0.0
+            // Zero-length window is worse than unmarked — use wall-clock.
+            self.tokens_per_second()
         }
     }
 }
@@ -326,7 +328,24 @@ fn maybe_mark_generation(request: &mut Request, event: &RequestEvent) {
         || event.output_tokens > 0
         || event.usage.is_some()
     {
-        request.generation_started_at = Some(Instant::now());
+        // Prefer reconstructing generation start from first_chunk_ms so terminal-only
+        // mark paths still yield a positive generation window (not Instant::now() at end).
+        let first_chunk_ms = event
+            .diagnostics
+            .first_chunk_ms
+            .max(request.diagnostics.first_chunk_ms);
+        let gen_start = if first_chunk_ms > 0 {
+            request
+                .started_at
+                .checked_add(Duration::from_millis(first_chunk_ms))
+                .unwrap_or_else(Instant::now)
+        } else {
+            Instant::now()
+        };
+        request.generation_started_at = Some(gen_start);
+        // Baseline is pre-generation output on the request. Terminal apply must call
+        // this *before* overwriting output_tokens with the absolute final, so baseline
+        // is not the final count (which would collapse gen_tokens to 0).
         request.generation_initial_output_tokens = request.output_tokens;
     }
 }
@@ -750,14 +769,6 @@ impl Dashboard {
                 request.error = sanitize(&event.error);
                 request.error_type = sanitize(&event.error_type);
                 request.failure_kind = event.failure_kind;
-                request.usage = event.usage;
-                request.output_tokens = event.output_tokens;
-                request.ended_at = Some(Instant::now());
-                request.duration_ms = if event.duration_ms > 0 {
-                    event.duration_ms
-                } else {
-                    request.duration().as_millis() as u64
-                };
                 request.response_id = sanitize(&event.response_id);
                 request.mapped = event.mapped;
                 request.lite = event.lite;
@@ -766,8 +777,9 @@ impl Dashboard {
                 request.attempt = event.attempt.max(1);
                 request.output_count = event.output_count;
                 request.capture_bytes = event.capture_bytes;
+                // Diagnostics (incl. first_chunk_ms) before generation mark so terminal-only
+                // paths can reconstruct generation_started_at.
                 request.diagnostics = event.diagnostics.clone();
-                request.phase = event.phase;
                 if !event.provider.is_empty() {
                     request.provider = sanitize(&event.provider);
                 }
@@ -777,7 +789,22 @@ impl Dashboard {
                 if event.stream_chunks > request.stream_chunks {
                     request.stream_chunks = event.stream_chunks;
                 }
+                // Phase only advances — never regress Auth/Upstream/Streaming to Preparing
+                // when terminal publishers still send base_event.phase=Preparing.
+                if phase_rank(event.phase) >= phase_rank(request.phase) {
+                    request.phase = event.phase;
+                }
+                // Mark generation *before* final output_tokens / ended_at so baseline is the
+                // pre-terminal active count (usually 0) and first_chunk_ms can backdate start.
                 maybe_mark_generation(&mut request, &event);
+                request.usage = event.usage;
+                request.output_tokens = event.output_tokens;
+                request.ended_at = Some(Instant::now());
+                request.duration_ms = if event.duration_ms > 0 {
+                    event.duration_ms
+                } else {
+                    request.duration().as_millis() as u64
+                };
 
                 let duration_secs = request.duration().as_secs_f64();
                 let gen_secs = request
@@ -1098,6 +1125,119 @@ mod tests {
         );
         assert!(wall > 0.0 && wall < 15.0, "wall ~10 tok/s, got {wall}");
         assert!(gen_rate > 30.0, "gen ~50 tok/s, got {gen_rate}");
+    }
+
+    /// Terminal-only generation mark (no mid-flight Updated): baseline must not be final
+    /// tokens, and gen rate must be > 0 when output tokens exist (Kimi non-stream path).
+    #[test]
+    fn terminal_only_generation_mark_yields_nonzero_gen_window() {
+        let d = Dashboard::new();
+        let start_at = Instant::now() - Duration::from_secs(5);
+        let mut start = base_event(RequestEventKind::Started);
+        start.started_at = start_at;
+        d.observe(start);
+
+        let mut done = base_event(RequestEventKind::Completed);
+        done.started_at = start_at;
+        done.duration_ms = 5_000;
+        done.output_tokens = 80;
+        done.output_count = 1;
+        done.diagnostics.first_chunk_ms = 2_000; // generation after ~2s TTFT
+        done.mark_generation_start = true;
+        done.phase = RequestPhase::Preparing; // publisher still stuck at Preparing
+        d.observe(done);
+
+        let req = &d.snapshot().recent[0];
+        assert!(
+            req.generation_started_at.is_some(),
+            "terminal-only path must mark generation"
+        );
+        assert_eq!(
+            req.generation_initial_output_tokens, 0,
+            "baseline must be pre-final (0), not final output_tokens"
+        );
+        let gen_tokens = req
+            .output_tokens
+            .saturating_sub(req.generation_initial_output_tokens);
+        assert_eq!(gen_tokens, 80, "gen tokens must equal final output");
+        let gen_rate = req.generation_tokens_per_second();
+        assert!(
+            gen_rate > 0.0,
+            "gen rate must be non-zero with tokens; got {gen_rate}"
+        );
+        // ~80 tokens over ~3s generation window → well above 0
+        assert!(
+            gen_rate > 10.0,
+            "expected meaningful gen rate from first_chunk_ms reconstruction, got {gen_rate}"
+        );
+    }
+
+    /// Terminal must not regress an already-advanced phase to Preparing.
+    #[test]
+    fn terminal_does_not_regress_phase_to_preparing() {
+        let d = Dashboard::new();
+        d.observe(base_event(RequestEventKind::Started));
+        let mut upd = base_event(RequestEventKind::Updated);
+        upd.phase = RequestPhase::Streaming;
+        d.observe(upd);
+        assert_eq!(d.snapshot().active[0].phase, RequestPhase::Streaming);
+
+        let mut done = base_event(RequestEventKind::Completed);
+        done.phase = RequestPhase::Preparing; // base_event default from many publishers
+        d.observe(done);
+
+        let recent = &d.snapshot().recent[0];
+        assert_eq!(
+            recent.phase,
+            RequestPhase::Streaming,
+            "terminal Preparing must not overwrite advanced Streaming phase"
+        );
+    }
+
+    /// Zero-length generation window falls back to wall-clock (not 0.0).
+    #[test]
+    fn zero_length_generation_window_falls_back_to_wall_clock() {
+        let d = Dashboard::new();
+        let start_at = Instant::now() - Duration::from_secs(4);
+        let mut start = base_event(RequestEventKind::Started);
+        start.started_at = start_at;
+        d.observe(start);
+        // Force a zero-length generation window: mark at ended_at with baseline == final.
+        {
+            let mut state = lock_state(&d.inner);
+            let req = state.active.get_mut("req\n1").expect("active");
+            req.generation_started_at = Some(Instant::now());
+            req.generation_initial_output_tokens = 0;
+        }
+        let mut done = base_event(RequestEventKind::Completed);
+        done.started_at = start_at;
+        done.duration_ms = 4_000;
+        done.output_tokens = 40;
+        done.output_count = 1;
+        // Clear mark signals so maybe_mark_generation does not rewrite our zero window;
+        // but terminal apply will set ended_at ≈ generation_started_at.
+        done.mark_generation_start = false;
+        done.diagnostics.first_chunk_ms = 0;
+        done.output_tokens = 40;
+        d.observe(done);
+
+        // After complete, force generation_started_at == ended_at for a pure zero window.
+        {
+            let mut state = lock_state(&d.inner);
+            let req = state.recent.front_mut().expect("recent");
+            let ended = req.ended_at.expect("ended");
+            req.generation_started_at = Some(ended);
+            req.generation_initial_output_tokens = 0;
+            req.output_tokens = 40;
+        }
+        let req = &d.snapshot().recent[0];
+        let wall = req.tokens_per_second();
+        let gen_rate = req.generation_tokens_per_second();
+        assert!(wall > 0.0, "wall-clock rate should be positive, got {wall}");
+        assert!(
+            (gen_rate - wall).abs() < 1e-9,
+            "zero-length gen window must fall back to wall-clock: gen={gen_rate} wall={wall}"
+        );
     }
 
     #[test]
