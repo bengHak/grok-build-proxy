@@ -4191,7 +4191,6 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
