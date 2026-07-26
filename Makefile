@@ -26,7 +26,8 @@ prepare-dist:
 	rm -rf bin $(DIST_DIR)
 	mkdir -p bin $(DIST_DIR)
 
-dist: prepare-dist build-arm64 build-amd64
+dist: prepare-dist
+	$(MAKE) build-arm64 build-amd64
 	mkdir -p $(DIST_DIR)/arm64 $(DIST_DIR)/amd64
 	cp bin/$(BINARY)-darwin-arm64 $(DIST_DIR)/arm64/$(BINARY)
 	cp bin/$(BINARY)-darwin-amd64 $(DIST_DIR)/amd64/$(BINARY)
@@ -39,6 +40,8 @@ dist: prepare-dist build-arm64 build-amd64
 	$(MAKE) verify-dist
 
 verify-dist:
+	@test "$$(wc -l < $(DIST_DIR)/checksums.txt | tr -d ' ')" = "2"
+	@test "$$(awk 'NF == 2 && $$1 ~ /^[0-9a-f]{64}$$/ { print $$2 }' $(DIST_DIR)/checksums.txt)" = "$$(printf '%s\n' $(BINARY)_Darwin_arm64.tar.gz $(BINARY)_Darwin_amd64.tar.gz)"
 	cd $(DIST_DIR) && shasum -a 256 -c checksums.txt
 	@test "$$(tar -tzf $(DIST_DIR)/$(BINARY)_Darwin_arm64.tar.gz | LC_ALL=C sort)" = "$$(printf '%s\n' $(BINARY) LICENSE README.md | LC_ALL=C sort)"
 	@test "$$(tar -tzf $(DIST_DIR)/$(BINARY)_Darwin_amd64.tar.gz | LC_ALL=C sort)" = "$$(printf '%s\n' $(BINARY) LICENSE README.md | LC_ALL=C sort)"
