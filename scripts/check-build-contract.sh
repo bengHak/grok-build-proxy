@@ -34,4 +34,15 @@ invalid_actions=$(printf '%s\n' "$remote_actions" \
   | grep -vE '^[^@[:space:]]+@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)
 [ -z "$invalid_actions" ] || fail "GitHub Actions must be pinned to full commit SHAs:\n$invalid_actions"
 
+grep -q 'tags:' .github/workflows/release.yml || fail 'release must be tag-triggered'
+if grep -qE 'workflow_dispatch:|branches:' .github/workflows/release.yml; then
+  fail 'release must not allow manual or branch triggers'
+fi
+grep -q 'uses: ./.github/workflows/quality.yml' .github/workflows/release.yml || fail 'release must call quality workflow'
+grep -q 'upload_dist: true' .github/workflows/release.yml || fail 'release must request validated artifacts'
+grep -q 'Release .* already exists' .github/workflows/release.yml || fail 'release must reject an existing release'
+if grep -qE -- '--clobber|gh release upload|make dist|cargo (build|test|clippy)' .github/workflows/release.yml; then
+  fail 'release publish path must not overwrite or rebuild'
+fi
+
 printf 'build contract ok: version %s\n' "$package_version"

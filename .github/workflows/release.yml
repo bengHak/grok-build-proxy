@@ -4,25 +4,21 @@ on:
   push:
     tags:
       - "v*"
-    branches:
-      - "release-v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Semantic version to release (for example 0.0.2)"
-        required: false
-        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  preflight:
     runs-on: macos-14
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -30,86 +26,78 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master, 2026-07-16
         with:
           toolchain: 1.88.0
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Resolve version and target
+      - name: Verify tag and Cargo package version
         id: version
         shell: bash
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            tag="${GITHUB_REF_NAME}"
-            version="${tag#v}"
-            target="${GITHUB_SHA}"
-            verify_tag=true
-          else
-            requested="${INPUT_VERSION:-}"
-            if [[ -z "${requested}" ]]; then
-              requested="$(tr -d '[:space:]' < VERSION)"
-            fi
-            version="${requested#v}"
-            tag="v${version}"
-            git fetch origin main
-            target="$(git rev-parse origin/main)"
-            verify_tag=false
-          fi
-
-          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid semantic version: ${version}" >&2
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "grok-build-proxy"))')"
+          expected="v${version}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "${expected}" ]]; then
+            echo "Release tag ${GITHUB_REF_NAME} does not match Cargo package version ${expected}" >&2
             exit 1
           fi
-
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "target=${target}" >> "${GITHUB_OUTPUT}"
-          echo "verify_tag=${verify_tag}" >> "${GITHUB_OUTPUT}"
-      - name: Test
-        run: cargo test --all-targets
-      - name: Build macOS release archives
-        run: make dist VERSION="${{ steps.version.outputs.version }}"
-      - name: Publish GitHub release
+          echo "tag=${expected}" >> "${GITHUB_OUTPUT}"
+      - name: Reject an existing release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
-          TARGET: ${{ steps.version.outputs.target }}
-          VERIFY_TAG: ${{ steps.version.outputs.verify_tag }}
         shell: bash
         run: |
           set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; refusing to replace published assets." >&2
+            exit 1
+          fi
 
-          assets=(
+  quality:
+    needs: preflight
+    permissions:
+      contents: read
+    uses: ./.github/workflows/quality.yml
+    with:
+      upload_dist: true
+
+  publish:
+    needs: [preflight, quality]
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: macos-dist
+          path: dist
+      - name: Validate downloaded release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
             dist/grok-build-proxy_Darwin_arm64.tar.gz
             dist/grok-build-proxy_Darwin_amd64.tar.gz
             dist/checksums.txt
           )
-
-          # If the tag/release was created empty (or assets were lost), upload rather
-          # than no-op. --clobber replaces stale archives on re-runs.
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; uploading assets."
-            gh release upload "${TAG}" "${assets[@]}" --clobber
-            exit 0
-          fi
-
-          args=(
-            "${assets[@]}"
-            --generate-notes
-            --latest
-            --title "${TAG}"
-          )
-
-          if [[ "${VERIFY_TAG}" == "true" ]]; then
-            args+=(--verify-tag)
-          else
-            args+=(--target "${TARGET}")
-          fi
-
-          gh release create "${TAG}" "${args[@]}"
-      - name: Remove temporary release branch
-        if: success() && github.ref_type == 'branch' && startsWith(github.ref_name, 'release-v')
+          for path in "${expected[@]}"; do
+            [[ -f "${path}" ]] || { echo "Missing release asset: ${path}" >&2; exit 1; }
+          done
+          [[ "$(find dist -type f | wc -l | tr -d ' ')" == "3" ]] || {
+            echo "Unexpected files in downloaded release artifact" >&2
+            find dist -type f -print >&2
+            exit 1
+          }
+          (cd dist && shasum -a 256 -c checksums.txt)
+      - name: Publish immutable GitHub release
         env:
-          BRANCH: ${{ github.ref_name }}
-        run: git push origin --delete "${BRANCH}"
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" \
+            dist/grok-build-proxy_Darwin_arm64.tar.gz \
+            dist/grok-build-proxy_Darwin_amd64.tar.gz \
+            dist/checksums.txt \
+            --generate-notes \
+            --latest \
+            --title "${TAG}" \
+            --verify-tag
