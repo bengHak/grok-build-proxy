@@ -39,7 +39,9 @@ impl Widget for Footer<'_> {
                 Span::styled(" Esc ", self.theme.highlight),
                 Span::styled("back ", self.theme.footer),
                 Span::styled(" q ", self.theme.highlight),
-                Span::styled("quit", self.theme.footer),
+                Span::styled("quit? ", self.theme.footer),
+                Span::styled(" ^C ", self.theme.highlight),
+                Span::styled("force", self.theme.footer),
             ])
         };
 

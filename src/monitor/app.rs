@@ -10,6 +10,8 @@ pub enum Mode {
     Dashboard,
     Help,
     Detail,
+    /// q/Q armed: y confirms quit, n/Esc cancels. Export keys are disabled.
+    ConfirmQuit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -258,6 +260,12 @@ impl App {
 
     /// Handle a key. Returns `true` when the monitor should quit.
     ///
+    /// Quit contract:
+    /// - `q`/`Q` arms [`Mode::ConfirmQuit`] (does not quit alone).
+    /// - In ConfirmQuit: `y`/`Y` confirms quit; `n`/`N`/`Esc`/`Backspace` cancels.
+    /// - `Ctrl-C` always force-quits (skips confirm).
+    /// - Export (`y`/`w`) only runs when [`Mode::Dashboard`] — ConfirmQuit `y` never exports.
+    ///
     /// On `f` with Failures focused, selection is reset to 0 and the in-handle clamp
     /// is skipped so callers must re-clamp with the **post-filter** `failures_len`
     /// (see `run` loop). Other keys clamp with the lengths passed here.
@@ -271,9 +279,30 @@ impl App {
         detail_len: usize,
         failures_len: usize,
     ) -> bool {
+        // Force quit always wins.
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return true;
+        }
+
+        if self.mode == Mode::ConfirmQuit {
+            match key.code {
+                KeyCode::Char('y' | 'Y') => return true,
+                KeyCode::Char('n' | 'N')
+                | KeyCode::Esc
+                | KeyCode::Backspace
+                | KeyCode::Char('q' | 'Q') => {
+                    self.mode = Mode::Dashboard;
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         match key.code {
-            KeyCode::Char('q' | 'Q') => return true,
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+            KeyCode::Char('q' | 'Q') => {
+                self.mode = Mode::ConfirmQuit;
+                return false;
+            }
             KeyCode::Char('?') => {
                 self.mode = if self.mode == Mode::Help {
                     Mode::Dashboard
@@ -531,14 +560,39 @@ mod tests {
     }
 
     #[test]
-    fn quit_keys() {
+    fn quit_keys_require_confirm_except_ctrl_c() {
         let mut app = App::new();
-        assert!(app.handle(key(KeyCode::Char('q')), 0, 0, 0));
+        assert!(!app.handle(key(KeyCode::Char('q')), 0, 0, 0));
+        assert_eq!(app.mode, Mode::ConfirmQuit);
+        assert!(!app.handle(key(KeyCode::Char('n')), 0, 0, 0));
+        assert_eq!(app.mode, Mode::Dashboard);
+
         let mut app = App::new();
-        assert!(app.handle(key(KeyCode::Char('Q')), 0, 0, 0));
+        assert!(!app.handle(key(KeyCode::Char('Q')), 0, 0, 0));
+        assert_eq!(app.mode, Mode::ConfirmQuit);
+        assert!(app.handle(key(KeyCode::Char('y')), 0, 0, 0));
+
+        let mut app = App::new();
+        app.mode = Mode::ConfirmQuit;
+        assert!(!app.handle(key(KeyCode::Esc), 0, 0, 0));
+        assert_eq!(app.mode, Mode::Dashboard);
+
         let mut app = App::new();
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert!(app.handle(ctrl_c, 0, 0, 0));
+    }
+
+    #[test]
+    fn confirm_quit_y_is_not_export_mode() {
+        // try_export only fires in Mode::Dashboard; ConfirmQuit y must quit only.
+        let mut app = App::new();
+        app.mode = Mode::ConfirmQuit;
+        assert_ne!(app.mode, Mode::Dashboard);
+        assert!(app.handle(key(KeyCode::Char('y')), 0, 0, 0));
+        // Y also confirms (export would use Y for JSON when Dashboard).
+        let mut app = App::new();
+        app.mode = Mode::ConfirmQuit;
+        assert!(app.handle(key(KeyCode::Char('Y')), 0, 0, 0));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Full-width failures panel: time, kind, session, error_type, status, attempt.
 //! Same-session failures within 30s are shown as estimated client-retry groups.
 
+use super::layout::LayoutTier;
 use super::truncate;
 use crate::events::FailureKind;
 use crate::monitor::app::FailureFilter;
@@ -200,6 +201,9 @@ impl Widget for FailuresPanel<'_> {
             .border_type(ratatui::widgets::BorderType::Rounded)
             .title(Span::styled(title, title_style));
 
+        let tier = LayoutTier::for_width(area.width);
+        let err_w = tier.failure_error_width();
+        let show_provider = tier.show_provider();
         let items: Vec<ListItem> = groups
             .iter()
             .flat_map(|g| {
@@ -213,6 +217,11 @@ impl Widget for FailuresPanel<'_> {
                     } else {
                         f.error_type.as_str()
                     };
+                    let provider = if f.provider.is_empty() {
+                        "?"
+                    } else {
+                        f.provider.as_str()
+                    };
                     let prefix = if estimated && i > 0 { "  ↳ " } else { "" };
                     let suffix = if estimated && i == 0 {
                         // Label estimated client-retry clusters (same session, ≤30s).
@@ -224,14 +233,28 @@ impl Widget for FailuresPanel<'_> {
                     } else {
                         String::new()
                     };
-                    let label = format!(
-                        "{prefix}{ts}  {:<18} {:<12} {:<22} {:>3} a{}{suffix}",
-                        truncate(kind, 18),
-                        truncate(&f.session_id, 12),
-                        truncate(err, 22),
-                        f.status_code,
-                        f.attempt
-                    );
+                    let label = if show_provider {
+                        format!(
+                            "{prefix}{ts}  {:<16} {:<5} {:<10} {:<err_w$} {:>3} a{}{suffix}",
+                            truncate(kind, 16),
+                            truncate(provider, 5),
+                            truncate(&f.session_id, 10),
+                            truncate(err, err_w),
+                            f.status_code,
+                            f.attempt,
+                            err_w = err_w,
+                        )
+                    } else {
+                        format!(
+                            "{prefix}{ts}  {:<14} {:<8} {:<err_w$} {:>3} a{}{suffix}",
+                            truncate(kind, 14),
+                            truncate(&f.session_id, 8),
+                            truncate(err, err_w),
+                            f.status_code,
+                            f.attempt,
+                            err_w = err_w,
+                        )
+                    };
                     ListItem::new(Line::from(Span::styled(
                         label,
                         kind_style(f.kind, self.theme),
@@ -270,6 +293,7 @@ mod tests {
             session_id: session.into(),
             requested_model: "a".into(),
             model: "m".into(),
+            provider: "codex".into(),
             status_code: 502,
             duration_ms: 10,
             kind,

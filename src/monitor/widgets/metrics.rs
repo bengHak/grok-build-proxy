@@ -53,11 +53,11 @@ pub fn format_cache_read_value(cached_input_tokens: u64, ratio: Option<f64>) -> 
     }
 }
 
-/// Mean of per-session lifetime tok/s over sessions that have a defined rate.
+/// Mean of per-session **lifetime** (wall-clock) tok/s over sessions with a defined rate.
 ///
 /// Sessions with `sample_seconds == 0` (no completed output yet) are excluded.
-/// Used for the live metrics/header number; the sparkline uses 1 Hz samples of
-/// this same value pushed by the monitor loop.
+/// Used for the metrics strip 1 Hz sparkline (labeled fleet), distinct from
+/// generation-window rates shown in the header / turn detail.
 pub fn fleet_avg_tok_s(snapshot: &Snapshot) -> f64 {
     fleet_avg_tok_s_from_sessions(&snapshot.sessions)
 }
@@ -71,6 +71,32 @@ pub fn fleet_avg_tok_s_from_sessions(sessions: &[Session]) -> f64 {
         if rate > 0.0 {
             total += rate;
             n += 1;
+        }
+    }
+    if n == 0 { 0.0 } else { total / n as f64 }
+}
+
+/// Mean of per-session **generation-window** tok/s (excludes TTFT/auth).
+///
+/// Distinct from [`fleet_avg_tok_s`] lifetime mean used by the metrics sparkline.
+pub fn fleet_avg_gen_tok_s(snapshot: &Snapshot) -> f64 {
+    let mut total = 0.0;
+    let mut n = 0usize;
+    for s in &snapshot.sessions {
+        let rate = s.generation_tokens_per_second();
+        if rate > 0.0 {
+            total += rate;
+            n += 1;
+        }
+    }
+    // Fall back to in-flight generation rates when no completed generation samples yet.
+    if n == 0 {
+        for r in &snapshot.active {
+            let rate = r.generation_tokens_per_second();
+            if rate > 0.0 {
+                total += rate;
+                n += 1;
+            }
         }
     }
     if n == 0 { 0.0 } else { total / n as f64 }
@@ -124,7 +150,8 @@ impl Widget for MetricsStrip<'_> {
             cols[0],
             buf,
             MetricCell {
-                label: "tok/s",
+                // Lifetime fleet rate (1 Hz samples); header uses gen/s separately.
+                label: "fleet",
                 value: format!("{:.1}", tok.avg_tok_s),
                 spark_values: &tok.tok_samples,
                 fixed_max: None,

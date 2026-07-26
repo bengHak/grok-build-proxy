@@ -28,8 +28,37 @@ impl TokenUsage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestEventKind {
     Started,
+    /// Mid-flight update: phase / progress only. Store mutates active map only.
+    Updated,
     Completed,
     Failed,
+}
+
+/// Live turn phase for hang diagnosis (no Compacting — not used by Grok Build).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RequestPhase {
+    #[default]
+    Preparing,
+    Auth,
+    Upstream,
+    Streaming,
+}
+
+impl RequestPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::Auth => "auth",
+            Self::Upstream => "upstream",
+            Self::Streaming => "streaming",
+        }
+    }
+}
+
+impl fmt::Display for RequestPhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Classification of a failed turn for monitor/report surfaces.
@@ -91,6 +120,8 @@ pub struct RequestEvent {
     pub session_id: String,
     pub requested_model: String,
     pub model: String,
+    /// Provider wire label: `"codex"`, `"kimi"`, or empty when unknown.
+    pub provider: String,
     pub status_code: u16,
     /// Absent until an upstream usage payload is observed; explicit zero usage is `Some`.
     pub usage: Option<TokenUsage>,
@@ -112,6 +143,14 @@ pub struct RequestEvent {
     pub capture_bytes: u32,
     pub warn_on_cache_miss: bool,
     pub diagnostics: RequestDiagnostics,
+    /// Live phase for Updated/Started; terminal events keep last phase.
+    pub phase: RequestPhase,
+    /// Cumulative streamed body bytes observed mid-flight (Updated progress).
+    pub streamed_bytes: u64,
+    /// Cumulative stream chunks observed mid-flight (Updated progress).
+    pub stream_chunks: u64,
+    /// When true on Updated, mark generation window start if not already set.
+    pub mark_generation_start: bool,
 }
 
 pub trait Observer: Send + Sync {
@@ -138,6 +177,7 @@ impl RequestEvent {
             session_id: session_id.into(),
             requested_model: requested_model.into(),
             model: model.into(),
+            provider: String::new(),
             status_code: 0,
             usage: None,
             output_tokens: 0,
@@ -156,7 +196,27 @@ impl RequestEvent {
             capture_bytes: 0,
             warn_on_cache_miss: false,
             diagnostics: RequestDiagnostics::default(),
+            phase: RequestPhase::Preparing,
+            streamed_bytes: 0,
+            stream_chunks: 0,
+            mark_generation_start: false,
         }
+    }
+
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
+    }
+
+    pub fn with_phase(mut self, phase: RequestPhase) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    /// Mid-flight update: only active map may change in the store.
+    pub fn as_updated(mut self) -> Self {
+        self.kind = RequestEventKind::Updated;
+        self
     }
 
     pub fn with_duration(mut self) -> Self {

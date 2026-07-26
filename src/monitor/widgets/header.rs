@@ -1,7 +1,7 @@
-//! Top status bar: version, listen address, uptime, active, errors, tok/s.
+//! Top status bar: version, listen address, uptime, active, errors, gen tok/s.
 
 use crate::monitor::theme::Theme;
-use crate::monitor::widgets::metrics::fleet_avg_tok_s;
+use crate::monitor::widgets::metrics::fleet_avg_gen_tok_s;
 use crate::store::Snapshot;
 use ratatui::{
     buffer::Buffer,
@@ -22,9 +22,10 @@ pub struct Header<'a> {
 impl Widget for Header<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let active = self.snapshot.active.len();
-        // Canonical failure ring (cap 200); prefer over legacy `errors` (cap 50).
+        // Canonical failure ring; prefer over legacy `errors`.
         let errors = self.snapshot.failures.len();
-        let tok_s = fleet_avg_tok_s(self.snapshot);
+        // Generation-window rate (distinct from metrics strip fleet lifetime tok/s).
+        let gen_s = fleet_avg_gen_tok_s(self.snapshot);
         let uptime = format_uptime(self.uptime_secs);
 
         let line = Line::from(vec![
@@ -36,7 +37,7 @@ impl Widget for Header<'_> {
             Span::styled(format!(" up {uptime} "), self.theme.muted),
             Span::styled(format!(" active↑{active} "), self.theme.active),
             Span::styled(format!(" err●{errors} "), self.theme.fail),
-            Span::styled(format!(" {tok_s:.1} tok/s "), self.theme.ok),
+            Span::styled(format!(" {gen_s:.1} gen/s "), self.theme.ok),
         ]);
 
         let block = Block::default()
