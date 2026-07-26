@@ -4,6 +4,7 @@ mod failures;
 mod footer;
 mod header;
 mod help;
+pub(crate) mod layout;
 pub(crate) mod metrics;
 mod session_detail;
 mod sessions;

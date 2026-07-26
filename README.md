@@ -171,14 +171,24 @@ When standard input and output are attached to a terminal, `grok-build-proxy
 serve` (and the default `grok-build-proxy` command) opens an interactive monitor
 instead of scrolling logs. It shows **active sessions** only (in-flight
 requests), a **session detail** inspector for the session selected on the left
-(identity, counters, tok/s, last failure, workspace path, latest user-prompt
-preview, plus that session's active and recent turns), a metrics strip (`tok/s` = mean of per-session lifetime rates with a
-1 Hz sparkline history; rolling `fail%` and completion-outcome sparklines —
-distinct from the header `err●N` failure-ring count), and a failures panel
-classified from real proxy traffic. Prompt/path previews are sanitized, capped at
-256 characters, and kept only in the in-memory monitor store. The failure ring
-keeps the latest 200 records by default; set `GROK_BUILD_PROXY_FAILURE_CAP` to a
-positive integer to change that in-memory limit.
+(identity, provider Codex/Kimi, counters, lifetime + generation tok/s, last
+failure, workspace path, latest user-prompt preview, per-session output-token
+sparklines, plus that session's active and recent turns with live phase labels),
+a metrics strip (`fleet` = mean of per-session **lifetime** rates with a 1 Hz
+sparkline history; rolling `fail%` and completion-outcome sparklines — distinct
+from the header `err●N` failure-ring count and from header **`gen/s`**
+generation-window throughput), and a failures panel classified from real proxy
+traffic. Prompt/path previews are sanitized, capped at 256 characters, and kept
+only in the in-memory monitor store.
+
+Ring caps (in-memory only):
+
+| Env | Default | Meaning |
+|---|---|---|
+| `GROK_BUILD_PROXY_FAILURE_CAP` | 200 | Failure-ring records for the failures panel / export |
+| `GROK_BUILD_PROXY_RECENT_CAP` | 200 | Completed recent-turn ring (session detail history) |
+
+These are separate rings; do not conflate them.
 
 **Keybindings**
 
@@ -187,16 +197,28 @@ positive integer to change that in-memory limit.
 | `j` / `k` or `↓` / `↑` | Move selection within the focused panel |
 | `Tab` / `Shift-Tab` | Cycle panel focus: sessions → session detail → failures |
 | `f` | Cycle failure filter: All → ProxyAssemble → Upstream → Auth → Stream |
-| `y` / `Y` | Copy filtered failure report (markdown / JSON) to the clipboard |
+| `y` / `Y` | Copy filtered failure report (markdown / JSON) to the clipboard (Dashboard only) |
 | `w` / `W` | Write filtered failure report to disk (markdown / JSON) |
 | `Enter` | Open detail overlay for the selected session, turn, or failure |
-| `Esc` / `Backspace` | Close help or detail overlay |
+| `Esc` / `Backspace` | Close help, detail, or cancel quit confirm |
 | `?` | Toggle help overlay |
-| `q` / `Q` / `Ctrl-C` | Stop the proxy and restore the terminal |
+| `q` / `Q` | Arm quit confirm (`y` stop proxy, `n`/`Esc` cancel) |
+| `Ctrl-C` | Force quit (skips confirm; HTTP server still drains) |
 
 On a narrow terminal (width &lt; 80), only the focused panel is shown; `Tab`
-still switches panels. The metrics strip is hidden below 64 columns or when the
-terminal is too short to keep the body panels usable.
+still switches panels. Medium and wide terminals show denser columns (provider,
+phase, longer error types). The metrics strip is hidden below 64 columns or when
+the terminal is too short to keep the body panels usable.
+
+**Offline demo** (no listen port, no credentials):
+
+```sh
+grok-build-proxy demo
+```
+
+On a TTY this opens the same monitor UI with scripted `Dashboard::observe`
+fixtures (phases, Codex/Kimi providers, failures, cache). Without a TTY it seeds
+the fixture, prints a one-line summary, and exits 0 (CI-safe).
 
 **Failure report export**
 

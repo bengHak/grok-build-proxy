@@ -948,6 +948,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         session_id: session_id.clone(),
         requested_model: transformed.requested_model.clone(),
         model: transformed.model.clone(),
+        provider: transformed.provider.as_str().to_owned(),
         status_code: 0,
         usage: None,
         output_tokens: 0,
@@ -972,6 +973,10 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             request_fingerprint: transformed.request_fingerprint.clone(),
             ..Default::default()
         },
+        phase: crate::events::RequestPhase::Preparing,
+        streamed_bytes: 0,
+        stream_chunks: 0,
+        mark_generation_start: false,
     };
     if let Some(observer) = &s.0.observer {
         observer.observe(base_event.clone());
@@ -980,6 +985,12 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
             &session_context.last_prompt,
             &session_context.cwd,
         );
+        // Auth/credential phase begins as we enter send_upstream.
+        let mut auth_phase = base_event.clone().as_updated();
+        auth_phase.phase = crate::events::RequestPhase::Auth;
+        observer.observe(auth_phase);
+        // Keep base_event.phase in sync so observe_failure / terminal events are not Preparing.
+        base_event.phase = crate::events::RequestPhase::Auth;
     }
     let timed = match send_upstream(&s.0, &transformed, &incoming_headers, &identity, false).await {
         Ok(r) => r,
@@ -1011,6 +1022,12 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         timed.upstream_headers_ms,
         false,
     );
+    if let Some(observer) = &s.0.observer {
+        let mut upstream_phase = base_event.clone().as_updated();
+        upstream_phase.phase = crate::events::RequestPhase::Upstream;
+        observer.observe(upstream_phase);
+        base_event.phase = crate::events::RequestPhase::Upstream;
+    }
     let mut upstream_started_at = timed.upstream_started_at;
     let mut upstream = timed.response;
     if upstream.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -1148,6 +1165,8 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     } else if translate_kimi {
         // Non-stream Kimi: drain the upstream body while recording first-chunk latency.
         // `bytes().await` alone would leave first_chunk_ms at 0 ("not observed").
+        // Also publish Streaming + mark_generation_start on first chunk (same contract as
+        // StreamObserveGuard.record_first_chunk) so hang diagnosis and gen window advance.
         let mut source = upstream.bytes_stream();
         let mut upstream_body = Vec::new();
         let mut first_chunk_recorded = false;
@@ -1156,8 +1175,11 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
                 Ok(chunk) => {
                     if !first_chunk_recorded {
                         first_chunk_recorded = true;
-                        base_event.diagnostics.first_chunk_ms =
-                            upstream_started_at.elapsed().as_millis() as u64;
+                        observe_streaming_first_chunk(
+                            &observer,
+                            &mut base_event,
+                            upstream_started_at,
+                        );
                     }
                     upstream_body.extend_from_slice(&chunk);
                 }
@@ -1338,7 +1360,16 @@ struct StreamObserveGuard {
     usage: UsageAccumulator,
     first_chunk_recorded: bool,
     finished: bool,
+    stream_chunks: u64,
+    streamed_bytes: u64,
+    last_progress_at: Option<std::time::Instant>,
+    last_progress_bytes: u64,
 }
+
+/// Minimum interval between mid-stream Updated progress publishes.
+const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(250);
+/// Or publish when at least this many new body bytes have been seen.
+const PROGRESS_BYTE_THRESHOLD: u64 = 4096;
 
 impl StreamObserveGuard {
     fn new(
@@ -1355,6 +1386,10 @@ impl StreamObserveGuard {
             usage: UsageAccumulator::new(is_sse),
             first_chunk_recorded: false,
             finished: false,
+            stream_chunks: 0,
+            streamed_bytes: 0,
+            last_progress_at: None,
+            last_progress_bytes: 0,
         }
     }
 
@@ -1364,12 +1399,58 @@ impl StreamObserveGuard {
         }
         self.first_chunk_recorded = true;
         self.event.diagnostics.first_chunk_ms = upstream_started_at.elapsed().as_millis() as u64;
+        self.event.phase = crate::events::RequestPhase::Streaming;
+        self.event.mark_generation_start = true;
+        // Immediate phase publish so hang diagnosis shows Streaming before throttle window.
+        self.publish_progress(true);
     }
 
     /// Feed emitted bytes to usage extraction before retaining the bounded diagnostic tail.
     fn capture_chunk(&mut self, chunk: &[u8]) {
         self.usage.push(chunk);
         capture_tail(&mut self.capture, chunk);
+        self.stream_chunks = self.stream_chunks.saturating_add(1);
+        self.streamed_bytes = self.streamed_bytes.saturating_add(chunk.len() as u64);
+        self.event.stream_chunks = self.stream_chunks;
+        self.event.streamed_bytes = self.streamed_bytes;
+        self.event.capture_bytes = self.capture.len().min(u32::MAX as usize) as u32;
+        self.publish_progress(false);
+    }
+
+    fn publish_progress(&mut self, force: bool) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        if self.finished {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = force
+            || self
+                .last_progress_at
+                .is_none_or(|t| now.duration_since(t) >= PROGRESS_THROTTLE)
+            || self.streamed_bytes.saturating_sub(self.last_progress_bytes)
+                >= PROGRESS_BYTE_THRESHOLD;
+        if !due {
+            return;
+        }
+        self.last_progress_at = Some(now);
+        self.last_progress_bytes = self.streamed_bytes;
+        let mut progress = self.event.clone().as_updated();
+        progress.phase = if self.first_chunk_recorded {
+            crate::events::RequestPhase::Streaming
+        } else {
+            crate::events::RequestPhase::Upstream
+        };
+        progress.streamed_bytes = self.streamed_bytes;
+        progress.stream_chunks = self.stream_chunks;
+        progress.mark_generation_start = self.first_chunk_recorded;
+        // Best-effort live output estimate from partial usage when available.
+        if let Some(usage) = self.usage.current() {
+            progress.output_tokens = usage.output_tokens;
+            progress.usage = Some(usage);
+        }
+        observer.observe(progress);
     }
 
     fn finish(&mut self, stream_io_error: Option<String>) {
@@ -1378,6 +1459,11 @@ impl StreamObserveGuard {
         }
         self.finished = true;
         let usage = self.usage.finish();
+        self.event.streamed_bytes = self.streamed_bytes;
+        self.event.stream_chunks = self.stream_chunks;
+        if self.first_chunk_recorded {
+            self.event.phase = crate::events::RequestPhase::Streaming;
+        }
         observe_stream_end(
             &self.observer,
             self.event.clone(),
@@ -1432,6 +1518,24 @@ fn maybe_warn_prompt_cache_miss(request_id: &str, usage: &TokenUsage) {
             fresh_input_tokens = usage.fresh_input_tokens(),
             "prompt cache miss on large input"
         );
+    }
+}
+
+/// Record first upstream content chunk: Streaming phase, generation start, first_chunk_ms.
+/// Used by non-stream Kimi drain and shares the StreamObserveGuard first-chunk contract.
+fn observe_streaming_first_chunk(
+    observer: &Option<Arc<dyn Observer>>,
+    event: &mut RequestEvent,
+    upstream_started_at: std::time::Instant,
+) {
+    event.diagnostics.first_chunk_ms = upstream_started_at.elapsed().as_millis() as u64;
+    event.phase = crate::events::RequestPhase::Streaming;
+    event.mark_generation_start = true;
+    if let Some(obs) = observer {
+        let mut progress = event.clone().as_updated();
+        progress.phase = crate::events::RequestPhase::Streaming;
+        progress.mark_generation_start = true;
+        obs.observe(progress);
     }
 }
 
@@ -3065,6 +3169,19 @@ mod tests {
             .unwrap();
 
         let events = observer.events.lock().unwrap();
+        let streaming_updated = events.iter().find(|event| {
+            event.kind == RequestEventKind::Updated
+                && event.phase == crate::events::RequestPhase::Streaming
+                && event.mark_generation_start
+        });
+        assert!(
+            streaming_updated.is_some(),
+            "non-stream Kimi must publish Streaming Updated with mark_generation_start before terminal; events={:?}",
+            events
+                .iter()
+                .map(|e| (e.kind, e.phase, e.mark_generation_start))
+                .collect::<Vec<_>>()
+        );
         let completed = events
             .iter()
             .find(|event| {
@@ -3076,6 +3193,11 @@ mod tests {
             "non-stream Kimi must record first_chunk_ms, got {} (kind={:?})",
             completed.diagnostics.first_chunk_ms,
             completed.kind
+        );
+        assert_eq!(
+            completed.phase,
+            crate::events::RequestPhase::Streaming,
+            "terminal must carry Streaming phase from first-chunk advance"
         );
     }
 
@@ -3811,6 +3933,7 @@ data: {"type":"response.completed","response":{"id":"resp_disabled","output":[]}
             session_id: "sess".into(),
             requested_model: "alias".into(),
             model: "gpt-5.6-sol".into(),
+            provider: "codex".into(),
             status_code: 0,
             usage: None,
             output_tokens: 0,
@@ -3829,6 +3952,10 @@ data: {"type":"response.completed","response":{"id":"resp_disabled","output":[]}
             capture_bytes: 0,
             warn_on_cache_miss: false,
             diagnostics: Default::default(),
+            phase: crate::events::RequestPhase::Preparing,
+            streamed_bytes: 0,
+            stream_chunks: 0,
+            mark_generation_start: false,
         }
     }
 
@@ -4042,6 +4169,109 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
         assert_eq!(events[0].error_type, "auth_retry_failed");
     }
 
+    /// Terminal failure must carry advanced phase from base_event (Auth/Upstream), not Preparing.
+    #[test]
+    fn observe_failure_preserves_base_event_phase() {
+        use crate::auth::Credentials;
+        struct Creds;
+        #[async_trait::async_trait]
+        impl CredentialProvider for Creds {
+            async fn get(&self, _: bool) -> Result<Credentials> {
+                unreachable!()
+            }
+        }
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let config = ProxyConfig {
+            upstream_url: "http://127.0.0.1:9/responses".into(),
+            credentials: Arc::new(Creds),
+            kimi: None,
+            catalog: Catalog::default(),
+            model_map: ModelMap::default(),
+            client: reqwest::Client::new(),
+            client_token: String::new(),
+            version: "test".into(),
+            compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
+            responses_compat: CompatMode::Full,
+            lite_tool_batching: false,
+            observer: Some(obs.clone()),
+            max_body_bytes: 1024,
+        };
+        let mut base = sample_event();
+        base.phase = crate::events::RequestPhase::Auth;
+        observe_failure(
+            &config,
+            &base,
+            FailureKind::UpstreamConnect,
+            "upstream_connect",
+            "connect failed".into(),
+            StatusCode::BAD_GATEWAY,
+        );
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events[0].phase, crate::events::RequestPhase::Auth);
+        assert_eq!(events[0].kind, RequestEventKind::Failed);
+    }
+
+    #[test]
+    fn observe_stream_end_preserves_streaming_phase() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let observer: Option<Arc<dyn Observer>> = Some(obs.clone());
+        let mut event = sample_event();
+        event.phase = crate::events::RequestPhase::Streaming;
+        event.mark_generation_start = true;
+        let capture = br#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":"message","content":[{"type":"output_text","text":"hi"}]}]}}
+
+"#;
+        observe_stream_end(
+            &observer,
+            event,
+            StatusCode::OK,
+            capture,
+            Some(crate::events::TokenUsage {
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                cache_write_tokens: 0,
+                output_tokens: 5,
+            }),
+            None,
+        );
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events[0].kind, RequestEventKind::Completed);
+        assert_eq!(events[0].phase, crate::events::RequestPhase::Streaming);
+        assert!(events[0].mark_generation_start);
+    }
+
+    /// Non-stream Kimi first-chunk helper: Streaming + mark_generation_start + first_chunk_ms.
+    #[test]
+    fn observe_streaming_first_chunk_publishes_updated() {
+        let obs = Arc::new(RecordingObserver {
+            events: std::sync::Mutex::new(Vec::new()),
+        });
+        let observer: Option<Arc<dyn Observer>> = Some(obs.clone());
+        let mut event = sample_event();
+        event.phase = crate::events::RequestPhase::Upstream;
+        let upstream_started = std::time::Instant::now() - std::time::Duration::from_millis(150);
+        observe_streaming_first_chunk(&observer, &mut event, upstream_started);
+
+        assert_eq!(event.phase, crate::events::RequestPhase::Streaming);
+        assert!(event.mark_generation_start);
+        assert!(
+            event.diagnostics.first_chunk_ms >= 100,
+            "first_chunk_ms should reflect elapsed since upstream start, got {}",
+            event.diagnostics.first_chunk_ms
+        );
+
+        let events = obs.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, RequestEventKind::Updated);
+        assert_eq!(events[0].phase, crate::events::RequestPhase::Streaming);
+        assert!(events[0].mark_generation_start);
+    }
+
     #[test]
     fn stream_observe_guard_emits_on_drop() {
         let obs = Arc::new(RecordingObserver {
@@ -4054,10 +4284,20 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             // drop without finish and without terminal → client disconnect path
         }
         let events = obs.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, RequestEventKind::Failed);
-        assert_eq!(events[0].failure_kind, Some(FailureKind::StreamIo));
-        assert!(events[0].error.contains("client disconnected"));
+        // Mid-stream Updated progress may precede the terminal Failed event.
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    RequestEventKind::Failed | RequestEventKind::Completed
+                )
+            })
+            .expect("terminal event");
+        assert_eq!(terminal.kind, RequestEventKind::Failed);
+        assert_eq!(terminal.failure_kind, Some(FailureKind::StreamIo));
+        assert!(terminal.error.contains("client disconnected"));
     }
 
     #[test]
@@ -4087,10 +4327,19 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             // Client drop after last chunk without finish() — must not force StreamIo.
         }
         let events = obs.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, RequestEventKind::Completed);
-        assert_eq!(events[0].failure_kind, None);
-        assert_eq!(events[0].response_id, "resp_ok");
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    RequestEventKind::Failed | RequestEventKind::Completed
+                )
+            })
+            .expect("terminal event");
+        assert_eq!(terminal.kind, RequestEventKind::Completed);
+        assert_eq!(terminal.failure_kind, None);
+        assert_eq!(terminal.response_id, "resp_ok");
     }
 
     #[test]
@@ -4113,9 +4362,18 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             guard.finish(None);
         }
         let events = obs.events.lock().unwrap();
-        assert_eq!(events.len(), 1);
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    RequestEventKind::Failed | RequestEventKind::Completed
+                )
+            })
+            .expect("terminal event");
         assert_eq!(
-            events[0].usage,
+            terminal.usage,
             Some(crate::events::TokenUsage {
                 input_tokens: 321,
                 cached_input_tokens: 123,
@@ -4123,7 +4381,7 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
                 output_tokens: 9,
             })
         );
-        assert_eq!(events[0].output_tokens, 9);
+        assert_eq!(terminal.output_tokens, 9);
     }
 
     #[test]
@@ -4141,8 +4399,18 @@ data: {"type":"error","error":{"type":"proxy_incomplete_output","message":"incom
             guard.capture_chunk(err);
         }
         let events = obs.events.lock().unwrap();
-        assert_eq!(events[0].kind, RequestEventKind::Failed);
-        assert_eq!(events[0].failure_kind, Some(FailureKind::ProxyAssemble));
-        assert_eq!(events[0].error_type, "proxy_incomplete_output");
+        let terminal = events
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    RequestEventKind::Failed | RequestEventKind::Completed
+                )
+            })
+            .expect("terminal event");
+        assert_eq!(terminal.kind, RequestEventKind::Failed);
+        assert_eq!(terminal.failure_kind, Some(FailureKind::ProxyAssemble));
+        assert_eq!(terminal.error_type, "proxy_incomplete_output");
     }
 }
