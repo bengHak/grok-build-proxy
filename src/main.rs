@@ -27,7 +27,7 @@ use std::{
 mod kimi_cli;
 
 const DEFAULT_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
-const VERSION: &str = env!("GROK_BUILD_PROXY_BUILD_VERSION");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
 #[command(name="grok-build-proxy",version=VERSION,about="Local Grok Build proxy for ChatGPT Codex and Kimi")]
