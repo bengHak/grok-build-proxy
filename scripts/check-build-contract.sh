@@ -26,9 +26,12 @@ make_version=$(make --no-print-directory print-version)
 python3 <<'PY'
 from pathlib import Path
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def fail(message):
@@ -188,6 +191,74 @@ def workflow_lines(path):
     return Path(path).read_text().splitlines()
 
 
+def top_level_mapping(lines, key):
+    matches = [
+        index
+        for index, raw in enumerate(lines)
+        if re.match(rf"^{re.escape(key)}:\s*(?:#.*)?$", raw)
+    ]
+    if not matches:
+        return {}
+    if len(matches) != 1:
+        fail(f"workflow must declare exactly one top-level {key} mapping")
+    start = matches[0] + 1
+    result = {}
+    index = start
+    while index < len(lines):
+        raw = lines[index]
+        if raw.strip() and indentation(raw) == 0:
+            break
+        match = re.match(r"^  ([^:#]+):\s*(.*)$", raw)
+        if match:
+            child_key = match.group(1).strip()
+            value = yaml_scalar(uncommented(match.group(2)))
+            if child_key in result:
+                fail(f"duplicate {child_key} keys under {key}")
+            if value:
+                result[child_key] = value
+            else:
+                nested = []
+                index += 1
+                while index < len(lines):
+                    nested_line = lines[index]
+                    if nested_line.strip() and indentation(nested_line) <= 2:
+                        index -= 1
+                        break
+                    nested.append(nested_line)
+                    index += 1
+                result[child_key] = nested if any(line.strip() for line in nested) else ""
+        index += 1
+    return result
+
+
+def mapping_keys(lines, indent):
+    keys = []
+    for raw in lines:
+        match = re.match(rf"^ {{{indent}}}([^ :#][^:#]*):\s*(.*)$", raw)
+        if match:
+            key = match.group(1).strip()
+            if key in keys:
+                fail(f"duplicate {key} keys in workflow structure")
+            keys.append(key)
+    return keys
+
+
+def child_block(lines, parent_indent, key):
+    start = None
+    for index, raw in enumerate(lines):
+        if re.match(rf"^ {{{parent_indent}}}{re.escape(key)}:\s*(?:#.*)?$", raw):
+            start = index + 1
+            break
+    if start is None:
+        return []
+    block = []
+    for raw in lines[start:]:
+        if raw.strip() and indentation(raw) <= parent_indent:
+            break
+        block.append(raw)
+    return block
+
+
 def workflow_uses(path, lines):
     found = []
     scalar_indent = None
@@ -306,7 +377,7 @@ def parse_steps(job_lines):
     steps = []
     for raw_step in raw_steps:
         step = {}
-        for key in ("name", "uses", "if", "shell"):
+        for key in ("name", "id", "uses", "if", "shell"):
             value = direct_value(raw_step, 8, key)
             if value is not None:
                 step[key] = value
@@ -355,11 +426,28 @@ if missing_workflows:
 
 # The reusable quality workflow is the sole owner of validation and dist creation.
 quality_lines, quality_order, quality_jobs = workflows["quality.yml"]
-quality_code = "\n".join(line for line in quality_lines if not line.lstrip().startswith("#"))
-if not re.search(r"^  workflow_call:\s*$", quality_code, re.MULTILINE):
-    fail("quality workflow must support workflow_call")
+quality_triggers = top_level_mapping(quality_lines, "on")
+if set(quality_triggers) != {"workflow_call"}:
+    fail("quality workflow must trigger only through workflow_call")
+workflow_call_lines = quality_triggers["workflow_call"]
+if not isinstance(workflow_call_lines, list):
+    fail("quality workflow_call must declare the upload_dist input")
+inputs_lines = child_block(workflow_call_lines, 4, "inputs")
+if mapping_keys(inputs_lines, 6) != ["upload_dist"]:
+    fail("quality workflow_call must expose only the upload_dist input")
+upload_dist_lines = child_block(inputs_lines, 6, "upload_dist")
+if mapping_keys(upload_dist_lines, 8) != ["description", "required", "default", "type"]:
+    fail("quality upload_dist must declare description, required, default, and type exactly once")
+if direct_value(upload_dist_lines, 8, "required") != "false":
+    fail("quality upload_dist input must not be required")
+if direct_value(upload_dist_lines, 8, "default") != "false":
+    fail("quality upload_dist input must default to false")
+if direct_value(upload_dist_lines, 8, "type") != "boolean":
+    fail("quality upload_dist input must be boolean")
 if quality_order != ["quality"]:
     fail("quality workflow must contain exactly the quality job")
+if direct_value(quality_jobs["quality"], 4, "runs-on") != "macos-14":
+    fail("quality job must run on macos-14")
 quality_steps = parse_steps(quality_jobs["quality"])
 expected_quality_actions = (
     "actions/checkout@",
@@ -371,6 +459,14 @@ if len(quality_steps) != 10 or any(
     for index, prefix in enumerate(expected_quality_actions)
 ):
     fail("quality workflow must begin with checkout, Rust toolchain, and Rust cache actions")
+rust_step = quality_steps[1]
+expected_rust_inputs = {
+    "toolchain": "1.88.0",
+    "components": "rustfmt, clippy",
+    "targets": "aarch64-apple-darwin, x86_64-apple-darwin",
+}
+if rust_step.get("with") != expected_rust_inputs:
+    fail("quality Rust toolchain must be exactly 1.88.0 with rustfmt, clippy, and both macOS targets")
 quality_step_names = [step.get("name") for step in quality_steps if step.get("name")]
 expected_quality_names = [
     "Check build contract",
@@ -412,6 +508,16 @@ if upload_step.get("with", {}).get("if-no-files-found") != "error":
     fail("quality artifact upload must fail when expected files are absent")
 
 ci_lines, ci_order, ci_jobs = workflows["ci.yml"]
+ci_triggers = top_level_mapping(ci_lines, "on")
+if set(ci_triggers) != {"push", "pull_request"}:
+    fail("CI must trigger only on main pushes and pull requests")
+ci_push_lines = ci_triggers["push"]
+if not isinstance(ci_push_lines, list):
+    fail("CI push trigger must declare the main branch")
+if direct_value(ci_push_lines, 4, "branches") != "[main]":
+    fail("CI push trigger must target exactly main")
+if ci_triggers["pull_request"] != "":
+    fail("CI pull_request trigger must not add filters")
 if ci_order != ["quality"]:
     fail("CI must contain exactly one reusable quality job")
 if direct_value(ci_jobs["quality"], 4, "uses") != "./.github/workflows/quality.yml":
@@ -423,13 +529,30 @@ if direct_value(ci_jobs["quality"], 4, "runs-on") is not None:
 
 # Release must be tag-only and have the exact preflight -> quality -> publish graph.
 release_lines, release_order, release_jobs = workflows["release.yml"]
-release_structural_code = "\n".join(line for line in release_lines if not line.lstrip().startswith("#"))
-if not re.search(r'^    tags:\s*\n      - ["\']v\*["\']\s*$', release_structural_code, re.MULTILINE):
-    fail("release must trigger only for v* tags")
-if re.search(r"^\s+(?:workflow_dispatch|branches):", release_structural_code, re.MULTILINE):
-    fail("release must not allow manual or branch triggers")
+release_triggers = top_level_mapping(release_lines, "on")
+if set(release_triggers) != {"push"}:
+    fail("release must trigger only on tag pushes")
+release_push_lines = release_triggers["push"]
+if not isinstance(release_push_lines, list):
+    fail("release push trigger must declare the v* tag filter")
+if mapping_keys(release_push_lines, 4) != ["tags"] or direct_value(release_push_lines, 4, "tags") != "":
+    fail("release push trigger must contain only a tags list")
+tag_lines = child_block(release_push_lines, 4, "tags")
+release_tags = []
+for raw in tag_lines:
+    match = re.match(r"^      -\s*(.+?)\s*$", raw)
+    if match:
+        release_tags.append(yaml_scalar(uncommented(match.group(1))))
+if release_tags != ["v*"]:
+    fail("release tag trigger must be exactly v*")
 if release_order != ["preflight", "quality", "publish"]:
     fail("release must contain exactly preflight, quality, and publish jobs in order")
+if direct_value(release_jobs["preflight"], 4, "runs-on") != "macos-14":
+    fail("release preflight must run on macos-14")
+if nested_mapping(release_jobs["preflight"], 4, "permissions").get("contents") != "write":
+    fail("release preflight requires contents: write to list draft releases")
+if nested_mapping(release_jobs["preflight"], 4, "outputs") != {"tag": "${{ steps.version.outputs.tag }}"}:
+    fail("release preflight must expose the verified version tag output")
 if direct_value(release_jobs["quality"], 4, "needs") != "preflight":
     fail("release quality job must depend on preflight")
 if direct_value(release_jobs["quality"], 4, "uses") != "./.github/workflows/quality.yml":
@@ -440,6 +563,8 @@ if parse_steps(release_jobs["quality"]) or direct_value(release_jobs["quality"],
     fail("release quality must remain a reusable-workflow caller without local steps")
 if direct_value(release_jobs["publish"], 4, "needs") != "[preflight, quality]":
     fail("release publish job must depend on preflight and quality")
+if direct_value(release_jobs["publish"], 4, "runs-on") != "macos-14":
+    fail("release publish job must run on macos-14")
 if nested_mapping(release_jobs["publish"], 4, "permissions").get("contents") != "write":
     fail("release publish job requires contents: write")
 
@@ -447,6 +572,29 @@ preflight_steps = parse_steps(release_jobs["preflight"])
 preflight_names = [step.get("name") for step in preflight_steps if step.get("name")]
 if preflight_names != ["Verify tag and Cargo package version", "Reject an existing release"]:
     fail("release preflight must verify the version and reject existing releases")
+if len(preflight_steps) != 4:
+    fail("release preflight must contain only checkout, Rust setup, version verification, and release rejection")
+preflight_rust_step = preflight_steps[1]
+if not preflight_rust_step.get("uses", "").startswith("dtolnay/rust-toolchain@"):
+    fail("release preflight must install the pinned Rust toolchain")
+if preflight_rust_step.get("with") != {"toolchain": "1.88.0"}:
+    fail("release preflight Rust toolchain must be exactly 1.88.0")
+version_step = next(step for step in preflight_steps if step.get("name") == "Verify tag and Cargo package version")
+if version_step.get("id") != "version":
+    fail("release version verification must expose the version step id")
+version_commands = command_text(version_step)
+for required_fragment in (
+    "set -euo pipefail",
+    "cargo metadata --locked --no-deps --format-version 1",
+    'p["name"] == "grok-build-proxy"',
+    'expected="v${version}"',
+    '[[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "${expected}" ]]',
+    'echo "tag=${expected}" >> "${GITHUB_OUTPUT}"',
+):
+    if required_fragment not in version_commands:
+        fail(f"release version verification is missing: {required_fragment}")
+if not re.search(r'GITHUB_REF_NAME\}"\s*!=\s*"\$\{expected\}', version_commands):
+    fail("release version verification must compare the exact ref name with v${Cargo version}")
 release_gate = next(step for step in preflight_steps if step.get("name") == "Reject an existing release")
 required_gate_env = {
     "GH_TOKEN": "${{ github.token }}",
@@ -458,20 +606,25 @@ if release_gate.get("env") != required_gate_env:
 gate_commands = command_text(release_gate)
 for required_fragment in (
     "set -euo pipefail",
-    'release_id="$(gh api',
-    '"/repos/${GH_REPO}/releases/tags/${TAG}"',
-    "--jq '.id' 2>release-query-error.log",
-    'if [[ "${query_status}" == "1" ]] && grep -Fq \'HTTP 404\' release-query-error.log; then',
-    'cat release-query-error.log >&2',
-    'exit "${query_status}"',
-    'if [[ -n "${release_id}" ]]; then',
+    'existing_release="$(gh api',
+    "--method GET",
+    "--paginate",
+    "--slurp",
+    '"/repos/${GH_REPO}/releases?per_page=100"',
+    'if [[ -n "${existing_release}" ]]; then',
 ):
     if required_fragment not in gate_commands:
-        fail(f"existing-release gate is missing authoritative API logic: {required_fragment}")
-if re.search(r"gh\s+release\s+view|>/dev/null|2>&1", gate_commands):
-    fail("existing-release gate must not hide or reinterpret GitHub API failures")
-if re.search(r"\|\|\s*true|\bif\s+gh\s+api\b", gate_commands):
-    fail("existing-release gate must accept only an explicit REST 404 as absence")
+        fail(f"existing-release gate is missing draft-aware paginated API logic: {required_fragment}")
+if not re.search(r"--jq\s+'\[\.\[\]\[\] \| select\(\.tag_name == env\.TAG\)\] \| first // empty'", gate_commands):
+    fail("existing-release gate must query all paginated release objects and exact-match tag_name")
+if "/releases/tags/" in gate_commands or re.search(r"gh\s+release\s+view", gate_commands):
+    fail("existing-release gate must list releases so drafts are included")
+if not re.search(r"select\(\.tag_name\s*==\s*env\.TAG\)", gate_commands):
+    fail("existing-release gate must exact-match tag_name")
+if re.search(r"2>|>/dev/null|2>&1|\|\|\s*true|\bif\s+gh\s+api\b", gate_commands):
+    fail("existing-release gate must fail closed without hiding API, auth, or transport errors")
+if gate_commands.index("gh api") > gate_commands.index('if [[ -n "${existing_release}" ]]'):
+    fail("existing-release API listing must run before deciding that the release is absent")
 
 publish_steps = parse_steps(release_jobs["publish"])
 if [step.get("name") for step in publish_steps if step.get("name")] != [
@@ -511,6 +664,8 @@ if publish_step.get("env") != required_publish_env:
 publish_commands = command_text(publish_step)
 if 'gh release create "${TAG}"' not in publish_commands:
     fail("release publication must create the preflight-approved tag release")
+if publish_commands.split().count("--verify-tag") != 1:
+    fail("release publication must verify the tag exactly once")
 for asset in expected_artifact_paths:
     if publish_commands.count(asset) != 1:
         fail(f"release publication must attach {asset} exactly once")
@@ -528,6 +683,161 @@ if re.search(r"(?:^|\n)\s*(?:make\s+dist|cargo\s+(?:build|test|clippy)\b|gh\s+re
     fail("release preflight and publish jobs must not rebuild or upload replacement assets")
 if re.search(r"(?:^|\s)--clobber(?:\s|$)", release_commands):
     fail("release publication must never clobber assets")
+
+
+def run_negative_mutation(name, replacements, expected_message):
+    with tempfile.TemporaryDirectory(prefix="build-contract-mutation-") as temp_dir:
+        temp_root = Path(temp_dir) / "repo"
+        temp_root.mkdir()
+        for relative_path in (
+            "Cargo.lock",
+            "Cargo.toml",
+            "Makefile",
+            "install.sh",
+            "src/main.rs",
+            ".github/workflows/ci.yml",
+            ".github/workflows/quality.yml",
+            ".github/workflows/release.yml",
+            "scripts/check-build-contract.sh",
+        ):
+            source = Path(relative_path)
+            destination = temp_root / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        for relative_path, old, new in replacements:
+            path = temp_root / relative_path
+            text = path.read_text()
+            if text.count(old) != 1:
+                fail(f"negative mutation {name} has a non-unique fixture in {relative_path}")
+            path.write_text(text.replace(old, new, 1))
+        subprocess.run(["git", "init", "--quiet"], cwd=temp_root, check=True)
+        subprocess.run(["git", "add", "."], cwd=temp_root, check=True)
+        environment = os.environ.copy()
+        environment["CHECK_BUILD_CONTRACT_SKIP_MUTATIONS"] = "1"
+        result = subprocess.run(
+            ["./scripts/check-build-contract.sh"],
+            cwd=temp_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+        output = result.stdout + result.stderr
+        if result.returncode == 0:
+            fail(f"negative mutation was accepted: {name}")
+        if expected_message not in output:
+            fail(f"negative mutation {name} failed for the wrong reason:\n{output}")
+
+
+if os.environ.get("CHECK_BUILD_CONTRACT_SKIP_MUTATIONS") != "1":
+    negative_mutations = [
+        (
+            "release trigger broadened",
+            [(".github/workflows/release.yml", '      - "v*"', '      - "v*"\n  workflow_dispatch:')],
+            "release must trigger only on tag pushes",
+        ),
+        (
+            "CI trigger broadened",
+            [(".github/workflows/ci.yml", "  pull_request:", "  pull_request:\n  workflow_dispatch:")],
+            "CI must trigger only on main pushes and pull requests",
+        ),
+        (
+            "quality trigger broadened",
+            [(".github/workflows/quality.yml", "on:\n  workflow_call:", "on:\n  workflow_call:\n  workflow_dispatch:")],
+            "quality workflow must trigger only through workflow_call",
+        ),
+        (
+            "upload_dist type weakened",
+            [(".github/workflows/quality.yml", "        type: boolean", "        type: string")],
+            "quality upload_dist input must be boolean",
+        ),
+        (
+            "upload_dist default enabled",
+            [(".github/workflows/quality.yml", "        default: false", "        default: true")],
+            "quality upload_dist input must default to false",
+        ),
+        (
+            "quality runner changed",
+            [(".github/workflows/quality.yml", "    runs-on: macos-14", "    runs-on: macos-latest")],
+            "quality job must run on macos-14",
+        ),
+        (
+            "release runner changed",
+            [(".github/workflows/release.yml", "  preflight:\n    runs-on: macos-14", "  preflight:\n    runs-on: macos-latest")],
+            "release preflight must run on macos-14",
+        ),
+        (
+            "Rust version floated",
+            [(".github/workflows/quality.yml", "          toolchain: 1.88.0", "          toolchain: stable")],
+            "quality Rust toolchain must be exactly 1.88.0",
+        ),
+        (
+            "Rust components dropped",
+            [(".github/workflows/quality.yml", "          components: rustfmt, clippy", "          components: rustfmt")],
+            "quality Rust toolchain must be exactly 1.88.0",
+        ),
+        (
+            "Rust target dropped",
+            [(".github/workflows/quality.yml", "          targets: aarch64-apple-darwin, x86_64-apple-darwin", "          targets: aarch64-apple-darwin")],
+            "quality Rust toolchain must be exactly 1.88.0",
+        ),
+        (
+            "preflight Rust version floated",
+            [(".github/workflows/release.yml", "          toolchain: 1.88.0", "          toolchain: stable")],
+            "release preflight Rust toolchain must be exactly 1.88.0",
+        ),
+        (
+            "version metadata unlocked",
+            [(".github/workflows/release.yml", "cargo metadata --locked --no-deps --format-version 1", "cargo metadata --no-deps --format-version 1")],
+            "cargo metadata must use --locked",
+        ),
+        (
+            "version package identity removed",
+            [(".github/workflows/release.yml", 'p["name"] == "grok-build-proxy"', 'p["name"] == "other-package"')],
+            'p["name"] == "grok-build-proxy"',
+        ),
+        (
+            "version ref comparison weakened",
+            [(".github/workflows/release.yml", '"${GITHUB_REF_NAME}" != "${expected}"', '"${GITHUB_REF_NAME}" != v*')],
+            "release version verification is missing",
+        ),
+        (
+            "version output removed",
+            [(".github/workflows/release.yml", 'echo "tag=${expected}" >> "${GITHUB_OUTPUT}"', 'echo "tag=${expected}"')],
+            "GITHUB_OUTPUT",
+        ),
+        (
+            "preflight tag output disconnected",
+            [(".github/workflows/release.yml", "      tag: ${{ steps.version.outputs.tag }}", "      tag: ${{ github.ref_name }}")],
+            "release preflight must expose the verified version tag output",
+        ),
+        (
+            "draft permission removed",
+            [(".github/workflows/release.yml", "  preflight:\n    runs-on: macos-14\n    permissions:\n      contents: write", "  preflight:\n    runs-on: macos-14\n    permissions:\n      contents: read")],
+            "release preflight requires contents: write",
+        ),
+        (
+            "release listing pagination removed",
+            [(".github/workflows/release.yml", "            --paginate \\\n", "")],
+            "--paginate",
+        ),
+        (
+            "release exact tag match weakened",
+            [(".github/workflows/release.yml", ".tag_name == env.TAG", ".tag_name | contains(env.TAG)")],
+            "query all paginated release objects and exact-match tag_name",
+        ),
+        (
+            "release API errors ignored",
+            [(".github/workflows/release.yml", '            --jq \'[.[][] | select(.tag_name == env.TAG)] | first // empty\')"', '            --jq \'[.[][] | select(.tag_name == env.TAG)] | first // empty\')" || true')],
+            "fail closed",
+        ),
+        (
+            "tag verification removed",
+            [(".github/workflows/release.yml", "            --verify-tag", "            --draft")],
+            "verify the tag exactly once",
+        ),
+    ]
+    for mutation_name, replacements, expected_message in negative_mutations:
+        run_negative_mutation(mutation_name, replacements, expected_message)
 PY
 
 printf 'build contract ok: version %s\n' "$package_version"

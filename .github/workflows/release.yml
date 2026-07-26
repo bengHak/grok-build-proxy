@@ -16,7 +16,7 @@ jobs:
   preflight:
     runs-on: macos-14
     permissions:
-      contents: read
+      contents: write
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -46,24 +46,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_id="$(gh api \
+          existing_release="$(gh api \
             --method GET \
+            --paginate \
+            --slurp \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/${GH_REPO}/releases/tags/${TAG}" \
-            --jq '.id' 2>release-query-error.log)" || {
-              query_status=$?
-              if [[ "${query_status}" == "1" ]] && grep -Fq 'HTTP 404' release-query-error.log; then
-                cat release-query-error.log >&2
-                release_id=""
-              else
-                cat release-query-error.log >&2
-                exit "${query_status}"
-              fi
-            }
-          rm -f release-query-error.log
-          if [[ -n "${release_id}" ]]; then
-            echo "Release ${TAG} already exists; refusing to replace published assets." >&2
+            "/repos/${GH_REPO}/releases?per_page=100" \
+            --jq '[.[][] | select(.tag_name == env.TAG)] | first // empty')"
+          if [[ -n "${existing_release}" ]]; then
+            echo "Release ${TAG} already exists; refusing to replace draft or published assets." >&2
             exit 1
           fi
 
