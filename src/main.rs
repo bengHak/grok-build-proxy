@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use grok_build_proxy::{
+    VERSION,
     auth::{DEFAULT_REFRESH_URL, Store},
     catalog::Catalog,
     codexcli, doctor,
@@ -27,7 +28,6 @@ use std::{
 mod kimi_cli;
 
 const DEFAULT_UPSTREAM: &str = "https://chatgpt.com/backend-api/codex/responses";
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser)]
 #[command(name="grok-build-proxy",version=VERSION,about="Local Grok Build proxy for ChatGPT Codex and Kimi")]
@@ -386,7 +386,6 @@ async fn serve(a: ServeArgs) -> Result<()> {
         model_map: mappings,
         client,
         client_token: a.client_token,
-        version: VERSION.into(),
         compatibility_version: a.codex_compat_version,
         responses_compat: CompatMode::from_env()?,
         lite_tool_batching: a.lite_tool_batching,

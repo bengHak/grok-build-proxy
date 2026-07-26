@@ -29,35 +29,14 @@ jobs:
       - name: Verify tag and Cargo package version
         id: version
         shell: bash
-        run: |
-          set -euo pipefail
-          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "grok-build-proxy"))')"
-          expected="v${version}"
-          if [[ "${GITHUB_REF_TYPE}" != "tag" || "${GITHUB_REF_NAME}" != "${expected}" ]]; then
-            echo "Release tag ${GITHUB_REF_NAME} does not match Cargo package version ${expected}" >&2
-            exit 1
-          fi
-          echo "tag=${expected}" >> "${GITHUB_OUTPUT}"
+        run: ./scripts/release-preflight.sh verify-version
       - name: Reject an existing release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
         shell: bash
-        run: |
-          set -euo pipefail
-          existing_release="$(gh api \
-            --method GET \
-            --paginate \
-            --slurp \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/${GH_REPO}/releases?per_page=100" \
-            --jq '[.[][] | select(.tag_name == env.TAG)] | first // empty')"
-          if [[ -n "${existing_release}" ]]; then
-            echo "Release ${TAG} already exists; refusing to replace draft or published assets." >&2
-            exit 1
-          fi
+        run: ./scripts/release-preflight.sh reject-existing-release
 
   quality:
     needs: preflight

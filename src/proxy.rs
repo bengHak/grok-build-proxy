@@ -46,7 +46,6 @@ pub struct ProxyConfig {
     pub model_map: ModelMap,
     pub client: reqwest::Client,
     pub client_token: String,
-    pub version: String,
     pub compatibility_version: String,
     pub responses_compat: CompatMode,
     pub lite_tool_batching: bool,
@@ -310,7 +309,7 @@ async fn health(State(s): State<AppState>, method: Method) -> Response {
             "method not allowed",
         );
     };
-    Json(json!({"ok":true,"service":"grok-build-proxy","version":s.0.version,"model_substitutions":s.0.model_map.len()})).into_response()
+    Json(json!({"ok":true,"service":"grok-build-proxy","version":crate::VERSION,"model_substitutions":s.0.model_map.len()})).into_response()
 }
 async fn ready(
     State(s): State<AppState>,
@@ -1091,7 +1090,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
         let mut response = with_request_id(error(status, &error_type, message), &request_id);
         response.headers_mut().insert(
             "x-grok-build-proxy-version",
-            HeaderValue::from_str(&s.0.version).unwrap_or(HeaderValue::from_static("dev")),
+            HeaderValue::from_static(crate::VERSION),
         );
         return response;
     }
@@ -1278,7 +1277,7 @@ async fn responses(State(s): State<AppState>, request: Request) -> Response {
     }
     response.headers_mut().insert(
         "x-grok-build-proxy-version",
-        HeaderValue::from_str(&s.0.version).unwrap_or(HeaderValue::from_static("dev")),
+        HeaderValue::from_static(crate::VERSION),
     );
     with_request_id(response, &request_id)
 }
@@ -1697,7 +1696,7 @@ async fn send_codex_upstream(
         )
         .header(
             header::USER_AGENT,
-            format!("grok-build-proxy/{}", cfg.version),
+            format!("grok-build-proxy/{}", crate::VERSION),
         )
         .header(
             "originator",
@@ -2523,7 +2522,6 @@ mod tests {
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -2581,7 +2579,6 @@ mod tests {
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: "secret".into(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -2649,7 +2646,6 @@ mod tests {
             model_map: ModelMap::parse("alias-fast=kimi-for-coding").unwrap(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -2700,7 +2696,24 @@ mod tests {
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let upstream=Router::new().route("/responses",axum::routing::post(|headers:HeaderMap|async move {assert_eq!(headers[header::AUTHORIZATION],"Bearer upstream-secret");([(header::CONTENT_TYPE,"text/event-stream")],"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_live\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"live\"}\n\ndata: [DONE]\n\n").into_response()}));
+        let upstream = Router::new().route(
+            "/responses",
+            axum::routing::post(|headers: HeaderMap| async move {
+                assert_eq!(
+                    headers[header::AUTHORIZATION],
+                    "Bearer upstream-secret"
+                );
+                assert_eq!(
+                    headers[header::USER_AGENT],
+                    format!("grok-build-proxy/{}", crate::VERSION)
+                );
+                (
+                    [(header::CONTENT_TYPE, "text/event-stream")],
+                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_live\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"live\"}\n\ndata: [DONE]\n\n",
+                )
+                    .into_response()
+            }),
+        );
         tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
         let app = router(ProxyConfig {
             upstream_url: format!("http://{address}/responses"),
@@ -2710,7 +2723,6 @@ mod tests {
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -2730,6 +2742,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-grok-build-proxy-version"],
+            crate::VERSION
+        );
         let bytes = axum::body::to_bytes(response.into_body(), 65536)
             .await
             .unwrap();
@@ -2785,7 +2801,6 @@ mod tests {
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -2851,7 +2866,6 @@ mod tests {
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -2916,7 +2930,6 @@ mod tests {
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -3026,7 +3039,6 @@ mod tests {
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -3662,7 +3674,6 @@ data: {"type":"response.completed","response":{"id":"resp_disabled","output":[]}
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,
@@ -4006,7 +4017,6 @@ data: {"type":"response.completed","response":{"id":"resp_ok","output":[{"type":
             model_map: ModelMap::default(),
             client: reqwest::Client::new(),
             client_token: String::new(),
-            version: "test".into(),
             compatibility_version: DEFAULT_CODEX_COMPATIBILITY_VERSION.into(),
             responses_compat: CompatMode::Full,
             lite_tool_batching: false,

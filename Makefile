@@ -1,7 +1,8 @@
-BINARY := grok-build-proxy
-CARGO := cargo
-DIST_DIR := dist
-PACKAGE_VERSION := $(shell $(CARGO) metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "$(BINARY)"))')
+override BINARY := grok-build-proxy
+override CARGO := cargo
+override DIST_DIR := dist
+override MAKE := make
+override PACKAGE_VERSION := $(shell cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "grok-build-proxy"))')
 
 .PHONY: build build-arm64 build-amd64 prepare-dist dist verify-dist print-version test lint fmt check clean
 

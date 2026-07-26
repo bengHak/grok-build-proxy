@@ -25,6 +25,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Check build contract
         run: ./scripts/check-build-contract.sh
+      - name: Test build contract mutations
+        run: ./scripts/test-build-contract.sh
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy

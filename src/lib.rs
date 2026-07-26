@@ -1,3 +1,5 @@
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod auth;
 pub mod catalog;
 pub mod codexcli;
