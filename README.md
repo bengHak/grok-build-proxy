@@ -636,16 +636,24 @@ default loopback binding whenever possible.
 ## Development and release
 
 Development requires Rust 1.88 or newer. `make dist` additionally requires
-`rustup` and the Apple Silicon and Intel macOS targets.
+`rustup`, Python 3, and the Apple Silicon and Intel macOS targets.
 
 ```sh
-git clone https://github.com/bengHak/grok-build-proxy.git
-cd grok-build-proxy
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+make check
 make dist
 ```
+
+`make dist` preserves `target/` so Cargo can reuse dependency and incremental
+artifacts across local and CI builds. It replaces only generated `bin/` and
+`dist/` packaging output. Run `make clean` only when you intentionally want to
+delete all Cargo and packaging artifacts.
+
+`Cargo.toml` is the only release version source. To release, update the package
+version and `Cargo.lock`, merge that commit, and push the exact matching tag
+(for example, package version `0.0.19` requires tag `v0.0.19`). The tag workflow
+runs the same quality checks as CI and publishes those validated archives.
+Existing releases and assets are never overwritten; corrections require a new
+version and tag.
 
 Release assets are built for macOS arm64 and amd64 and published with a SHA-256
 manifest. See [`SECURITY.md`](SECURITY.md) for credential and vulnerability
