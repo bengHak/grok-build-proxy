@@ -36,9 +36,16 @@ The request adapter preserves:
 - the order of multi-turn input items;
 - developer instructions and tool definitions in Responses Lite input;
 - request-level `reasoning.effort` on both `POST /v1/responses` and
-  `POST /responses`, without replacing it with a proxy-wide value.
+  `POST /responses`, without replacing it with a proxy-wide value;
+- `previous_response_id` for multi-turn chaining / retained reasoning
+  (passthrough to Codex);
+- `context_management` (including server-side compaction via
+  `compact_threshold`) for long-horizon context control (passthrough);
+- client-supplied `store` when present (defaults to `false` for ZDR/privacy
+  when omitted). Setting `store: true` enables durable response IDs needed
+  for reliable `previous_response_id` chaining across longer sessions.
 
-### Planned / in-progress: Retained reasoning & compaction (OpenAI ARC-AGI-3 lessons)
+### Retained reasoning & compaction (OpenAI ARC-AGI-3 lessons)
 
 OpenAI reported that enabling two Responses API settings tripled ARC-AGI-3 scores
 (13.3% → 38.3% RHAE) while cutting output tokens ~6×:
@@ -46,22 +53,16 @@ OpenAI reported that enabling two Responses API settings tripled ARC-AGI-3 score
 1. **Retained reasoning** via `previous_response_id` (keep private reasoning across turns).
 2. **Compaction** via `context_management` (server-side summary instead of rolling truncation).
 
-Current limitation in `prepare_codex_request`:
+This proxy now passes both fields through on the Codex path. Grok Build remains
+the harness and owns session state; when using Codex models for long multi-turn
+agent loops, prefer sending `previous_response_id` (and optionally enabling
+compaction) rather than only growing a truncated message list.
 
-- The ALLOWED whitelist does **not** yet include `previous_response_id` or
-  `context_management` (they are stripped).
-- `store` is hard-forced to `false`.
+Follow-ups still under consideration:
 
-Planned changes (this branch / follow-up):
-
-- Add `previous_response_id` and `context_management` to the ALLOWED list so they
-  are passed through to Codex upstream.
-- Soften `store` forcing: respect client-provided value when present (default
-  remains `false` for ZDR/privacy); document trade-offs for long-horizon agents.
-- Ensure SSE/event normalization tolerates compaction output items.
-- Update README with a short “Long-horizon agent optimization” section.
-
-Until the code lands, clients that send these fields will see them dropped.
+- Selective ID preservation in `normalize_input_item` for reasoning/compaction items.
+- SSE normalizer tolerance for compaction output items if upstream emits them.
+- Optional env flag / default `compact_threshold` injection.
 
 ## Kimi compatibility
 
