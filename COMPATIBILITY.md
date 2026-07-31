@@ -38,6 +38,31 @@ The request adapter preserves:
 - request-level `reasoning.effort` on both `POST /v1/responses` and
   `POST /responses`, without replacing it with a proxy-wide value.
 
+### Planned / in-progress: Retained reasoning & compaction (OpenAI ARC-AGI-3 lessons)
+
+OpenAI reported that enabling two Responses API settings tripled ARC-AGI-3 scores
+(13.3% → 38.3% RHAE) while cutting output tokens ~6×:
+
+1. **Retained reasoning** via `previous_response_id` (keep private reasoning across turns).
+2. **Compaction** via `context_management` (server-side summary instead of rolling truncation).
+
+Current limitation in `prepare_codex_request`:
+
+- The ALLOWED whitelist does **not** yet include `previous_response_id` or
+  `context_management` (they are stripped).
+- `store` is hard-forced to `false`.
+
+Planned changes (this branch / follow-up):
+
+- Add `previous_response_id` and `context_management` to the ALLOWED list so they
+  are passed through to Codex upstream.
+- Soften `store` forcing: respect client-provided value when present (default
+  remains `false` for ZDR/privacy); document trade-offs for long-horizon agents.
+- Ensure SSE/event normalization tolerates compaction output items.
+- Update README with a short “Long-horizon agent optimization” section.
+
+Until the code lands, clients that send these fields will see them dropped.
+
 ## Kimi compatibility
 
 Requests for K3 (`k3`) and Kimi K2.7 Code (`kimi-for-coding`, with the legacy
