@@ -36,7 +36,33 @@ The request adapter preserves:
 - the order of multi-turn input items;
 - developer instructions and tool definitions in Responses Lite input;
 - request-level `reasoning.effort` on both `POST /v1/responses` and
-  `POST /responses`, without replacing it with a proxy-wide value.
+  `POST /responses`, without replacing it with a proxy-wide value;
+- `previous_response_id` for multi-turn chaining / retained reasoning
+  (passthrough to Codex);
+- `context_management` (including server-side compaction via
+  `compact_threshold`) for long-horizon context control (passthrough);
+- client-supplied `store` when present (defaults to `false` for ZDR/privacy
+  when omitted). Setting `store: true` enables durable response IDs needed
+  for reliable `previous_response_id` chaining across longer sessions.
+
+### Retained reasoning & compaction (OpenAI ARC-AGI-3 lessons)
+
+OpenAI reported that enabling two Responses API settings tripled ARC-AGI-3 scores
+(13.3% → 38.3% RHAE) while cutting output tokens ~6×:
+
+1. **Retained reasoning** via `previous_response_id` (keep private reasoning across turns).
+2. **Compaction** via `context_management` (server-side summary instead of rolling truncation).
+
+This proxy now passes both fields through on the Codex path. Grok Build remains
+the harness and owns session state; when using Codex models for long multi-turn
+agent loops, prefer sending `previous_response_id` (and optionally enabling
+compaction) rather than only growing a truncated message list.
+
+Follow-ups still under consideration:
+
+- Selective ID preservation in `normalize_input_item` for reasoning/compaction items.
+- SSE normalizer tolerance for compaction output items if upstream emits them.
+- Optional env flag / default `compact_threshold` injection.
 
 ## Kimi compatibility
 
